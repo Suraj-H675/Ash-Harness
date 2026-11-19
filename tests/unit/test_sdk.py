@@ -311,6 +311,28 @@ async def test_sdk_goal_stream_has_one_terminal_event_and_aggregate_usage(
 
 
 @pytest.mark.asyncio
+async def test_sdk_goal_pauses_when_a_step_exhausts_its_iteration_limit(tmp_path) -> None:
+    (tmp_path / "goal.txt").write_text("evidence\n", encoding="utf-8")
+    provider = GoalStreamingSDKProvider()
+    config = AshConfig(
+        model="ollama/sdk-model",
+        workspace_root=tmp_path,
+        db_directory=tmp_path / "db",
+        memory_backend="off",
+        repo_map_enabled=False,
+        max_turn_iterations=1,
+    )
+    async with await AshClient.create(config=config, provider=provider) as client:
+        client.loop.create_goal("Read goal.txt and verify it")
+        events = [event async for event in client.stream_prompt("Start the Goal")]
+        goal = client.current_goal()
+        assert events[-1].data["stop_reason"] == "iteration_limit"
+        assert goal is not None and goal.state is GoalState.PAUSED
+        assert goal.continuations_used == 0
+        assert provider.calls == 1
+
+
+@pytest.mark.asyncio
 async def test_async_sdk_runtime_is_terminal_after_close(tmp_path: Path) -> None:
     config = AshConfig(
         model="ollama/sdk-model",

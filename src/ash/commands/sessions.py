@@ -204,6 +204,7 @@ def render_session_activity(
     *,
     after_sequence: int,
     has_more: bool,
+    last_incomplete_turn_reason: str | None = None,
     json_output: bool = False,
 ) -> str:
     """Show bounded, content-free tool/model timing for one session event page."""
@@ -215,21 +216,29 @@ def render_session_activity(
         "after_sequence": after_sequence,
         "next_cursor": next_cursor,
         "has_more": has_more,
+        "last_incomplete_turn_reason": last_incomplete_turn_reason,
         "activity": activity,
     }
     if json_output:
         return json.dumps(redact_value(payload), sort_keys=True)
-    if not events:
+    if not events and last_incomplete_turn_reason is None:
         return "No stored runtime activity for this session at this cursor."
     lines = [
         f"Session {terminal_safe_text(session_id, single_line=True)} — "
         f"activity after sequence {after_sequence}",
+    ]
+    if last_incomplete_turn_reason is not None:
+        lines.append(f"Last turn stopped: {last_incomplete_turn_reason}")
+    if not events:
+        lines.append("No stored runtime activity for this session at this cursor.")
+        return "\n".join(lines)
+    lines.extend([
         f"Model requests: {activity['model_requests']} started, "
         f"{activity['model_requests_completed']} completed, "
         f"{activity['completed_model_seconds']:.2f}s measured",
         f"Completed tool time: {activity['completed_tool_seconds']:.3f}s; "
         f"failed/cancelled model time: {activity['unsuccessful_model_seconds']:.3f}s",
-    ]
+    ])
     if activity["completed_requests_with_first_output"]:
         lines.append(
             "Model first-output split: "

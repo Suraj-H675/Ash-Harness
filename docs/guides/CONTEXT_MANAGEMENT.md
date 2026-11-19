@@ -281,20 +281,37 @@ the provider limit, Ash stops with a context error rather than silently
 discarding state, rewriting tool results, or repeating actions. This can
 happen partway through a multi-file coding task.
 
-After inspecting the workspace and any recovery warnings, an interactive
-user may run `/restart-context <explicit handoff>` to open a **new reasoning
-window**. The old session, action history and audit log remain available for
-review. Ash reconciles the interrupted journal under the session lease before
-the fork. Only completed, known tool outcomes (or safely compensated edits)
-permit this explicit restart. Pending turns, ambiguous external actions,
-unresolved file checkpoints and active external tasks still block it. The
-child inherits neither previous tool approvals nor opaque reasoning items;
-no actions are automatically replayed. The handoff is user-supplied, not
-a model-generated completion claim, and the user must verify partial edits.
+Inspect the workspace and any recovery warnings before opening a new reasoning
+window. In the interactive terminal, use `/restart-context <explicit handoff>`.
+From the source workspace, the equivalent one-shot workflow is:
+
+```bash
+ash sessions activity --session SESSION --json
+ash sessions recovery --session SESSION
+ash sessions restart-context --session SESSION \
+  --handoff "Describe the objective, observed edits, and checks still needed." --json
+ash --resume CHILD_SESSION -p "Continue from the handoff."
+```
+
+The restart command returns the child and parent IDs without contacting a
+model. Use the same Ash profile and database for the restart and resume. The
+parent retains its transcript and audit log. Ash reconciles the interruption
+under the session lease and refuses restart if another process owns that lease
+or recovery cannot establish the outcome of an earlier action. Active MCP
+tasks and terminal tasks without a recorded local outcome require ordinary
+session recovery. The child retains the
+parent's saved permission mode and starts with the redacted handoff. Earlier
+tool calls, approvals, and opaque reasoning stay in the parent. Verify the
+workspace and run authorized checks before relying on partial edits.
 
 This is **manual recovery**, not transparent automatic continuation or a
 substitute for long-task context management. `/compact-native` remains
 unavailable on the ChatGPT-plan route until the native contract is verified.
+
+`ash sessions activity` and interactive `/status` show the last incomplete turn
+when Ash has a recorded stop. A context-budget error, cancellation, or interrupted
+process can leave work and verification unfinished. Inspect recovery reports
+separately for unknown tool outcomes or unresolved files.
 
 ### Opt-in one-shot continuation
 

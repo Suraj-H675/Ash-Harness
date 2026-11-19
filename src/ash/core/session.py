@@ -164,6 +164,11 @@ AUTOMATIC_CONTEXT_HANDOFF_TOOLS = frozenset({
 })
 
 
+INCOMPLETE_TURN_STOP_REASONS = frozenset({
+    "token_budget", "iteration_limit", "circuit_breaker",
+})
+
+
 class SessionStorageError(RuntimeError):
     """Session database cannot be opened or migrated safely."""
 
@@ -187,7 +192,17 @@ class SessionResolutionError(ValueError):
 
 
 class SessionForkConflictError(ValueError):
-    """A session has a started turn and cannot be forked yet."""
+    """Durable source state does not permit a safe session fork."""
+
+
+def validate_context_restart_handoff(handoff: str) -> None:
+    if (
+        not isinstance(handoff, str)
+        or not handoff.strip()
+        or len(handoff.encode("utf-8")) > 12_000
+        or any(ord(char) < 32 and char not in "\n\t" for char in handoff)
+    ):
+        raise ValueError("context restart requires a bounded, printable handoff")
 
 
 class _DatabaseCoordinationState:
@@ -4369,7 +4384,7 @@ class SessionStore:
             )
 
     def latest_incomplete_turn_reason(self, session_id: str) -> str | None:
-        """Read a bounded, trusted stop category from the last durable turn.
+        """Read a bounded stop category from the last durable turn.
 
         A terminal runtime event marks the execution boundary; it does not
         imply the task was finished. Never infer an unfinished turn from an
@@ -4378,29 +4393,36 @@ class SessionStore:
 
         with closing(self._connect()) as conn:
             row = conn.execute(
-                "SELECT event.event_json FROM ("
+                "SELECT latest.status, event.event_type, event.event_json FROM ("
                 "SELECT turn_id, status FROM turn_journal WHERE session_id = ? "
                 "ORDER BY started_at DESC, rowid DESC LIMIT 1"
-                ") AS latest JOIN runtime_events AS event "
+                ") AS latest LEFT JOIN runtime_events AS event "
                 "ON event.session_id = ? AND event.turn_id = latest.turn_id "
-                "WHERE latest.status = 'completed' "
-                "AND event.event_type = 'turn.completed' "
+                "AND ((latest.status = 'completed' "
+                "AND event.event_type IN ('turn.completed', 'goal.step.completed')) "
+                "OR (latest.status = 'interrupted' "
+                "AND event.event_type IN ('turn.cancelled', 'turn.error'))) "
                 "ORDER BY event.sequence DESC LIMIT 1",
                 (session_id, session_id),
             ).fetchone()
         if row is None:
             return None
         try:
-            event = json.loads(str(row["event_json"]))
+            event = json.loads(row["event_json"] or "{}")
         except (TypeError, ValueError):
-            return None
+            event = {}
         reason = event.get("stop_reason") if isinstance(event, dict) else None
-        return (
-            reason
-            if isinstance(reason, str)
-            and reason in {"token_budget", "iteration_limit", "circuit_breaker"}
-            else None
-        )
+        if row["status"] == "interrupted":
+            if row["event_type"] == "turn.cancelled":
+                return "wall_time_budget" if reason == "wall_time_budget" else "cancelled"
+            if row["event_type"] == "turn.error":
+                if isinstance(reason, str) and reason in ("context_budget", "opaque_context"):
+                    return reason
+                return "error"
+            return "interrupted"
+        if isinstance(reason, str) and reason in INCOMPLETE_TURN_STOP_REASONS:
+            return reason
+        return None
 
     def save_turn_usage(self, turn_id: str, usage: dict[str, Any]) -> None:
         """Persist normalized usage so rewinding can adjust session totals."""
@@ -5845,13 +5867,7 @@ class SessionStore:
 
             if message_count != 0:
                 raise ValueError("context restart must begin with an empty history")
-            if (
-                not isinstance(_restart_handoff, str)
-                or not _restart_handoff.strip()
-                or len(_restart_handoff.encode("utf-8")) > 12_000
-                or any(ord(c) < 32 and c not in "\n\t" for c in _restart_handoff)
-            ):
-                raise ValueError("context restart requires a bounded, printable handoff")
+            validate_context_restart_handoff(_restart_handoff)
             handoff_content = (
                 "Context restart (new reasoning window). The previous session "
                 "is retained separately for audit and review. Previous tool "

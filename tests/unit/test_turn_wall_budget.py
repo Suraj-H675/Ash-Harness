@@ -96,7 +96,12 @@ async def test_time_budget_cancels_real_model_turn_and_keeps_recovery(
             "user"
         ]
         events = loop.session_store.list_runtime_events(session.session_id)
-        assert any(event.event.get("type") == "turn.cancelled" for event in events)
+        cancelled = next(event.event for event in events if event.event["type"] == "turn.cancelled")
+        assert cancelled["stop_reason"] == "wall_time_budget"
+        assert (
+            loop.session_store.latest_incomplete_turn_reason(session.session_id)
+            == "wall_time_budget"
+        )
         info = classify_exception(TurnWallBudgetExceededError(0.04))
         assert info.category.value == "context"
         assert info.exit_code != 0

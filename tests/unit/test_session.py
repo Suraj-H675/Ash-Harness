@@ -249,6 +249,15 @@ def test_latest_incomplete_turn_reason_is_from_last_durable_terminal_event(
     assert store.latest_incomplete_turn_reason(session.session_id) is None
 
 
+def test_latest_interrupted_turn_has_a_continuity_reason(tmp_path: Path) -> None:
+    store = SessionStore(tmp_path / "continuity.db")
+    session = store.create_session(str(tmp_path))
+    store.start_turn(session.session_id, "turn-1", "edit and verify")
+    store.interrupt_turn("turn-1")
+
+    assert store.latest_incomplete_turn_reason(session.session_id) == "interrupted"
+
+
 
 @pytest.mark.parametrize(
     ("steps", "blocked"),

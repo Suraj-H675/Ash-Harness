@@ -12,10 +12,12 @@ from typing import TYPE_CHECKING
 
 from ash.context.history import ContextBudgetExceededError
 from ash.core.checkpoints import recover_interrupted_turns
-from ash.core.session import SessionForkConflictError
+from ash.core.session import SessionForkConflictError, validate_context_restart_handoff
 
 if TYPE_CHECKING:
     from ash.core.loop import AshLoop
+    from ash.core.session import Session, SessionStore
+    from ash.safety.guard import SafetyGuard
 
 
 MAX_CONTEXT_CONTINUATIONS = 2
@@ -38,6 +40,45 @@ class ContinuationResult:
     context_continuations: int
     tool_free_finalized: bool = False
     tool_free_finalization_usage: dict[str, int] | None = None
+
+
+def restart_context_with_handoff(
+    store: SessionStore,
+    guard: SafetyGuard,
+    session_id: str,
+    handoff: str,
+) -> Session:
+    """Recover locally and fork an explicit handoff without starting a runtime."""
+
+    validate_context_restart_handoff(handoff)
+    store.require_session_project(session_id, guard.ensure_project_root_current())
+    lease = store.acquire_session_runtime_lease(session_id)
+    try:
+        for task in store.list_mcp_tasks(session_id):
+            call = store.tool_call_for_recovery(
+                session_id, task["turn_id"], task["call_id"]
+            )
+            if (
+                task["status"] not in {"completed", "cancelled", "failed"}
+                or call is None
+                or not call["dispatched"]
+                or not call["executed"]
+                or call["success"] not in (0, 1)
+            ):
+                raise SessionForkConflictError(
+                    "session has persisted MCP tasks without known local outcomes. "
+                    "Resume their recovery before starting a fresh reasoning window."
+                )
+        recover_interrupted_turns(
+            store, guard, session_id, include_quiescent_interrupted=True
+        )
+        return store.restart_context_session(
+            session_id,
+            expected_project_path=guard.ensure_project_root_current(),
+            user_handoff=handoff,
+        )
+    finally:
+        lease.close()
 
 
 async def run_with_context_continuation(

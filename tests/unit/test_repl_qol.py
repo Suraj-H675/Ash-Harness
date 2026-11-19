@@ -851,6 +851,19 @@ async def test_context_command_uses_effective_runtime_ceiling(
 
 
 @pytest.mark.asyncio
+async def test_status_reports_last_interrupted_turn(tmp_path, monkeypatch, capsys) -> None:
+    store = SessionStore(tmp_path / "status.db")
+    source = store.create_session(str(tmp_path))
+    store.start_turn(source.session_id, "interrupted-turn", "edit and verify")
+    store.interrupt_turn("interrupted-turn")
+    assert await _run_repl(
+        tmp_path, monkeypatch, iter(("/status", "exit")),
+        session_store=store, current_session=source,
+    ) == 0
+    assert "Last turn stopped: interrupted" in capsys.readouterr().out
+
+
+@pytest.mark.asyncio
 async def test_permissions_mode_command_persists_current_session_override(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

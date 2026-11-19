@@ -3294,10 +3294,15 @@ async def test_run_command_bounds_live_output(
 
     result = await tool.run(command_line=command)
 
-    streamed = "".join(str(event["delta"]) for event in events)
+    streamed = "".join(
+        str(event["delta"]) for event in events if event["type"] == "tool.output"
+    )
+    tail = [event for event in events if event["type"] == "tool.output.tail"]
     assert result.truncated is True
     assert len(streamed) < 100100
     assert "Live command output truncated" in streamed
+    assert len(tail) == 1
+    assert 0 < len(str(tail[0]["delta"])) <= 12_000
 
 
 @pytest.mark.asyncio
@@ -3360,9 +3365,17 @@ async def test_run_command_keeps_final_failure_summary_after_verbose_output(
     )
     command = f"{shlex.quote(sys.executable)} -c {shlex.quote(script)}"
 
-    result = await RunCommandTool(guard).run(
-        command_line=command, timeout_seconds=10, pty=pty
-    )
+    from io import StringIO
+
+    from rich.console import Console
+
+    from ash.ui.terminal import TerminalUI
+
+    tool = RunCommandTool(guard)
+    events = []
+    tool.set_event_sink(events.append)
+    with tool.event_context({"tool": "run_command", "call_id": "verbose-test"}):
+        result = await tool.run(command_line=command, timeout_seconds=10, pty=pty)
 
     assert result.success is False
     assert result.exit_code == 1
@@ -3377,6 +3390,15 @@ async def test_run_command_keeps_final_failure_summary_after_verbose_output(
     assert any(item["path"] == "src/parser.py" for item in result.diagnostics)
     assert "supersecretvalue" not in result.model_dump_json()
     assert "[REDACTED]" in result.model_dump_json()
+    output = StringIO()
+    ui = TerminalUI(console=Console(file=output, force_terminal=False))
+    for event in events:
+        ui.emit_event(event)
+    visible = output.getvalue()
+    assert "Live command output truncated" in visible
+    assert visible.count("FAILED tests/test_events.py::test_null") == 1
+    assert "1 failed, 2 passed in 0.12s" in visible
+    assert "supersecretvalue" not in visible
 
 
 @pytest.mark.asyncio

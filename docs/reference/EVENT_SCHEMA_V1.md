@@ -66,6 +66,12 @@ When a `run_command` result has a known process status, its terminal event also
 includes the integer `exit_code`. Ash omits that field when the command timed
 out or its outcome is unknown.
 
+After truncating live `run_command` output, Ash can emit `tool.output.tail`
+before the terminal event. It has the same operation ID, `stream`, and `delta`
+fields as `tool.output`. Each tail contains up to 12,000 redacted characters
+from the end of the omitted output for that stream. It can include a test
+summary or other diagnostics. Use the terminal event to check the outcome.
+
 Recovery emits one terminal `tool.error` per unfinished call before the
 aggregate `session.recovery` event. A recovered record with `dispatched: false`
 is a confirmed unstarted call and therefore has `ambiguous: false`.
@@ -129,6 +135,13 @@ count is positive, and JSON errors expose the same count and remedy. Recovery
 continues to preserve known completed work and never blindly replay uncertain
 effects.
 
+`turn.error` reports `stop_reason` as `opaque_context` when retained provider
+reasoning prevents a context fit, `context_budget` on other protected input
+overflows, or `error` for other failures. `turn.cancelled` reports
+`wall_time_budget` if the configured wall-time deadline triggered cancellation,
+and `cancelled` otherwise. Session activity reports `interrupted` for a
+journaled interruption without a terminal event.
+
 `turn.completed` means the Ash turn reached its terminal boundary, not that
 the user's task passed verification. In particular, a provider may produce a
 normal terminal response with empty text. Automation must inspect the response,
@@ -143,6 +156,10 @@ the process ended normally but did **not** finish the turn. An ordinary
 Neither code 0 nor `turn.completed` proves that the user's requested task
 passed independent tests or review. Interactive sessions retain their
 existing process-exit behavior.
+
+An active Goal pauses when its current step stops at an iteration or token
+limit or trips the circuit breaker. Resume the Goal explicitly to grant
+further automatic continuations.
 
 For a fresh one-shot `ash -p --require-check-command EXACT_COMMAND`, Ash also
 includes `required_check_satisfied` in the final JSON/stream-JSON result.

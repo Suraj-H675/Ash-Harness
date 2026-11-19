@@ -1317,6 +1317,11 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                 continue
             if command.name == "status":
                 session = loop.current_session
+                last_incomplete_turn = (
+                    loop.session_store.latest_incomplete_turn_reason(session.session_id)
+                    if session is not None
+                    else None
+                )
                 goal = loop.current_goal
                 capabilities = loop.provider.capabilities
                 active_model = str(loop.active_model_id)
@@ -1352,6 +1357,11 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                             f"Mode: {loop.safety_tier}",
                             f"Session: {session.session_id if session else '(none)'}",
                             f"Title: {session_title}",
+                            *(
+                                (f"Last turn stopped: {last_incomplete_turn}",)
+                                if last_incomplete_turn is not None
+                                else ()
+                            ),
                             "Goal: "
                             + (
                                 f"{goal.state.value} ({goal.goal_id[:8]})"
@@ -4176,6 +4186,34 @@ def _main_impl(argv: list[str] | None = None) -> int:
                 **_config_overrides_from_args(args),
             )
             store = SessionStore(sessions_config.db_directory / "sessions.db")
+            if args.sessions_action == "restart-context":
+                from ash.core.context_continuation import restart_context_with_handoff
+                from ash.safety.guard import SafetyGuard
+
+                if not args.session or args.handoff is None or args.all_projects:
+                    raise ValueError(
+                        "sessions restart-context requires --session ID and "
+                        "--handoff TEXT in the source workspace"
+                    )
+                guard = SafetyGuard(sessions_config.workspace_root)
+                source = store.resolve_session(args.session, str(guard.project_root))
+                child = restart_context_with_handoff(
+                    store, guard, source.session_id, args.handoff
+                )
+                if args.json:
+                    print(json.dumps({
+                        "session_id": child.session_id,
+                        "parent_session_id": source.session_id,
+                    }))
+                else:
+                    print(
+                        f"Created a fresh reasoning window {child.session_id} "
+                        f"from {source.session_id}.\n"
+                        f"Resume it with `ash --resume {child.session_id}`."
+                    )
+                return 0
+            if args.handoff is not None:
+                raise ValueError("--handoff requires sessions restart-context")
             if args.sessions_action == "tree":
                 try:
                     selected_summary = (
@@ -4250,6 +4288,9 @@ def _main_impl(argv: list[str] | None = None) -> int:
                         page[: args.limit],
                         after_sequence=args.after_sequence,
                         has_more=len(page) > args.limit,
+                        last_incomplete_turn_reason=store.latest_incomplete_turn_reason(
+                            selected_summary.session_id
+                        ),
                         json_output=args.json,
                     )
                 )
@@ -5569,6 +5610,7 @@ async def _bootstrap_and_headless(
 ) -> int:
     from ash.exceptions import classify_exception, format_error
     from ash.commands.attachments import PreparedAttachments, prepare_file_mentions
+    from ash.core.session import INCOMPLETE_TURN_STOP_REASONS
     from ash.logging import get_logger
 
     primary_error: BaseException | None = None
@@ -5759,11 +5801,7 @@ async def _bootstrap_and_headless(
         # stopped before the turn could finish. The turn remains durably
         # completed as an execution boundary, and its stop_reason stays in
         # the existing terminal event for callers to inspect.
-        if loop._last_turn_stop_reason in {
-            "iteration_limit",
-            "token_budget",
-            "circuit_breaker",
-        }:
+        if loop._last_turn_stop_reason in INCOMPLETE_TURN_STOP_REASONS:
             result_code = 1
     except asyncio.CancelledError as exc:
         primary_error = exc

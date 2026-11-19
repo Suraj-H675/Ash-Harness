@@ -48,6 +48,7 @@ from pydantic import ValidationError
 from ash.context.assembly import ContextAssemblyRequest, assemble_context
 from ash.context.history import (
     RUNTIME_ONLY_HISTORY_KEY,
+    ContextBudgetExceededError,
     RequestTokenBudget,
     resolve_request_token_budget,
 )
@@ -60,6 +61,7 @@ from ash.core.goals import (
 from ash.core.recovery import CircuitBreaker, CircuitBreakerError
 from ash.core.events import EventContext, envelope_event
 from ash.core.session import (
+    INCOMPLETE_TURN_STOP_REASONS,
     AuditAction,
     AuditResult,
     CoworkerWorkerSessionBinding,
@@ -1594,6 +1596,7 @@ class AshLoop:
             getattr(config, "max_turn_total_tokens", 0)
         )
         self._turn_wall_deadline: float | None = None
+        self._turn_wall_timeout: asyncio.Timeout | None = None
         self._turn_wall_budget_seconds: float | None = None
         self._turn_wall_notice_phase = -1
         self._turn_wall_notice_session_id: str | None = None
@@ -3662,6 +3665,7 @@ class AshLoop:
         deadline = clock.time() + seconds
         timeout = asyncio.timeout_at(deadline)
         self._turn_wall_deadline = deadline
+        self._turn_wall_timeout = timeout
         self._turn_wall_budget_seconds = seconds
         self._turn_wall_notice_phase = -1
         self._turn_wall_notice_session_id = None
@@ -3682,6 +3686,7 @@ class AshLoop:
                 ]
             self._turn_wall_notices.clear()
             self._turn_wall_deadline = None
+            self._turn_wall_timeout = None
             self._turn_wall_budget_seconds = None
             self._turn_wall_notice_phase = -1
             self._turn_wall_notice_session_id = None
@@ -3829,6 +3834,9 @@ class AshLoop:
                 goal = self.current_goal
                 if goal is None or not goal.can_auto_continue:
                     break
+                if self._last_turn_stop_reason in INCOMPLETE_TURN_STOP_REASONS:
+                    self._pause_goal_nonfatal()
+                    break
                 if self._last_turn_non_goal_tool_calls == 0:
                     self._emit_event(
                         {
@@ -3880,11 +3888,16 @@ class AshLoop:
                 else 0
             )
             self._recover_cancelled_turn(current_turn_id, previous_turn_id)
+            deadline_expired = (
+                self._turn_wall_timeout is not None
+                and self._turn_wall_timeout.expired()
+            )
             discarded = len(self._steering_messages)
             self._steering_messages.clear()
             self._emit_event(
                 {
                     "type": "turn.cancelled",
+                    "stop_reason": "wall_time_budget" if deadline_expired else "cancelled",
                     "discarded_steering": discarded,
                     "usage": self.last_turn_usage,
                     "iterations": self._last_turn_iterations,
@@ -3912,9 +3925,17 @@ class AshLoop:
             if current_turn_id is not None and current_turn_id != previous_turn_id:
                 self._last_interrupted_edit_files = len(self._turn_modified_paths)
                 self.session_store.interrupt_turn(current_turn_id)
+                stop_reason = "error"
+                if isinstance(exc, ContextBudgetExceededError):
+                    stop_reason = (
+                        "opaque_context"
+                        if exc.provider_replay_state_preserved
+                        else "context_budget"
+                    )
                 self._emit_event(
                     {
                         "type": "turn.error",
+                        "stop_reason": stop_reason,
                         "error": redact_text(str(exc)),
                         "edited_files": self._last_interrupted_edit_files,
                     }
@@ -4206,8 +4227,6 @@ class AshLoop:
         )
         turn_token_budget = int(getattr(self._config, "max_turn_total_tokens", 0))
         self._last_turn_token_budget = turn_token_budget
-        from ash.context.history import ContextBudgetExceededError
-
         iteration = 0
         iteration_budget = self.max_turn_iterations
         maximum_iteration_budget = self.max_turn_iterations + self.max_steering_messages

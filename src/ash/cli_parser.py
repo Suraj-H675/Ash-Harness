@@ -874,17 +874,20 @@ def configure_parser(parser: argparse.ArgumentParser, version: str) -> None:
     sessions_parser.add_argument(
         "sessions_action",
         nargs="?",
-        choices=["list", "tree", "recovery", "search", "activity"],
+        choices=["list", "tree", "recovery", "search", "activity", "restart-context"],
         default="list",
         help=(
             "list sessions; tree shows branch lineage; recovery shows interrupted-turn "
             "reports; search finds transcript text; activity shows content-free "
-            "model/tool timing"
+            "model/tool timing; restart-context creates a fresh reasoning window"
         ),
     )
     sessions_parser.add_argument(
         "--session",
-        help="Session ID or exact title for tree/recovery/activity inspection",
+        help="Session ID or exact title",
+    )
+    sessions_parser.add_argument(
+        "--handoff", help="User-authored handoff text for sessions restart-context",
     )
     sessions_parser.add_argument("--query", default="")
     sessions_parser.add_argument("--limit", type=int, default=20)

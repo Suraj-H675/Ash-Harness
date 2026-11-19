@@ -152,6 +152,14 @@ def classify_exception(exc: BaseException) -> ErrorInfo:
             retriable=True,
         )
 
+    if name == "SessionForkConflictError":
+        return ErrorInfo(
+            ErrorCategory.SESSION,
+            message,
+            "Inspect `ash sessions recovery --session SESSION` and any persisted "
+            "external task handles before retrying.",
+        )
+
     if (
         name == "SessionStorageError"
         or module == "sqlite3"
@@ -248,8 +256,9 @@ def classify_exception(exc: BaseException) -> ErrorInfo:
                 "Opaque provider reasoning cannot be shortened safely within "
                 "the current turn. Inspect the workspace and recorded tool "
                 "outcomes before continuing in a fresh session. When the "
-                "source session is quiescent, /restart-context with an "
-                "explicit handoff can start a new reasoning window without "
+                "source session is quiescent, use /restart-context or "
+                "`ash sessions restart-context --session SESSION --handoff TEXT` "
+                "to start a new reasoning window without "
                 "replaying earlier actions. Otherwise use a larger supported "
                 "input window or verified provider-native compaction. "
                 "Do not automatically repeat uncertain side effects.",

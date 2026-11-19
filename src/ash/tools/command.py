@@ -1203,6 +1203,7 @@ class _CommandEventStreamer:
         self._emitted_characters = 0
         self._truncated = False
         self._tails = {"stdout": "", "stderr": ""}
+        self._withheld_characters = dict.fromkeys(self._tails, 0)
         self._redactors = {
             "stdout": StreamingRedactor(),
             "stderr": StreamingRedactor(),
@@ -1221,6 +1222,13 @@ class _CommandEventStreamer:
             if delta:
                 self._retain_tail(stream, delta)
                 self._send(stream, delta)
+        for stream, withheld in self._withheld_characters.items():
+            if withheld:
+                self._emit_output({
+                    "type": "tool.output.tail",
+                    "stream": stream,
+                    "delta": self.tail(stream)[-withheld:],
+                })
 
     def _retain_tail(self, stream: str, delta: str) -> None:
         self._tails[stream] = (self._tails[stream] + delta)[-MAX_COMMAND_TAIL_CHARS:]
@@ -1230,9 +1238,11 @@ class _CommandEventStreamer:
 
     def _send(self, stream: str, delta: str) -> None:
         if self._truncated:
+            self._withheld_characters[stream] += len(delta)
             return
         remaining = MAX_COMMAND_OUTPUT_CHARS - self._emitted_characters
         if len(delta) > remaining:
+            self._withheld_characters[stream] += len(delta) - remaining
             warning = (
                 "\n[Warning: Live command output truncated after 100000 characters.]"
             )
@@ -1240,7 +1250,10 @@ class _CommandEventStreamer:
             self._truncated = True
         self._emitted_characters += min(len(delta), remaining)
         if delta:
-            try:
-                self._emit({"type": "tool.output", "stream": stream, "delta": delta})
-            except Exception:
-                pass
+            self._emit_output({"type": "tool.output", "stream": stream, "delta": delta})
+
+    def _emit_output(self, event: dict[str, str]) -> None:
+        try:
+            self._emit(event)
+        except Exception:
+            pass

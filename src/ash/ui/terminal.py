@@ -1137,7 +1137,7 @@ class TerminalUI:
         """Render concise tool lifecycle state outside the assistant panel."""
 
         event_type = payload.get("type")
-        if event_type == "tool.output" and self._activity_turn_closed:
+        if event_type in {"tool.output", "tool.output.tail"} and self._activity_turn_closed:
             return
         if event_type in _TURN_TERMINAL_EVENTS or event_type == "turn.started":
             self._finalize_pending_tool_output()
@@ -1247,6 +1247,7 @@ class TerminalUI:
         if event_type not in {
             "tool.started",
             "tool.output",
+            "tool.output.tail",
             "tool.completed",
             "tool.denied",
             "tool.error",
@@ -1258,10 +1259,13 @@ class TerminalUI:
         call_id = str(payload.get("call_id", ""))
         if event_type == "tool.started":
             return
-        if event_type == "tool.output":
+        if event_type in {"tool.output", "tool.output.tail"}:
             delta = terminal_safe_text(str(payload.get("delta", "")))
             if not delta:
                 return
+            stream = "stderr" if payload.get("stream") == "stderr" else "stdout"
+            if event_type == "tool.output.tail":
+                delta = f"\n[Last captured {stream}]\n{delta}"
             entry_id = self._tool_output_entries.get(call_id)
             if entry_id is None:
                 entry_id = self.transcript.begin(
@@ -1271,7 +1275,6 @@ class TerminalUI:
                 )
                 self._tool_output_entries[call_id] = entry_id
             self.transcript.append_delta(entry_id, delta)
-            stream = str(payload.get("stream", "stdout"))
             style = "red" if stream == "stderr" else ""
             if self._prompt_invalidator is not None:
                 self._conversation_needs_user_gap = True
