@@ -38,15 +38,29 @@ def test_anchored_directory_listing_uses_fresh_cursor_and_original_inode(
     original.mkdir()
     (original / "plugin.json").write_text("{}", encoding="utf-8")
     with AnchoredDirectory.open(original, create=False, private=False) as held:
-        os.lseek(held.descriptor, 0, os.SEEK_END)
-        assert held.list_names() == ["plugin.json"]
+        opened = os.fstat(held.descriptor)
+        actual_listdir = os.listdir
+        new_cursor_reads = 0
 
-        displaced = tmp_path / "displaced"
-        original.rename(displaced)
-        original.mkdir()
-        (original / "hostile.json").write_text("{}", encoding="utf-8")
-        os.lseek(held.descriptor, 0, os.SEEK_END)
-        assert held.list_names() == ["plugin.json"]
+        def stale_cursor_listdir(descriptor: int) -> list[str]:
+            nonlocal new_cursor_reads
+            if descriptor == held.descriptor:
+                return []  # An exhausted shared offset must not hide entries.
+            current = os.fstat(descriptor)
+            assert (current.st_dev, current.st_ino) == (opened.st_dev, opened.st_ino)
+            new_cursor_reads += 1
+            return actual_listdir(descriptor)
+
+        # SEEK_END on directory descriptors is unsupported on some filesystems.
+        with patch("ash.safety.anchored_fs.os.listdir", side_effect=stale_cursor_listdir):
+            assert held.list_names() == ["plugin.json"]
+
+            displaced = tmp_path / "displaced"
+            original.rename(displaced)
+            original.mkdir()
+            (original / "hostile.json").write_text("{}", encoding="utf-8")
+            assert held.list_names() == ["plugin.json"]
+        assert new_cursor_reads == 2
 
 
 @pytest.mark.skipif(os.name != "posix", reason="POSIX directory descriptor")
