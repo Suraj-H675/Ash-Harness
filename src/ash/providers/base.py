@@ -245,6 +245,12 @@ class ProviderCompletionError(RuntimeError):
         self.stop_category = stop_category
 
 
+class ProviderMalformedToolArgumentsError(ProviderCompletionError):
+    """Malformed native arguments; this response dispatched no tool calls."""
+
+    retriable = True
+
+
 class ProviderIncompleteStreamError(ProviderCompletionError):
     """Provider stream ended before a terminal chunk and is safe to retry."""
 

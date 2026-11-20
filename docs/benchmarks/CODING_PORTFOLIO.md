@@ -28,7 +28,7 @@ Keep the lanes separate and do not pool their scores into a single win rate.
 | R13 | `moreitertools-peekable-reverse-slice` | Pinned real repo | Prevent `peekable` from exhausting an infinite or large finite iterator when reverse slicing with a known start and omitted stop; preserve caching and genuine right-relative indexing | **First sequential 65K pair: both pass**; Ash 69.16s / 6 model requests / 6 tools / 0 rejects, Codex 53.46s / 3 non-test shell commands; one observation and native policy-parity caveat |
 | R14 | `toolz-partition-invalid-length` | Pinned real repo | Detect an iterable's incorrect reported length rather than silently truncate a partially filled partition; preserve correct normal and no-length iteration | **First sequential 65K pair: both pass**; Ash 88.85s / 8 model requests / 8 tool calls (one safe edit rejection), Codex 104.25s / 4 non-test commands; one sample, with policy-parity limits |
 | R15 | `click-clirunner-context-settings` | Pinned real repo | Extend Click's `CliRunner.invoke` public API with context-settings overrides that avoid parameter-name collisions while preserving existing invocation behavior | **First sequential 65K pair: both pass**; Ash 113.51s / 12 model requests / 15 tools (one rejected regex), Codex 86.05s / four non-test shell commands; one sample and native-policy caveat |
-| R16 | `pyflakes-functional-typing-fields` | Pinned real repo | Python static analysis in Pyflakes. Track name uses in runtime `TypedDict` and `NamedTuple` field expressions while preserving annotation handling | **NOT YET SCORED**. Independent trusted-host preflight passed (red/red base, green/green fix, checker-only repair passed). |
+| R16 | `pyflakes-functional-typing-fields` | Pinned real repo | Python static analysis in Pyflakes. Track name uses in runtime `TypedDict` and `NamedTuple` field expressions while preserving annotation handling | **First matched pair: Ash fail (malformed provider tool-call arguments before any edit), plain Codex pass (visible and hidden oracles).** One trial only; no stable reliability or speed ranking. Independent source preflight remains red/red base and green/green fix. |
 | S1 | `marker` | Synthetic CLI smoke | Exact file creation and protected-file preservation | Exists; record separately as smoke |
 | S2 | `build-run` | Synthetic CLI smoke | Create a script, then execute authorized check | Exists; verify tool execution and terminal completion |
 | S3 | `repair-test` | Synthetic repair | Single-file bug and independent hidden check | Exists; current strong-model baseline pending |
@@ -63,7 +63,23 @@ checker module into the base also passed both (0/0). The source-only repair
 passed the edit-scope check, while a simulated edit to the protected upstream
 test was rejected. The run used exact pinned Git revisions pre-fetched on the
 trusted host (rather than nesting Bubblewrap inside Codex's workspace-write
-sandbox). No live Ash or plain-Codex model trial has been run for R16.
+sandbox).
+
+**R16 first matched trial (2026-11-19):** At local Ash commit `7cb0645`, one
+sequential pair requested `gpt-6-luna` at `xhigh` and 65,536 context tokens,
+used the same user prompt and frozen visible/hidden oracles, and allowed 210
+seconds per engine. Ash failed after 39.74 seconds of CLI execution: its first
+two model requests and six read/search/status tools completed, but the third
+provider response produced invalid native function-call JSON. Ash returned a
+provider-category error with no edits or visible test command; both oracles
+remained red. Audit and protected-file checks passed. Plain Codex completed in
+86.27 seconds, modified only `pyflakes/checker.py`, executed the visible test,
+and passed both independent oracles with protected files unchanged. The
+comparator verified source pins, prompt, oracle hashes, requested model/effort,
+requested context, and isolated credentials; system prompts, tools, shell
+permissions and actual served-model details were not proven equivalent.
+This is **one Ash failure and one Codex success**, not a stable performance
+estimate or evidence that the preceding reference-lookup optimization regressed.
 
 **R15 provenance and preflight (2026-11-17):**
 The independently selected [pallets/click PR #3896](https://github.com/pallets/click/pull/3896),

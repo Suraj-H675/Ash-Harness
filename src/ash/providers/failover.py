@@ -12,6 +12,7 @@ from ash.providers.base import (
     ProviderABC,
     ProviderCapabilityError,
     ProviderIncompleteStreamError,
+    ProviderMalformedToolArgumentsError,
     ProviderTerminalError,
     StreamChunk,
     completion_stop_category,
@@ -237,7 +238,15 @@ class FailoverProvider(ProviderABC):
                 self.failures = failures
                 return
             except Exception as exc:  # noqa: BLE001
-                if emitted_output or exposed_terminal:
+                if (
+                    emitted_output
+                    or exposed_terminal
+                    or isinstance(exc, ProviderMalformedToolArgumentsError)
+                ):
+                    # Invalid model-generated arguments are not a transport
+                    # outage. Preserve the typed error for one bounded retry
+                    # in the outer loop, rather than multiplying requests
+                    # across providers and losing the safe CLI remedy.
                     self.failures = failures
                     raise
                 last_error = exc

@@ -12,6 +12,7 @@ from ash.context.tokens import OpenAITokenCounter
 from ash.providers.base import (
     ProviderABC,
     ProviderIncompleteStreamError,
+    ProviderMalformedToolArgumentsError,
     ProviderTerminalError,
     StreamChunk,
     TokenCounterLike,
@@ -246,14 +247,22 @@ async def stream_openai_responses(
                     provider_state.append(_reasoning_replay_item(item))
                 elif item_type == "function_call":
                     raw_arguments = str(getattr(item, "arguments", "") or "")
+                    malformed = False
                     try:
                         arguments = strict_json_loads(raw_arguments)
-                    except (json.JSONDecodeError, ValueError, UnicodeError) as exc:
-                        raise RuntimeError(
-                            "OpenAI returned invalid function-call arguments"
-                        ) from exc
+                    except (json.JSONDecodeError, ValueError, UnicodeError):
+                        malformed = True
+                    # Raise *outside* the parser's exception handler. `from None`
+                    # only hides `__context__` in formatted tracebacks; the
+                    # original JSON error may retain private arguments in `doc`.
+                    if malformed:
+                        raise ProviderMalformedToolArgumentsError(
+                            "OpenAI returned invalid native function-call arguments"
+                        )
                     if not isinstance(arguments, dict):
-                        raise RuntimeError("OpenAI function-call arguments were not an object")
+                        raise ProviderMalformedToolArgumentsError(
+                            "OpenAI returned non-object native function-call arguments"
+                        )
                     tool_calls.append(
                         CanonicalToolCall(
                             call_id=str(getattr(item, "call_id", "") or ""),

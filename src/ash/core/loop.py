@@ -91,6 +91,7 @@ from ash.providers.base import (
     ProviderCapabilityError,
     ProviderCompletionError,
     ProviderIncompleteStreamError,
+    ProviderMalformedToolArgumentsError,
     ProviderTerminalError,
     StreamChunk,
     TokenCounterLike,
@@ -5498,6 +5499,7 @@ class AshLoop:
         saw_terminal = False
         terminal_stop_reason: str | None = None
         maximum_attempts = int(getattr(self._config, "provider_max_attempts", 3))
+        malformed_argument_retries = 0
         retry_base_delay = float(
             getattr(self._config, "provider_retry_base_delay", 0.5)
         )
@@ -5912,6 +5914,12 @@ class AshLoop:
                                 primary_error=exc,
                             )
                         failure = classify_provider_failure(exc)
+                        malformed_arguments = isinstance(
+                            exc, ProviderMalformedToolArgumentsError
+                        )
+                        can_retry = failure.retriable and not (
+                            malformed_arguments and malformed_argument_retries >= 1
+                        )
                         self._emit_event(
                             {
                                 "type": "model.request.error",
@@ -5920,7 +5928,7 @@ class AshLoop:
                                 "model": self.active_model_id,
                                 "attempt": attempt,
                                 "status_code": failure.status_code,
-                                "retriable": failure.retriable,
+                                "retriable": can_retry,
                                 "failure_category": failure.category.value,
                                 "emitted_output": emitted_output,
                                 "error_type": type(exc).__name__,
@@ -5931,11 +5939,12 @@ class AshLoop:
                         active_request_id = None
                         if (
                             emitted_output
-                            or not failure.retriable
+                            or not can_retry
                             or attempt >= maximum_attempts
                         ):
                             if (
-                                failure.retriable
+                                can_retry
+                                and not malformed_arguments
                                 and self.provider_circuit_breaker.record_failure(
                                     self._provider_circuit_key
                                 )
@@ -5956,6 +5965,8 @@ class AshLoop:
                                     }
                                 )
                             raise
+                        if malformed_arguments:
+                            malformed_argument_retries += 1
                         delay = retry_delay(
                             failure,
                             attempt,

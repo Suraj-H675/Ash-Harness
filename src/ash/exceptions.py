@@ -8,7 +8,10 @@ from typing import Any
 
 from ash.context.history import ContextBudgetExceededError
 from ash.core.redaction import redact_text
-from ash.providers.base import ProviderCompletionError
+from ash.providers.base import (
+    ProviderCompletionError,
+    ProviderMalformedToolArgumentsError,
+)
 from ash.ui.safe_text import terminal_safe_text
 
 
@@ -213,6 +216,17 @@ def classify_exception(exc: BaseException) -> ErrorInfo:
             message,
             "Install an available sandbox backend, choose a less privileged safety mode, or configure Ash for this host.",
             retriable=True,
+        )
+
+    if isinstance(exc, ProviderMalformedToolArgumentsError):
+        return ErrorInfo(
+            ErrorCategory.PROVIDER,
+            message,
+            "The model or provider returned malformed native tool arguments. "
+            "Ash did not execute tool calls from that response. "
+            "Inspect the session and workspace before manually retrying; "
+            "the current request cannot be safely completed.",
+            retriable=False,
         )
 
     if type(exc) is ProviderCompletionError and lowered.startswith(
