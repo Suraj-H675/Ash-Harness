@@ -2771,7 +2771,7 @@ def _locked_runtime_versions(
 
 
 def _read_regular_source(
-    path: Path, relative_name: str, *, require_unlinked: bool = False
+    path: Path, relative_name: str
 ) -> bytes:
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
     try:
@@ -2784,8 +2784,6 @@ def _read_regular_source(
         before = os.fstat(fd)
         if not stat.S_ISREG(before.st_mode):
             raise RuntimeError(f"runtime source is not a regular file: {relative_name}")
-        if require_unlinked and before.st_nlink != 1:
-            raise RuntimeError(f"runtime source file is hardlinked: {relative_name}")
         with os.fdopen(fd, "rb", closefd=False) as source:
             data = source.read(_RUNTIME_MAX_BYTES + 1)
         after = os.fstat(fd)
@@ -2862,7 +2860,10 @@ def _package_source_files(
                 raise RuntimeError(
                     "runtime package source lacks a bounded SHA-256 RECORD"
                 )
-            data = _read_regular_source(path, relative_name, require_unlinked=True)
+            # uv can legitimately hardlink wheel files to its cache. Never
+            # publish bytes from the active venv unless the complete package
+            # matches its separately frozen source fingerprint below.
+            data = _read_regular_source(path, relative_name)
             digest = base64.urlsafe_b64encode(hashlib.sha256(data).digest())
             digest_text = digest.rstrip(b"=").decode("ascii")
             if digest_text != hash_record.partition("=")[2] or len(data) != int(

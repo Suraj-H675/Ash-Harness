@@ -753,7 +753,12 @@ import os
 import sys
 
 test_file = Path(sys.argv[3])
-visible = [repr(sys.argv), Path('/proc/self/cmdline').read_bytes().decode('utf-8', 'ignore')]
+visible = [repr(sys.argv)]
+# Linux has procfs; macOS does not. Exercise procfs when present and still
+# verify argv, environment, visible files, and cwd on both host platforms.
+proc_cmdline = Path('/proc/self/cmdline')
+if proc_cmdline.is_file():
+    visible.append(proc_cmdline.read_bytes().decode('utf-8', 'ignore'))
 visible.append(repr(dict(os.environ)))
 visible.extend(str(path) for path in Path.cwd().rglob('*'))
 visible.extend(path.read_text(encoding='utf-8', errors='ignore') for path in Path.cwd().rglob('*') if path.is_file())
@@ -948,6 +953,33 @@ def test_r17_runtime_rejects_modified_source_even_with_matching_record(
         bench._package_source_files(modified_root.parent, package, recorded)
 
 
+def test_r17_runtime_accepts_hardlinked_source_with_independent_byte_attestation(
+    tmp_path: Path,
+) -> None:
+    """Normal uv cache hardlinks are safe if all copied bytes match frozen pins."""
+    task = bench.TASKS["pytest-mixed-indirect-fixture-precedence"]
+    _, purelib, metadata = bench._locked_runtime_versions(task.runtime)
+    package = next(
+        item for item in task.runtime.packages if item.package == "iniconfig"
+    )
+    recorded = metadata[package.distribution.casefold()][1]
+    import shutil
+
+    copied = tmp_path / "purelib" / package.package
+    copied.parent.mkdir()
+    shutil.copytree(purelib / package.package, copied)
+    source = copied / "__init__.py"
+    trusted_cache = tmp_path / "cache-source.py"
+    trusted_cache.write_bytes(source.read_bytes())
+    source.unlink()
+    os.link(trusted_cache, source)
+    assert source.stat().st_nlink == 2
+
+    found = bench._package_source_files(copied.parent, package, recorded)
+    assert found[f"{package.package}/__init__.py"] == trusted_cache.read_bytes()
+    assert bench._hash_file_map(found) == package.trusted_source_sha256
+
+
 def test_r17_runtime_rejects_hardlinked_source_even_with_forged_record(
     tmp_path: Path,
 ) -> None:
@@ -973,7 +1005,9 @@ def test_r17_runtime_rejects_hardlinked_source_even_with_forged_record(
         str(len(data)),
     )
 
-    with pytest.raises(RuntimeError, match="hardlinked"):
+    # A forged RECORD cannot authorize arbitrary host bytes, even when a
+    # package path is hardlinked to them: the separately frozen digest wins.
+    with pytest.raises(RuntimeError, match="trusted runtime source fingerprint mismatch"):
         bench._package_source_files(linked_root.parent, package, recorded)
     assert external.read_text(encoding="utf-8") == "synthetic host-only bytes"
 
