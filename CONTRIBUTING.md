@@ -6,17 +6,35 @@ unit-test expectations.
 
 ## Development Setup
 
-Python 3.12 through 3.14 and `uv` are required for Ash development. **Linux is
+Python 3.12 through 3.14 and **uv 0.12.17** are required for Ash development.
+The exact uv version is enforced by `pyproject.toml`; a different installed
+version will refuse to run project commands, even if it is newer. **Linux is
 the primary target**, with Arch Linux as the main local development environment;
 hosted CI exercises Ubuntu. **macOS remains a supported secondary native host**
 with important regression and packaging checks. On Windows, WSL2 is an
 **experimental, not-yet-verified** way to reuse the Linux implementation;
 native Windows is deferred and unsupported.
 
+With uv 0.12.17 already on your `PATH`:
+
 ```bash
-uv sync --group dev --extra server --extra acp --extra a2a
-uv run ash --help
+uv sync --locked --group dev --extra server --extra acp --extra a2a
+uv run --locked ash --help
 ```
+
+If your installed uv has a different version, use `uvx` to invoke the pinned
+version **without replacing your system uv**:
+
+```bash
+uvx --from 'uv==0.12.17' uv sync --locked --group dev --extra server --extra acp --extra a2a
+uvx --from 'uv==0.12.17' uv run --locked ash --help
+```
+
+Use the same `uvx --from 'uv==0.12.17' uv` prefix for verification and build
+commands below while your system uv differs. `uvx` acquires the pinned tool if
+it is not cached; `uvx --offline --from 'uv==0.12.17' uv` also works if that
+version is already cached. Offline mode cannot fetch a missing tool or package.
+Do not loosen the repository's version pin to work around a local mismatch.
 
 Implementation code belongs under `src/ash`; tests mirror the affected layer
 under `tests/unit`, `tests/integration`, or `tests/e2e`. Import project code
