@@ -100,6 +100,158 @@ def test_engine_commands_select_plain_codex_with_identical_model_limits(
         assert "poteto" not in " ".join(argv).lower()
 
 
+def test_batch_and_pair_refuse_unapproved_model_dispatch_before_any_effect(
+    tmp_path: Path,
+) -> None:
+    called: list[str] = []
+
+    def fake_invoke(argv: list[str], evidence: Path) -> int:
+        called.append(evidence.name)
+        raise AssertionError("model runner was invoked before operator consent")
+
+    pair_root = tmp_path / "pair"
+    pair_root.mkdir()
+    with pytest.raises(ValueError, match="explicit.*authorization"):
+        run_pair(
+            "h11-chunk-footer", 1, pair_root, 170, 32768,
+            invoke=fake_invoke,
+        )
+    assert list(pair_root.iterdir()) == []
+
+    batch_root = tmp_path / "batch"
+    with pytest.raises(ValueError, match="explicit.*authorization"):
+        run_batch(
+            ["h11-chunk-footer"], 1, 1, batch_root, 170, 32768,
+            invoke=fake_invoke,
+        )
+    assert not batch_root.exists()
+    assert not called
+
+
+def test_explicit_batch_consent_reaches_only_plain_codex_runner(
+    tmp_path: Path,
+) -> None:
+    ash = commands(
+        "h11-chunk-footer", "ash", tmp_path, 170, 32768,
+        authorize_model_trial=True,
+    )
+    codex = commands(
+        "h11-chunk-footer", "codex", tmp_path, 170, 32768,
+        authorize_model_trial=True,
+    )
+    assert "--authorize-model-trial" not in ash
+    assert codex.count("--authorize-model-trial") == 1
+    assert "--authorize-model-trial" not in commands(
+        "h11-chunk-footer", "codex", tmp_path, 170, 32768
+    )
+
+
+def test_paired_cli_requires_consent_before_reading_auth_or_creating_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    def unsafe_auth(_timeout: int) -> bool:
+        raise AssertionError("auth was touched before trial consent")
+
+    root = tmp_path / "new-private-evidence"
+    monkeypatch.setattr(batch_runner, "refresh_existing_chatgpt_access", unsafe_auth)
+    monkeypatch.setattr(
+        sys, "argv", [
+            "parallel_repository_benchmarks.py", "--task", "h11-chunk-footer",
+            "--evidence-root", str(root),
+        ],
+    )
+    with pytest.raises(SystemExit) as exc:
+        batch_runner.main()
+    assert exc.value.code == 2
+    assert "--authorize-model-trial" in capsys.readouterr().err
+    assert not root.exists()
+
+
+def test_approved_pair_refuses_unsealed_comparator_before_first_engine(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    attempted: list[Path] = []
+
+    def unexpected_invoke(argv: list[str], evidence: Path) -> int:
+        attempted.append(evidence)
+        raise AssertionError("plain Codex is unsealed; no Ash trial may run")
+
+    # Exercise real-runner dispatch with a simulated missing sealed profile.
+    def refuse_unsealed() -> None:
+        raise RuntimeError("sealed profile unavailable")
+
+    monkeypatch.setattr(batch_runner, "preflight_plain_codex_readiness", refuse_unsealed)
+    monkeypatch.setattr(batch_runner, "invoke_runner", unexpected_invoke)
+    root = tmp_path / "would-be-private-batch"
+    with pytest.raises(RuntimeError, match="sealed profile unavailable"):
+        run_batch(
+            ["h11-chunk-footer"], 1, 1, root, 170, 32768,
+            invoke=unexpected_invoke, authorize_model_trial=True,
+        )
+    assert not root.exists()
+    assert not attempted
+
+
+def test_approved_cli_rejects_unsealed_native_before_accessing_credentials(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    def no_seal() -> None:
+        raise RuntimeError("private attestation drift")
+
+    def no_access(_timeout: int) -> bool:
+        raise AssertionError("auth must not be accessed when native comparator is unsealed")
+
+    monkeypatch.setattr(batch_runner, "preflight_plain_codex_readiness", no_seal)
+    monkeypatch.setattr(batch_runner, "refresh_existing_chatgpt_access", no_access)
+    root = tmp_path / "uncreated"
+    monkeypatch.setattr(
+        sys, "argv", [
+            "parallel_repository_benchmarks.py", "--task", "h11-chunk-footer",
+            "--authorize-model-trial", "--evidence-root", str(root),
+        ],
+    )
+    with pytest.raises(SystemExit) as exc:
+        batch_runner.main()
+    assert exc.value.code == 2
+    assert "sealed plain Codex" in capsys.readouterr().err
+    assert not root.exists()
+
+
+def test_paired_cli_with_explicit_consent_passes_authorization_to_batch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    observed: list[dict[str, object]] = []
+
+    def fake_batch(*args: object, **kwargs: object) -> dict[str, object]:
+        observed.append({"args": args, **kwargs})
+        return {"parallel_pairs": 1, "uncontended_latency_mode": True, "results": [
+            {"comparison_verified": True}
+        ]}
+
+    monkeypatch.setattr(batch_runner, "refresh_existing_chatgpt_access", lambda _: True)
+    monkeypatch.setattr(batch_runner, "preflight_plain_codex_readiness", lambda: None)
+    monkeypatch.setattr(batch_runner, "run_batch", fake_batch)
+    monkeypatch.setattr(
+        sys, "argv", [
+            "parallel_repository_benchmarks.py", "--task", "h11-chunk-footer",
+            "--parallel", "1", "--evidence-root", str(tmp_path / "never-created"),
+            "--authorize-model-trial",
+        ],
+    )
+    assert batch_runner.main() == 0
+    assert len(observed) == 1
+    assert observed[0]["authorize_model_trial"] is True
+    assert len(json.loads(capsys.readouterr().out)["results"]) == 1
+    assert not (tmp_path / "never-created").exists()
+
+
 def test_runner_receipt_directory_is_created_by_runner_not_supervisor(
     tmp_path: Path,
 ) -> None:
@@ -126,10 +278,14 @@ def test_pair_alternates_order_and_validates_external_receipts(
 
     def fake_invoke(argv: list[str], evidence: Path) -> int:
         seen.append(evidence.name)
+        assert ("--authorize-model-trial" in argv) == (evidence.name == "codex")
         _emit_receipt("h11-chunk-footer", evidence)
         return 0
 
-    report = run_pair("h11-chunk-footer", rep, tmp_path, 170, 32768, invoke=fake_invoke)
+    report = run_pair(
+        "h11-chunk-footer", rep, tmp_path, 170, 32768,
+        invoke=fake_invoke, authorize_model_trial=True,
+    )
     assert seen == expected
     assert report["comparison_verified"] is True
     assert report["ash_pass"] is True
@@ -147,7 +303,10 @@ def test_pair_excludes_provider_outage_from_valid_comparisons(tmp_path: Path) ->
         _emit_receipt("h11-chunk-footer", evidence, outage=evidence.name == "codex")
         return 1 if evidence.name == "codex" else 0
 
-    report = run_pair("h11-chunk-footer", 1, tmp_path, 170, 32768, invoke=fake_invoke)
+    report = run_pair(
+        "h11-chunk-footer", 1, tmp_path, 170, 32768,
+        invoke=fake_invoke, authorize_model_trial=True,
+    )
     assert report["comparison_verified"] is False
     assert report["reason"] == "provider_outage_or_parity_unverified"
     assert report["runner_exit_codes"] == {"ash": 0, "codex": 1}
@@ -163,7 +322,10 @@ def test_r17_synthetic_pair_uses_the_standard_grade_path(tmp_path: Path) -> None
         _emit_receipt(task, evidence)
         return 0
 
-    report = run_pair(task, 1, tmp_path, 170, 32768, invoke=fake_invoke)
+    report = run_pair(
+        task, 1, tmp_path, 170, 32768,
+        invoke=fake_invoke, authorize_model_trial=True,
+    )
     assert seen == ["ash", "codex"]
     assert report["comparison_verified"] is True
     assert report["fully_controlled"] is False
@@ -193,6 +355,7 @@ def test_two_scenarios_execute_concurrently_with_separate_evidence(
     report = run_batch(
         ["h11-chunk-footer", "urllib3-header-sanitization"],
         1, 2, root, 170, 32768, invoke=fake_invoke,
+        authorize_model_trial=True,
     )
     assert len(set(seen)) == 2
     assert len(report["results"]) == 2

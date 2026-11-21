@@ -22,6 +22,11 @@ import time
 from typing import Any, Callable
 
 from coding_comparison import compare
+from codex_repository_benchmark import (
+    _native_codex_binary,
+    _require_sealed_comparator_profile,
+)
+from coding_benchmark import _chatgpt_tmpfs_root
 from ash.providers.openai_chatgpt_auth import ChatGPTAuthSession, ChatGPTCredentialStore
 from repository_benchmark import TASKS, hidden_oracle_classification
 
@@ -45,8 +50,26 @@ def invoke_runner(argv: list[str], evidence: Path) -> int:
         ).returncode
 
 
+def preflight_plain_codex_readiness() -> None:
+    """Fail before any Ash model call if the matched native Codex is unsealed.
+
+    The child runner repeats these checks and its effective sandbox probe
+    before its own dispatch. This early guard only prevents a wasted Ash arm;
+    it does not assert identical Ash/Codex runtime tool permissions.
+    """
+    _require_sealed_comparator_profile()
+    _native_codex_binary()
+    _chatgpt_tmpfs_root()
+
+
 def commands(
-    task: str, engine: str, evidence: Path, timeout: int, context: int
+    task: str,
+    engine: str,
+    evidence: Path,
+    timeout: int,
+    context: int,
+    *,
+    authorize_model_trial: bool = False,
 ) -> list[str]:
     if engine == "ash":
         return [
@@ -73,6 +96,7 @@ def commands(
             "--reasoning-effort", "xhigh",
             "--context-tokens", str(context),
             "--timeout", str(timeout),
+            *(["--authorize-model-trial"] if authorize_model_trial else []),
             "--evidence-dir", str(evidence),
         ]
     raise ValueError("unsupported engine")
@@ -87,7 +111,12 @@ def run_pair(
     *,
     invoke: Invoke = invoke_runner,
     order_offset: int = 0,
+    authorize_model_trial: bool = False,
 ) -> dict[str, Any]:
+    if not authorize_model_trial:
+        raise ValueError("paired model trials require explicit operator authorization")
+    if invoke is invoke_runner:
+        preflight_plain_codex_readiness()
     pair_id = f"{task}-r{repetition:02d}"
     directory = root / pair_id
     directory.mkdir(mode=0o700)
@@ -100,7 +129,10 @@ def run_pair(
         evidence = directory / engine
         try:
             exit_codes[engine] = invoke(
-                commands(task, engine, evidence, timeout, context), evidence
+                commands(
+                    task, engine, evidence, timeout, context,
+                    authorize_model_trial=authorize_model_trial,
+                ), evidence
             )
         except (OSError, subprocess.SubprocessError):
             # Never put paths, provider payloads, or credential errors in
@@ -172,6 +204,7 @@ def run_batch(
     context: int,
     *,
     invoke: Invoke = invoke_runner,
+    authorize_model_trial: bool = False,
 ) -> dict[str, Any]:
     if parallel not in (1, 2) or not 1 <= repeats <= 3:
         raise ValueError("parallel workers and repetition count exceed bounds")
@@ -183,6 +216,10 @@ def run_batch(
         raise ValueError("out-of-range model limits")
     if root.resolve().is_relative_to(ROOT.resolve()):
         raise ValueError("private benchmark evidence must live outside the repo")
+    if not authorize_model_trial:
+        raise ValueError("paired model trials require explicit operator authorization")
+    if invoke is invoke_runner:
+        preflight_plain_codex_readiness()
     root.mkdir(mode=0o700, parents=False, exist_ok=False)
     jobs = [
         (task, i, offset)
@@ -195,6 +232,7 @@ def run_batch(
             executor.submit(
                 run_pair, task, rep, root, timeout, context,
                 invoke=invoke, order_offset=offset,
+                authorize_model_trial=authorize_model_trial,
             )
             for task, rep, offset in jobs
         ]
@@ -242,6 +280,11 @@ def main() -> int:
     parser.add_argument("--timeout", type=int, default=170)
     parser.add_argument("--context-tokens", type=int, default=32768)
     parser.add_argument("--evidence-root", type=Path)
+    parser.add_argument(
+        "--authorize-model-trial",
+        action="store_true",
+        help="Explicitly authorize model inference for every pair in this batch",
+    )
     args = parser.parse_args()
     os.umask(0o077)
     if (
@@ -252,6 +295,11 @@ def main() -> int:
         or not 8192 <= args.context_tokens <= 65536
     ):
         parser.error("invalid or duplicate task or unsupported model limits")
+    if not args.authorize_model_trial:
+        parser.error(
+            "Paired model trials require --authorize-model-trial before "
+            "credential access or running either engine"
+        )
     root = args.evidence_root
     if root is None:
         root = Path(tempfile.gettempdir()) / (
@@ -259,6 +307,10 @@ def main() -> int:
         )
     if root.exists() or root.resolve().is_relative_to(ROOT.resolve()):
         parser.error("private benchmark evidence path is not a new external directory")
+    try:
+        preflight_plain_codex_readiness()
+    except (OSError, ValueError, RuntimeError):
+        parser.error("sealed plain Codex comparator unavailable; no engine launched")
     try:
         access_covered = refresh_existing_chatgpt_access(args.timeout)
     except Exception:
@@ -269,6 +321,7 @@ def main() -> int:
         report = run_batch(
             args.task, args.repetitions, args.parallel, root,
             args.timeout, args.context_tokens,
+            authorize_model_trial=args.authorize_model_trial,
         )
     except ValueError:
         parser.error("invalid scenario configuration or private evidence path")

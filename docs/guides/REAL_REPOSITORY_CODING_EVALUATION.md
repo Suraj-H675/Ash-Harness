@@ -197,9 +197,14 @@ PYTHONPATH=src .venv/bin/python devtools/codex_repository_benchmark.py \
   --preflight-only --evidence-dir /var/tmp/ash-codex-h11-preflight
 ~~~
 
-For an actual operator-approved, bounded model run, omit --preflight-only,
-choose a new evidence directory, and optionally set --timeout (30–300
-seconds). A zero exit means both independent oracles passed, the authorized
+For an actual **separately owner-approved** bounded model run, omit
+`--preflight-only`, add the required `--authorize-model-trial` opt-in, choose a
+new evidence directory, and optionally set `--timeout` (30–300 seconds). The
+model-using plain-Codex runner also requires its independently attested Linux
+x86_64 sealed managed sandbox profile; unsupported platforms or changed local
+policy/native binary fail closed before accessing model credentials. The
+one-time attestation and flag are not general permission to run further paid
+trials. A zero exit means both independent oracles passed, the authorized
 source was changed, protected files stayed unchanged, the visible QA command
 was observed succeeding, and the Codex CLI emitted a completed turn. A
 timeout cannot count as a finished run even if the resulting code passes.
@@ -208,6 +213,27 @@ logs are retained outside Git. Scratch source checkouts are removed after
 grading. The runner copies a temporary authenticated profile into RAM,
 but never inherits ambient API-token environment variables and never
 mutates the existing personal Codex installation.
+
+The paired coordinator (`devtools/parallel_repository_benchmarks.py`) also
+requires `--authorize-model-trial` **before** it refreshes credentials, creates
+batch evidence, or dispatches either engine. After explicit owner approval for
+the named task(s), number of repetitions, and per-engine budget, an example
+single-pair invocation is:
+
+~~~sh
+PYTHONPATH=src .venv/bin/python devtools/parallel_repository_benchmarks.py \
+  --task h11-chunk-footer --parallel 1 --repetitions 1 \
+  --timeout 170 --context-tokens 32768 --authorize-model-trial \
+  --evidence-root /var/tmp/ash-approved-paired-new-evidence
+~~~
+
+The flag authorizes **every Ash and Codex model run in the selected batch**
+(up to six pairs), not merely one child. Never reuse it without a fresh
+correspondingly scoped owner approval. Missing authorization fails without
+starting either engine; `--authorize-model-trial` is forwarded to the Codex
+child, not passed as an unsupported Ash option. A valid batch still cannot
+claim matched tools, system prompts, or permission semantics solely because
+model, effort, source, user prompt and context settings were matched.
 
 For the paired Ash run, use the same task, model, effort, time limit
 and a fresh evidence directory, passing `--fair-prompt` to
@@ -233,12 +259,15 @@ providers account for system overhead identically, and Codex has no
 enforced counterpart to Ash's `--turn-token-budget`.
 
 **Comparison limitations:** The shell sandbox and command permissions are
-not identical to Ash's exact tool grants. Network blocking and host skill
-discovery disabling are requested through Codex configuration, not
-independently proven in all cases; access to every host-side file has not
-been audited. Only the agent's personal profile is isolated, not every
-possible host read path. Both receive identical user-input bytes, but their
-product/system instructions, native tools, provider internals and resource
-accounting differ. The prompt fingerprint checks user intent equality,
-not system-prompt equality. Do not claim a fully controlled head-to-head or
-general competitive win from one paired trial.
+not identical to Ash's exact tool grants. The bounded Linux x86_64 comparator
+now checks a managed-profile and native-binary attestation and runs a model-free
+sandbox probe for workspace access, outside-file denial and socket denial
+before model dispatch. This is a verified *bounded* isolation preflight, not
+proof that all host read paths or effective execution grants match Ash's. The
+plain comparator also requests suppression of user-owned skills and rules;
+there is no established exact parity of system instructions, native tools,
+provider internals, permissions or resource accounting. macOS model-driven
+plain-Codex trials fail closed rather than claiming equivalent confinement.
+The prompt fingerprint checks user intent equality, not system-prompt equality.
+Do not claim a fully controlled head-to-head or general competitive win from
+one paired trial.
