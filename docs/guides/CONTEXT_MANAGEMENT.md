@@ -247,6 +247,49 @@ provider-visible tool count, an eight-name preview, and how many registry tools
 remain deferred. It also reports whether core instructions, loaded persistent
 instructions, or supplemental system context were truncated.
 
+### Diagnosing request context
+
+Use `/context` to compare the most recently recorded successful request
+assembly with the last dispatched attempt, inspect a local pre-dispatch stop,
+and read the last persisted cumulative turn usage. The command reads only the
+selected session's latest 300 runtime events; it does not read the transcript
+or contact a provider. `ash sessions activity --session SESSION_ID --json`
+shows the bounded event timeline with request/context correlation IDs, route
+fields, usage source, and rejection details.
+
+The local `~current/maximum` value is an Ash token estimate and effective
+input ceiling. A completed request's prompt usage is a separate measurement:
+it may be provider-reported or estimated when the provider omits usage. Cache
+read and write values are subsets of prompt usage. Cumulative turn usage sums
+request usage across the turn, so it is not a single request's context size.
+Provider-reported prompt usage may omit retained opaque reasoning or count
+schemas differently; it does not prove the total occupied context. Ash does
+not calibrate its admission estimate from historical usage ratios.
+
+`context.request.rejected` identifies one request attempt that Ash stopped
+before dispatch because of the local input limit, an opaque-context constraint,
+or the cumulative turn budget. Earlier provider requests may already have
+completed. The current stop reason and hard limits remain authoritative. For a
+request without a recorded outcome, `/context` checks the exact turn journal
+row in the selected session: a started turn remains pending, while an
+interrupted turn is shown as interrupted with provider outcome and usage
+unknown. A completed turn without a request outcome is shown as missing;
+absent or unreadable turn state is unknown. None of these states establishes
+whether a provider completed the request or whether retrying is safe. A
+failed/cancelled request has no completed usage value. Route parity is unknown
+unless both requested and effective provider/model routes are present for the
+same correlated attempt.
+
+The terminal view uses durable events scoped to the active session. Older
+records without correlation fields and unavailable, corrupt, or evicted events
+are reported as unknown/unavailable rather than joined by chronology. The
+context assembly and planner events omit credential profile labels. A
+successful tool-free final report records its own request and cumulative usage
+under a distinct reporting turn; a failed or cancelled report does not replace
+the prior turn usage. The
+`/context --provenance` fragment report remains process-local and is unavailable
+after resume until a new context assembly is built.
+
 ## Compaction
 
 The full transcript remains in SQLite. Compaction changes only the provider

@@ -738,6 +738,127 @@ def test_coding_timeline_records_request_and_tool_timings_without_content() -> N
     assert "/private/sensitive-file.py" not in serialized
 
 
+def test_coding_timeline_carries_context_retry_route_and_rejection_evidence() -> None:
+    context_id = "11111111-1111-4111-8111-111111111111"
+    rejected_context_id = "22222222-2222-4222-8222-222222222222"
+    first_operation_id = "33333333-3333-4333-8333-333333333333"
+    second_operation_id = "44444444-4444-4444-8444-444444444444"
+
+    def event(sequence: int, kind: str, **fields: object) -> StoredRuntimeEvent:
+        return StoredRuntimeEvent(
+            sequence=sequence,
+            event={
+                "type": kind,
+                "timestamp": f"2026-11-21T00:00:{sequence:02d}+00:00",
+                **fields,
+            },
+        )
+
+    evidence = summarize_operational_events(
+        [
+            event(
+                1,
+                "context.usage",
+                context_id=context_id,
+                assembly_purpose="request",
+                estimate_source="local",
+                current=74_000,
+                maximum=80_000,
+                estimator_route="unknown",
+                estimator_count_mode="unknown",
+            ),
+            event(
+                2,
+                "model.request.started",
+                operation_id=first_operation_id,
+                context_id=context_id,
+                attempt=1,
+                requested_route="provider-a/model-a",
+                effective_route="unknown",
+            ),
+            event(
+                3,
+                "model.request.error",
+                operation_id=first_operation_id,
+                context_id=context_id,
+                attempt=1,
+                failure_category="transient",
+                requested_route="provider-a/model-a",
+                effective_route="unknown",
+            ),
+            event(
+                4,
+                "provider.retrying",
+                context_id=context_id,
+                attempt=2,
+                max_attempts=3,
+                delay_seconds=0.0,
+            ),
+            event(
+                5,
+                "model.request.started",
+                operation_id=second_operation_id,
+                context_id=context_id,
+                attempt=2,
+                requested_route="provider-a/model-a",
+                effective_route="unknown",
+            ),
+            event(
+                6,
+                "model.request.completed",
+                operation_id=second_operation_id,
+                context_id=context_id,
+                attempt=2,
+                requested_route="provider-a/model-a",
+                effective_route="provider-b/model-b",
+                usage_source="provider",
+                prompt_tokens=900,
+                completion_tokens=30,
+                cache_read_tokens=200,
+                cache_write_tokens=50,
+            ),
+            event(
+                7,
+                "context.request.rejected",
+                context_id=rejected_context_id,
+                cause="turn_budget",
+                scope="request_attempt",
+                dispatch_status="not_dispatched",
+                required_input_tokens=1500,
+                input_limit=80_000,
+                turn_tokens_used=7900,
+                turn_token_limit=9000,
+                prompt="PRIVATE_PROMPT",
+            ),
+        ]
+    )
+
+    timeline = evidence["timeline"]
+    first_attempt = next(
+        item
+        for item in timeline
+        if item.get("operation_id") == first_operation_id
+        and item["type"] == "model.request.error"
+    )
+    completed_attempt = next(
+        item
+        for item in timeline
+        if item.get("operation_id") == second_operation_id
+        and item["type"] == "model.request.completed"
+    )
+    rejection = next(
+        item for item in timeline if item["type"] == "context.request.rejected"
+    )
+    assert first_attempt["context_id"] == completed_attempt["context_id"] == context_id
+    assert first_attempt["operation_id"] != completed_attempt["operation_id"]
+    assert completed_attempt["requested_route"] == "provider-a/model-a"
+    assert completed_attempt["effective_route"] == "provider-b/model-b"
+    assert completed_attempt["usage_source"] == "provider"
+    assert rejection["context_id"] == rejected_context_id
+    assert rejection["dispatch_status"] == "not_dispatched"
+    assert "PRIVATE_PROMPT" not in str(evidence)
+
+
 def test_coding_timeline_measures_only_successful_terminal_requests_and_tools() -> None:
     def event(sequence: int, kind: str, **fields: object) -> StoredRuntimeEvent:
         return StoredRuntimeEvent(

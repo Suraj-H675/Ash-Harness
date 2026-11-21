@@ -482,6 +482,37 @@ def test_local_openai_compatible_route_runs_through_fresh_cli_process(
         assert ("POST", "/v1/chat/completions", None) in seen
         assert request_bodies[0]["max_tokens"] == 64
         assert all(authorization is None for _, _, authorization in seen)
+
+        store = SessionStore(tmp_path / "db" / "sessions.db")
+        sessions = store.list_sessions(project_path=str(workspace))
+        assert len(sessions) == 1
+        events = store.list_runtime_events(
+            sessions[0].session_id,
+            limit=256,
+        )
+        context_events = [
+            item.event for item in events if item.event.get("type") == "context.usage"
+        ]
+        started = [
+            item.event
+            for item in events
+            if item.event.get("type") == "model.request.started"
+        ]
+        completed = [
+            item.event
+            for item in events
+            if item.event.get("type") == "model.request.completed"
+        ]
+        assert len(context_events) == len(started) == len(completed) == 1
+        context_event = context_events[0]
+        assert context_event["assembly_purpose"] == "request"
+        assert context_event["context_id"]
+        assert started[0]["context_id"] == context_event["context_id"]
+        assert completed[0]["context_id"] == context_event["context_id"]
+        assert context_event["estimator_route"] == f"{provider}/local-model"
+        assert started[0]["requested_route"] == f"{provider}/local-model"
+        assert completed[0]["effective_route"] == f"{provider}/local-model"
+        assert completed[0]["usage_source"] == "estimated"
     finally:
         server.shutdown()
         server.server_close()

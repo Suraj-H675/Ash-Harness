@@ -297,7 +297,12 @@ def test_planner_decompose_rejects_empty_request(tmp_path: Path) -> None:
 def test_planner_usage_is_included_in_approved_and_rejected_turns(
     tmp_path: Path, approved: bool
 ) -> None:
+    profile_label = "SECRET_LOOKING_PLANNER_PROFILE_FOR_TEST_ONLY"
+
     class UsageProvider(FakeProvider):
+        active_profile = profile_label
+        profile_ids = (profile_label,)
+
         def configure_max_tokens(self, max_tokens: int) -> None:
             self.max_tokens = max_tokens
 
@@ -360,6 +365,25 @@ def test_planner_usage_is_included_in_approved_and_rejected_turns(
     assert loop.last_turn_usage["usage_source"] == "provider"
     assert loop.last_turn_usage["cost_known"] is True
     assert loop._last_turn_budget_exhausted is False
+    events = store.list_recent_runtime_events(session.session_id, limit=100)
+    planner_assembly = next(
+        item.event
+        for item in events
+        if item.event.get("type") == "context.usage"
+        and item.event.get("assembly_purpose") == "request"
+    )
+    planner_events = [
+        item.event
+        for item in events
+        if item.event.get("context_id") == planner_assembly["context_id"]
+    ]
+    assert any(event.get("type") == "model.request.started" for event in planner_events)
+    assert any(
+        event.get("type") in {"model.request.completed", "model.request.error"}
+        for event in planner_events
+    )
+    assert all("credential_profile" not in event for event in planner_events)
+    assert profile_label not in repr(planner_events)
 
 
 def test_sprint_planning_respects_turn_token_budget_before_provider_call(
@@ -457,7 +481,7 @@ def test_loop_runs_editable_planning_phase_before_execution(tmp_path: Path) -> N
         enable_sprint_planning=True,
     )
 
-    asyncio.run(loop.start_session())
+    session = asyncio.run(loop.start_session())
     response = asyncio.run(loop.run_turn("Implement user authentication for the API"))
 
     assert response == "executed plan"
@@ -467,6 +491,31 @@ def test_loop_runs_editable_planning_phase_before_execution(tmp_path: Path) -> N
     sprint = store.load_sprint(sprint_ids[0])
     assert sprint.state == SprintState.ACTIVE
     assert sprint.items[0].description == "Add login endpoint"
+    events = store.list_recent_runtime_events(session.session_id, limit=100)
+    planner_start = next(
+        event.event
+        for event in events
+        if event.event.get("type") == "model.request.started"
+        and event.event.get("model") == "custom/fake-planner"
+    )
+    planner_context_id = planner_start["context_id"]
+    planner_assembly = next(
+        event.event
+        for event in events
+        if event.event.get("type") == "context.usage"
+        and event.event.get("context_id") == planner_context_id
+    )
+    planner_completion = next(
+        event.event
+        for event in events
+        if event.event.get("type") == "model.request.completed"
+        and event.event.get("context_id") == planner_context_id
+    )
+    assert planner_assembly["assembly_purpose"] == "request"
+    assert planner_assembly["estimate_source"] == "unavailable"
+    assert planner_assembly["current"] is None
+    assert planner_start["operation_id"] == planner_completion["operation_id"]
+    assert planner_start["requested_route"] == "custom/fake-planner"
 
 
 def test_planner_and_loop_use_their_own_provider_budgets(tmp_path: Path) -> None:

@@ -118,12 +118,40 @@ async def finalize_tool_free(
         },
     ]
     request_budget = loop._resolve_request_token_budget()
-    if request_budget is not None and (
-        sum(max(0, int(provider.count_tokens(msg["content"]))) for msg in messages)
-        + 1024
-        >= request_budget.input_limit
-    ):
-        raise ProviderCompletionError("tool-free report would exceed provider input budget")
+    context_id = str(uuid4())
+    if request_budget is not None:
+        admission_estimate = (
+            sum(
+                max(0, int(provider.count_tokens(msg["content"])))
+                for msg in messages
+            )
+            + 1024
+        )
+        if admission_estimate >= request_budget.input_limit:
+            loop._emit_event(
+                loop._context_usage_event_payload(
+                    {
+                        "current": admission_estimate,
+                        "maximum": request_budget.input_limit,
+                    },
+                    context_id=context_id,
+                    assembly_purpose="request",
+                    estimate_source="local",
+                )
+            )
+            loop._emit_context_rejection(
+                context_id,
+                cause="input_limit",
+                required_input_tokens=admission_estimate,
+                input_limit=request_budget.input_limit,
+                protected_current_turn=True,
+                opaque_provider_replay_state_preserved=False,
+                required_history_summary=False,
+            )
+            loop._flush_runtime_events_nonfatal(force=True)
+            raise ProviderCompletionError(
+                "tool-free report would exceed provider input budget"
+            )
 
     # Reuse the *same* provider transport, stream validation, retry guard,
     # cancellation and usage accounting as an ordinary model request. Passing
@@ -131,69 +159,113 @@ async def finalize_tool_free(
     loop._last_context_tokens = max(
         1, int(provider.count_tokens(json.dumps(messages, separators=(",", ":"))))
     )
-    completion = await loop._stream_one_completion(
-        messages,
-        provider_tools={},
-        provider_tool_schema=[],
-        session_id=session.session_id,
-        allow_tool_calls=False,
-    )
-    if completion.tool_calls:
-        raise ProviderCompletionError(
-            "tool-free finalizer requested tools; no actions were executed"
-        )
-    if len(completion.text.encode("utf-8")) > MAX_REPORT_OUTPUT_BYTES:
-        raise ProviderCompletionError("tool-free finalizer response too large")
-    response = redact_text(completion.text.strip())
-    if not response:
-        raise ProviderCompletionError("tool-free finalizer returned an empty report")
-    response = (
-        "Tool-free final report after a context boundary "
-        "(no tools or commands were run in this reporting phase).\n\n"
-        + response
-    )
-
-    # Persist a distinct *completed reporting turn*. Do not rewrite the
-    # interrupted coding turn, its tool records, or its recovery receipt.
     report_turn_id = str(uuid4())
     loop.session_store.start_turn(session.session_id, report_turn_id, "")
-    saved_message = Message(
-        role="assistant",
-        content=response,
-        timestamp=datetime.now(timezone.utc),
-        metadata={
-            "tool_free_finalization": True,
-            "source_interrupted_turn_id": source_turn_id,
-        },
-    )
     try:
+        loop._emit_event(
+            {
+                **loop._context_usage_event_payload(
+                    {
+                        "current": loop._last_context_tokens,
+                        "maximum": (
+                            request_budget.input_limit if request_budget else None
+                        ),
+                    },
+                    context_id=context_id,
+                    assembly_purpose="request",
+                    estimate_source="local",
+                ),
+                "turn_id": report_turn_id,
+            }
+        )
+        from ash.core.loop import PreparedModelInput
+
+        completion = await loop._stream_one_completion(
+            PreparedModelInput(
+                messages,
+                context_id,
+                estimated_input_tokens=loop._last_context_tokens,
+            ),
+            provider_tools={},
+            provider_tool_schema=[],
+            session_id=session.session_id,
+            allow_tool_calls=False,
+            event_turn_id=report_turn_id,
+        )
+        if completion.tool_calls:
+            raise ProviderCompletionError(
+                "tool-free finalizer requested tools; no actions were executed"
+            )
+        if len(completion.text.encode("utf-8")) > MAX_REPORT_OUTPUT_BYTES:
+            raise ProviderCompletionError("tool-free finalizer response too large")
+        response = redact_text(completion.text.strip())
+        if not response:
+            raise ProviderCompletionError("tool-free finalizer returned an empty report")
+        response = (
+            "Tool-free final report after a context boundary "
+            "(no tools or commands were run in this reporting phase).\n\n"
+            + response
+        )
+        saved_message = Message(
+            role="assistant",
+            content=response,
+            timestamp=datetime.now(timezone.utc),
+            metadata={
+                "tool_free_finalization": True,
+                "source_interrupted_turn_id": source_turn_id,
+            },
+        )
+        estimated = completion.usage_source == "estimated"
+        usage = {
+            "prompt_tokens": completion.prompt_tokens,
+            "completion_tokens": completion.completion_tokens,
+            "cache_read_tokens": completion.cache_read_tokens,
+            "cache_write_tokens": completion.cache_write_tokens,
+            "usage_source": completion.usage_source,
+            "estimated_prompt_tokens": (
+                completion.prompt_tokens if estimated else 0
+            ),
+            "estimated_completion_tokens": (
+                completion.completion_tokens if estimated else 0
+            ),
+            "has_estimates": estimated,
+            "cache_hit_rate": (
+                completion.cache_read_tokens / completion.prompt_tokens
+                if completion.prompt_tokens
+                else 0.0
+            ),
+            "cost_usd": 0.0,
+            "estimated_cost_usd": 0.0,
+            "cost_known": False,
+            "cost_is_estimated": False,
+        }
         loop.session_store.save_message(
             session.session_id,
             saved_message,
             turn_id=report_turn_id,
         )
-        loop.session_store.save_turn_usage_snapshot(
-            report_turn_id,
-            {
-                "prompt_tokens": completion.prompt_tokens,
-                "completion_tokens": completion.completion_tokens,
-                "cache_read_tokens": completion.cache_read_tokens,
-                "cache_write_tokens": completion.cache_write_tokens,
-                "cost_known": False,
-            },
-        )
+        loop.session_store.save_turn_usage_snapshot(report_turn_id, usage)
         loop.session_store.complete_turn(report_turn_id)
     except BaseException:
         loop.session_store.interrupt_turn(report_turn_id)
+        loop._flush_runtime_events_nonfatal(force=True)
         raise
     session.messages.append(saved_message)
     loop._last_turn_stop_reason = "tool_free_finalization"
+    loop._emit_event(
+        {
+            "type": "turn.usage",
+            "turn_id": report_turn_id,
+            **usage,
+        }
+    )
     loop._emit_event({
         "type": "turn.finalized.tool_free",
         "turn_id": report_turn_id,
         "source_interrupted_turn_id": source_turn_id,
         "tool_calls_executed": 0,
     })
+    loop._flush_runtime_events_nonfatal(force=True)
     return ToolFreeReport(
         response=response,
         usage={

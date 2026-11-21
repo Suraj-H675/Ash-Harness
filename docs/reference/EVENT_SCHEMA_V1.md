@@ -85,6 +85,26 @@ Every provider completion attempt emits:
 - exactly one of `model.request.completed`, `model.request.error`, or
   `model.request.cancelled` for that request operation ID.
 
+For the main assembled request path, each successful `context.usage` event has
+an opaque `context_id` and `assembly_purpose: "request"`. Its exact messages
+carry that ID through each retry. A request attempt keeps its own `operation_id`,
+so retries share a context ID and have distinct operation IDs. Preview-only
+context builds use `assembly_purpose: "preview"` and are never joined to a
+request. Other request paths may have no matching context assembly; consumers
+must show the association as unavailable instead of matching by event order.
+
+Request lifecycle events may include `context_id`, `requested_route`, and
+`effective_route`. Routes use the provider's safe provider/model identity. The
+effective route is `"unknown"` before dispatch and on failed or cancelled
+attempts. On completion, failover reports the route that served the request;
+existing credential-pool routing behavior is unchanged. Context-assembly and
+planner events omit credential profile labels. The
+`context.usage.estimator_route` is `"unknown"` for composite estimators such
+as failover. `estimator_count_mode` is `"unknown"` unless an adapter can
+honestly identify its counting mode. Route equality indicates provider/model
+route parity only; it does not establish tokenizer or context accounting
+parity.
+
 Ash also emits a content-free `model.request.first_output` when the first
 retained provider output arrives. When a request remains without retained
 output for 30 seconds, it emits at most one `model.request.waiting` event for
@@ -107,19 +127,64 @@ consumers to infer provider attempts from assistant deltas.
 
 ## Provider input budget telemetry
 
-`context.usage` retains `current` (the locally estimated token count for
-the next provider input) and `maximum` (the effective input-token ceiling).
-It also includes optional content-free accounting fields:
+For the configured context-assembly path, `context.usage.current` is Ash's
+local input estimate and `maximum` is the effective input ceiling. An
+unconfigured message build may report both as null with
+`estimate_source: "unavailable"`.
+The event also includes optional content-free accounting fields:
 `system_tokens`, `tool_schema_tokens`, `history_tokens`,
 `repo_map_tokens`, `memory_tokens`, `history_message_count`,
 `tool_message_count`, and `tool_message_chars`.
 
-These measurements describe **locally assembled input**, not provider-billed
-tokens or a task's completion quality. Tool-message character counts include
-the model-visible serialized results, not file paths or source snippets.
-Actual `model.request.completed.prompt_tokens` remains the authoritative
-provider-reported number when available. Consumers must not sum overlapping
-per-request input values and label them a single context-window size.
+`model.request.completed.usage_source` identifies whether its `prompt_tokens`
+are provider-reported or locally estimated. Failed and cancelled requests have
+no completed usage measurement. `cache_read_tokens` and `cache_write_tokens`
+are subsets of prompt usage and must not be added to `prompt_tokens`. `turn.usage`
+is cumulative across the turn and likewise reports those cache subsets; it is a
+different measure from one request's input.
+
+A successful tool-free final report has a distinct durable reporting turn.
+Its context assembly and request lifecycle carry that report's `turn_id`, and
+exactly one `turn.usage` is emitted after the report message and usage snapshot
+are saved and the turn is completed. Provider, estimated, and unavailable
+sources remain distinct, including zero-valued token and cache fields. A failed
+or cancelled report leaves its reporting turn interrupted and emits no
+`turn.usage`; the interrupted coding turn's usage is unchanged. The
+`turn.finalized.tool_free` event retains `source_interrupted_turn_id`.
+
+The estimate and provider-reported usage are separate units of evidence. A
+provider's reported prompt count may omit retained opaque reasoning or count
+schemas and other input differently. It does not prove the full occupied
+context window. Consumers must not use historic estimate/usage ratios as an
+admission adjustment, sum overlapping per-request input values as a single
+context size, or treat provider-reported input alone as total context
+occupancy. Tool-message character counts include model-visible serialized
+results, not file paths or source snippets.
+
+`context.request.rejected` records a local attempt stopped before provider
+dispatch. It includes `cause` (`input_limit`, `opaque_context`, or
+`turn_budget`), `scope: "request_attempt"`, `dispatch_status: "not_dispatched"`,
+the required input estimate and input ceiling when known, and bounded boolean
+indicators for protected current-turn content and preserved opaque replay
+state. Cumulative-turn fields are present when relevant. The event says only
+that this attempt was not dispatched; earlier provider calls in the same turn
+may already have completed. It does not change turn stop reasons or admission
+guards.
+
+The terminal `/context` command reads at most the latest 300 runtime events for
+the selected session. It shows the latest recorded successful request
+assembly, the last dispatched attempt joined by `context_id` and `operation_id`,
+the latest local rejection, and the last persisted cumulative turn usage.
+`/context --provenance` retains its existing in-memory fragment detail. Legacy
+records without these fields, missing/corrupt/evicted events, and ambiguous
+associations remain unavailable; chronology is never used to fill in missing
+IDs. If a matched request start has no recorded outcome, the terminal view
+checks that exact `turn_id` in the selected session's durable turn journal:
+`started` remains pending, `interrupted` reports provider outcome unknown,
+and `completed` without a request outcome is missing. Missing or unreadable
+journal state is unknown. This lookup adds no runtime event and does not imply
+that a request completed or is safe to retry. The command does not load the
+transcript or make a provider request.
 
 ## Turn completion identity
 

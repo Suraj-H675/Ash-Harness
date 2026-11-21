@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import io
 import json
 from datetime import datetime, timezone
@@ -10,9 +11,10 @@ from types import SimpleNamespace
 
 import pytest
 
-from ash.cli import _bootstrap_and_headless
+from ash.cli import _bootstrap_and_headless, _render_context_diagnostics
 from ash.config import AshConfig
-from ash.context.history import ContextBudgetExceededError
+from ash.context.history import ContextBudgetExceededError, RequestTokenBudget
+from ash.core.activity import summarize_context_diagnostics
 from ash.core.checkpoints import recover_interrupted_turns
 from ash.core.context_continuation import run_with_context_continuation
 from ash.core.loop import AshLoop
@@ -43,6 +45,15 @@ class FinalReportProvider(ProviderABC):
             yield StreamChunk(content="Partial report")
         elif self.mode == "truncated":
             yield StreamChunk(content="Partial report", is_done=True, stop_reason="length")
+        elif self.mode == "estimated":
+            yield StreamChunk(
+                content=(
+                    "Edited both modules; the recorded test exited 0. "
+                    "Unrecorded checks remain unverified. No commands were repeated."
+                ),
+                is_done=True,
+                stop_reason="stop",
+            )
         else:
             yield StreamChunk(
                 content="Edited both modules; the recorded test exited 0. "
@@ -147,10 +158,14 @@ def test_bounded_report_keeps_last_edit_and_test_after_many_reads() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("mode", "usage_source"),
+    [("complete", "provider"), ("estimated", "estimated")],
+)
 async def test_tool_free_reporting_persists_distinct_completed_turn(
-    tmp_path: Path,
+    tmp_path: Path, mode: str, usage_source: str,
 ) -> None:
-    provider = FinalReportProvider()
+    provider = FinalReportProvider(mode=mode)
     loop = build_loop(tmp_path, provider)
     try:
         session = await loop.start_session()
@@ -164,8 +179,8 @@ async def test_tool_free_reporting_persists_distinct_completed_turn(
             loop, "Fix the two related Python modules", *evidence
         )
         assert "No commands were repeated" in report.response
-        assert report.usage["prompt_tokens"] == 150
-        assert report.usage["completion_tokens"] == 32
+        assert report.usage["prompt_tokens"] > 0
+        assert report.usage["completion_tokens"] > 0
         assert len(provider.requests) == 1
         messages, tools = provider.requests[0]
         assert tools is None
@@ -191,6 +206,82 @@ async def test_tool_free_reporting_persists_distinct_completed_turn(
     finally:
         await loop.aclose()
 
+    resumed_provider = FinalReportProvider()
+    resumed_loop = build_loop(tmp_path, resumed_provider)
+    try:
+        resumed_session = await resumed_loop.start_session(session.session_id)
+        assert resumed_session.session_id == session.session_id
+        assert resumed_provider.requests == []
+        events = resumed_loop.session_store.list_recent_runtime_events(
+            session.session_id, limit=100
+        )
+    finally:
+        await resumed_loop.aclose()
+    assembly = next(
+        item.event
+        for item in events
+        if item.event.get("type") == "context.usage"
+        and item.event.get("assembly_purpose") == "request"
+    )
+    request_start = next(
+        item.event for item in events if item.event.get("type") == "model.request.started"
+    )
+    request_completion = next(
+        item.event
+        for item in events
+        if item.event.get("type") == "model.request.completed"
+    )
+    report_turn_id = rows[1]["turn_id"]
+    request_events = [
+        item.event
+        for item in events
+        if item.event.get("context_id") == assembly["context_id"]
+    ]
+    turn_usage = [
+        item.event for item in events if item.event.get("type") == "turn.usage"
+    ]
+    finalized = next(
+        item.event
+        for item in events
+        if item.event.get("type") == "turn.finalized.tool_free"
+    )
+    assert assembly["context_id"] == request_start["context_id"]
+    assert request_start["context_id"] == request_completion["context_id"]
+    assert request_start["operation_id"] == request_completion["operation_id"]
+    assert {event["turn_id"] for event in request_events} == {report_turn_id}
+    assert request_start["requested_route"] == request_completion["effective_route"]
+    assert request_completion["usage_source"] == usage_source
+    assert request_completion["prompt_tokens"] > 0
+    assert request_completion["cache_read_tokens"] == 0
+    assert request_completion["cache_write_tokens"] == 0
+    assert len(turn_usage) == 1
+    assert turn_usage[0]["turn_id"] == report_turn_id
+    assert turn_usage[0]["usage_source"] == usage_source
+    assert turn_usage[0]["prompt_tokens"] == request_completion["prompt_tokens"]
+    assert turn_usage[0]["completion_tokens"] == request_completion[
+        "completion_tokens"
+    ]
+    assert turn_usage[0]["cache_read_tokens"] == 0
+    assert turn_usage[0]["cache_write_tokens"] == 0
+    assert turn_usage[0]["estimated_prompt_tokens"] == (
+        request_completion["prompt_tokens"] if usage_source == "estimated" else 0
+    )
+    assert turn_usage[0]["estimated_completion_tokens"] == (
+        request_completion["completion_tokens"] if usage_source == "estimated" else 0
+    )
+    assert finalized["turn_id"] == report_turn_id
+    assert finalized["source_interrupted_turn_id"] == prior
+    diagnostics = summarize_context_diagnostics(events, session_id=session.session_id)
+    assert diagnostics["request"]["turn_id"] == report_turn_id
+    assert diagnostics["turn_usage"]["turn_id"] == report_turn_id
+    assert diagnostics["turn_usage"]["usage_source"] == usage_source
+    context_output = _render_context_diagnostics(diagnostics)
+    assert f"Last persisted turn cumulative usage ({usage_source})" in context_output
+    assert "prompt cache subsets: 0 read, 0 written" in context_output
+    if mode == "complete":
+        assert turn_usage[0]["prompt_tokens"] == 150
+        assert turn_usage[0]["completion_tokens"] == 32
+
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("mode", ["tool_request", "partial", "truncated", "oversized"])
@@ -210,11 +301,166 @@ async def test_bad_model_report_never_completes_a_turn(
             await finalize_tool_free(loop, "Fix code", *evidence)
         with get_db_connection(loop.session_store.db_path) as connection:
             turns = connection.execute(
-                "SELECT status FROM turn_journal WHERE session_id = ?",
+                "SELECT turn_id, status FROM turn_journal WHERE session_id = ? "
+                "ORDER BY started_at, rowid",
                 (session.session_id,),
             ).fetchall()
-        assert [row["status"] for row in turns] == ["interrupted"]
+        assert len(turns) == 2
+        assert [row["status"] for row in turns] == ["interrupted", "interrupted"]
+        events = loop.session_store.list_recent_runtime_events(
+            session.session_id, limit=100
+        )
+        report_ids = {item.event.get("turn_id") for item in events}
+        assert turns[1]["turn_id"] in report_ids
+        request_events = [
+            item.event
+            for item in events
+            if item.event.get("type", "").startswith("model.request.")
+        ]
+        assert request_events
+        assert all(event.get("turn_id") == turns[1]["turn_id"] for event in request_events)
+        assert not any(item.event.get("type") == "turn.usage" for item in events)
+        assert not any(
+            item.event.get("type") == "turn.finalized.tool_free" for item in events
+        )
         assert loop.session_store.load_session(session.session_id).messages == []
+    finally:
+        await loop.aclose()
+
+
+@pytest.mark.asyncio
+async def test_report_admission_rejection_creates_no_report_turn_or_request(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = FinalReportProvider()
+    loop = build_loop(tmp_path, provider)
+    try:
+        session = await loop.start_session()
+        source = record_completed_coding_turn(loop.session_store, session.session_id)
+        reconcile(loop, session.session_id)
+        evidence = loop.session_store.tool_free_finalization_evidence(
+            session.session_id, expected_project_path=tmp_path
+        )
+        assert evidence is not None
+        monkeypatch.setattr(
+            loop,
+            "_resolve_request_token_budget",
+            lambda: RequestTokenBudget(combined_limit=10, input_limit=1, response_limit=9),
+        )
+
+        with pytest.raises(ProviderCompletionError, match="exceed provider input"):
+            await finalize_tool_free(loop, "Fix code", *evidence)
+
+        with get_db_connection(loop.session_store.db_path) as connection:
+            rows = connection.execute(
+                "SELECT turn_id, status FROM turn_journal WHERE session_id = ?",
+                (session.session_id,),
+            ).fetchall()
+        assert [(row["turn_id"], row["status"]) for row in rows] == [
+            (source, "interrupted")
+        ]
+        assert provider.requests == []
+        events = loop.session_store.list_recent_runtime_events(
+            session.session_id, limit=100
+        )
+        rejection = next(
+            item.event
+            for item in events
+            if item.event.get("type") == "context.request.rejected"
+        )
+        assert rejection["dispatch_status"] == "not_dispatched"
+        assert rejection.get("turn_id") is None
+        assert not any(
+            item.event.get("type", "").startswith("model.request.")
+            for item in events
+        )
+    finally:
+        await loop.aclose()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_report_stays_interrupted_and_keeps_prior_usage(
+    tmp_path: Path,
+) -> None:
+    class BlockingProvider(FinalReportProvider):
+        def __init__(self) -> None:
+            super().__init__()
+            self.started = asyncio.Event()
+
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            self.requests.append((list(messages), tools))
+            self.started.set()
+            await asyncio.Event().wait()
+            yield StreamChunk(content="unreachable", is_done=True)
+
+    provider = BlockingProvider()
+    loop = build_loop(tmp_path, provider)
+    try:
+        session = await loop.start_session()
+        source = record_completed_coding_turn(loop.session_store, session.session_id)
+        reconcile(loop, session.session_id)
+        loop.session_store.save_runtime_events(
+            [
+                {
+                    "event_id": "prior-report-source-usage",
+                    "type": "turn.usage",
+                    "session_id": session.session_id,
+                    "turn_id": source,
+                    "prompt_tokens": 77,
+                    "completion_tokens": 8,
+                    "cache_read_tokens": 2,
+                    "cache_write_tokens": 1,
+                    "estimated_prompt_tokens": 0,
+                    "estimated_completion_tokens": 0,
+                    "usage_source": "provider",
+                }
+            ]
+        )
+        evidence = loop.session_store.tool_free_finalization_evidence(
+            session.session_id, expected_project_path=tmp_path
+        )
+        assert evidence is not None
+        task = asyncio.create_task(finalize_tool_free(loop, "Fix code", *evidence))
+        await asyncio.wait_for(provider.started.wait(), timeout=1)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        with get_db_connection(loop.session_store.db_path) as connection:
+            rows = connection.execute(
+                "SELECT turn_id, status FROM turn_journal WHERE session_id = ? "
+                "ORDER BY started_at, rowid",
+                (session.session_id,),
+            ).fetchall()
+        assert len(rows) == 2
+        assert [row["status"] for row in rows] == ["interrupted", "interrupted"]
+        assert len(provider.requests) == 1
+        events = loop.session_store.list_recent_runtime_events(
+            session.session_id, limit=100
+        )
+        starts = [
+            item.event
+            for item in events
+            if item.event.get("type") == "model.request.started"
+        ]
+        cancelled = [
+            item.event
+            for item in events
+            if item.event.get("type") == "model.request.cancelled"
+        ]
+        assert len(starts) == len(cancelled) == 1
+        assert starts[0]["turn_id"] == cancelled[0]["turn_id"] == rows[1]["turn_id"]
+        assert starts[0]["context_id"] == cancelled[0]["context_id"]
+        assert starts[0]["operation_id"] == cancelled[0]["operation_id"]
+        assert not any(item.event.get("type") == "turn.usage" for item in events if item.event.get("turn_id") == rows[1]["turn_id"])
+        assert not any(
+            item.event.get("type") == "turn.finalized.tool_free" for item in events
+        )
+        diagnostics = summarize_context_diagnostics(events, session_id=session.session_id)
+        assert diagnostics["request"]["state"] == "cancelled"
+        assert diagnostics["request"]["usage_source"] == "unavailable"
+        assert diagnostics["turn_usage"]["turn_id"] == source
+        assert diagnostics["turn_usage"]["prompt_tokens"] == 77
     finally:
         await loop.aclose()
 
@@ -303,6 +549,22 @@ async def test_failed_report_persistence_does_not_complete_source_turn(
         assert all(row["status"] == "interrupted" for row in rows)
         assert rows[0]["turn_id"] == source
         assert loop._last_turn_stop_reason != "tool_free_finalization"
+        events = loop.session_store.list_recent_runtime_events(
+            session.session_id, limit=100
+        )
+        report_turn_id = rows[1]["turn_id"]
+        request_events = [
+            item.event
+            for item in events
+            if item.event.get("type", "").startswith("model.request.")
+        ]
+        assert request_events
+        assert all(event.get("turn_id") == report_turn_id for event in request_events)
+        assert not any(
+            item.event.get("type") == "turn.usage"
+            and item.event.get("turn_id") == report_turn_id
+            for item in events
+        )
     finally:
         await loop.aclose()
 

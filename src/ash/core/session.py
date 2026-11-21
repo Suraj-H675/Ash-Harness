@@ -4424,6 +4424,17 @@ class SessionStore:
             return reason
         return None
 
+    def turn_journal_status(self, session_id: str, turn_id: str) -> str | None:
+        """Read one exact turn's durable lifecycle state within its session."""
+
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                "SELECT status FROM turn_journal "
+                "WHERE session_id = ? AND turn_id = ? LIMIT 1",
+                (session_id, turn_id),
+            ).fetchone()
+        return str(row["status"]) if row is not None else None
+
     def save_turn_usage(self, turn_id: str, usage: dict[str, Any]) -> None:
         """Persist normalized usage so rewinding can adjust session totals."""
 
@@ -5622,6 +5633,35 @@ class SessionStore:
             )
             for row in rows
         ]
+
+    def list_recent_runtime_events(
+        self,
+        session_id: str,
+        *,
+        limit: int = 100,
+    ) -> list[StoredRuntimeEvent]:
+        """Read a bounded, session-specific tail using the sequence index."""
+
+        if type(limit) is not int or not 1 <= limit <= 300:
+            raise ValueError("limit must be between 1 and 300")
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                "SELECT sequence, event_json FROM runtime_events "
+                "WHERE session_id = ? ORDER BY sequence DESC LIMIT ?",
+                (session_id, limit),
+            ).fetchall()
+        recent: list[StoredRuntimeEvent] = []
+        for row in reversed(rows):
+            try:
+                event = json.loads(str(row["event_json"]))
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(event, dict):
+                continue
+            recent.append(
+                StoredRuntimeEvent(sequence=int(row["sequence"]), event=event)
+            )
+        return recent
 
     def search_coworker_session_messages(
         self,

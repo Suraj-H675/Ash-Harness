@@ -20,7 +20,8 @@ import re
 from contextlib import aclosing
 from dataclasses import replace
 from pathlib import Path
-from typing import Any, Literal, Sequence
+from typing import Any, Callable, Literal, Sequence
+from uuid import uuid4
 
 from ash.context.history import RequestBudgetError, RequestTokenBudget
 from ash.core.sprint import (
@@ -37,6 +38,7 @@ from ash.providers.base import (
     TokenCounterLike,
     completion_stop_category,
 )
+from ash.providers.failover import FailoverProvider
 
 
 # --- architect mode system prompt (Section 2.1 of the spec) --------------
@@ -118,6 +120,28 @@ _FIELD_PATTERN = re.compile(
 MAX_PLANNER_RESPONSE_BYTES = 256 * 1024
 
 
+def _route_provider(provider: ProviderABC, *, first: bool = False) -> ProviderABC:
+    if isinstance(provider, FailoverProvider) and provider.providers:
+        if first:
+            return provider.providers[0]
+        index = provider.active_index
+        if 0 <= index < len(provider.providers):
+            return provider.providers[index]
+    return provider
+
+
+def _provider_route(
+    provider: ProviderABC, configured_model: str | None = None
+) -> str:
+    family = str(getattr(provider, "provider_family", "custom") or "custom")
+    model_name = str(provider.model_name)
+    if family == "custom" and configured_model:
+        configured_family, separator, configured_name = configured_model.partition("/")
+        if separator and configured_name == model_name:
+            return configured_model
+    return f"{family}/{model_name}"
+
+
 class PlannerError(RuntimeError):
     """Raised when the LLM response cannot be parsed into a sprint."""
 
@@ -188,6 +212,12 @@ class Planner:
         total_token_budget: int = 0,
         max_completion_tokens: int | None = None,
         request_budget: RequestTokenBudget | None = None,
+        configured_model: str | None = None,
+        event_sink: Callable[[dict[str, Any]], None] | None = None,
+        context_event_sink: Callable[
+            [str, int | None, int | None, str, bool], None
+        ]
+        | None = None,
     ) -> tuple[SprintExecution, CompletionOutcome]:
         """Return a sprint and its architect request usage for turn accounting."""
 
@@ -203,6 +233,78 @@ class Planner:
         messages: list[dict[str, Any]] = [
             {"role": "user", "content": prompt},
         ]
+        context_id = str(uuid4())
+        operation_id = str(uuid4())
+        requested_provider = _route_provider(self._provider, first=True)
+        requested_route = _provider_route(requested_provider, configured_model)
+        requested_family = requested_route.split("/", 1)[0]
+        estimator_route = (
+            "unknown"
+            if isinstance(self._provider, FailoverProvider)
+            or self._token_counter is not None
+            else _provider_route(_route_provider(self._provider), configured_model)
+        )
+        estimated_input: int | None = None
+        context_event_emitted = False
+
+        def emit_event(payload: dict[str, Any]) -> None:
+            if event_sink is not None:
+                try:
+                    event_sink(payload)
+                except Exception:  # noqa: BLE001 - event reporting is non-critical
+                    pass
+
+        def emit_context_event(
+            current: int | None,
+            maximum: int | None,
+            *,
+            available: bool,
+        ) -> None:
+            nonlocal context_event_emitted
+            if context_event_sink is None or context_event_emitted:
+                return
+            try:
+                context_event_sink(
+                    context_id,
+                    current,
+                    maximum,
+                    estimator_route,
+                    available,
+                )
+            except Exception:  # noqa: BLE001 - event reporting is non-critical
+                pass
+            context_event_emitted = True
+
+        def emit_rejection(
+            *,
+            cause: str,
+            required: int,
+            input_limit: int | None,
+        ) -> None:
+            emit_context_event(required, input_limit, available=True)
+            emit_event(
+                {
+                    "type": "context.request.rejected",
+                    "context_id": context_id,
+                    "cause": cause,
+                    "scope": "request_attempt",
+                    "dispatch_status": "not_dispatched",
+                    "required_input_tokens": max(0, int(required)),
+                    "input_limit": input_limit,
+                    "protected_current_turn": True,
+                    "opaque_provider_replay_state_preserved": False,
+                    "required_history_summary": False,
+                    **(
+                        {
+                            "turn_tokens_used": 0,
+                            "turn_token_limit": total_token_budget,
+                        }
+                        if total_token_budget > 0
+                        else {}
+                    ),
+                }
+            )
+
         if request_budget is not None:
             counter = (
                 self._token_counter.count
@@ -213,6 +315,11 @@ class Planner:
                 1, int(counter(json.dumps(messages, ensure_ascii=False)))
             )
             if estimated_input > request_budget.input_limit:
+                emit_rejection(
+                    cause="input_limit",
+                    required=estimated_input,
+                    input_limit=request_budget.input_limit,
+                )
                 raise RequestBudgetError(
                     f"planner prompt estimate ({estimated_input:,}) exceeds the "
                     f"provider input limit ({request_budget.input_limit:,})"
@@ -224,6 +331,11 @@ class Planner:
                 ),
             )
             if output_limit is None:
+                emit_rejection(
+                    cause="turn_budget",
+                    required=estimated_input,
+                    input_limit=request_budget.input_limit,
+                )
                 raise PlannerError(
                     "planner input exceeds turn token budget or leaves no "
                     "response tokens within it"
@@ -239,14 +351,95 @@ class Planner:
                 1, int(counter(json.dumps(messages, ensure_ascii=False)))
             )
             if estimated_input >= total_token_budget:
+                emit_rejection(
+                    cause="turn_budget",
+                    required=estimated_input,
+                    input_limit=None,
+                )
                 raise PlannerError("planner input exceeds turn token budget")
             output_limit = total_token_budget - estimated_input
             if max_completion_tokens is not None:
                 output_limit = min(output_limit, max_completion_tokens)
             self._provider.configure_max_tokens(max(1, output_limit))
-
-        completion = await self._collect_stream(
-            messages, timeout_seconds=timeout_seconds
+        emit_context_event(
+            estimated_input,
+            request_budget.input_limit if request_budget is not None else None,
+            available=estimated_input is not None,
+        )
+        emit_event(
+            {
+                "type": "model.request.started",
+                "operation_id": operation_id,
+                "context_id": context_id,
+                "provider": requested_family,
+                "model": requested_route,
+                "requested_route": requested_route,
+                "effective_route": "unknown",
+                "attempt": 1,
+                "max_attempts": 1,
+                "message_count": len(messages),
+                "tool_count": 0,
+                "native_tools": False,
+            }
+        )
+        try:
+            completion = await self._collect_stream(
+                messages, timeout_seconds=timeout_seconds
+            )
+        except asyncio.CancelledError:
+            emit_event(
+                {
+                    "type": "model.request.cancelled",
+                    "operation_id": operation_id,
+                    "context_id": context_id,
+                    "provider": requested_family,
+                    "model": requested_route,
+                    "requested_route": requested_route,
+                    "effective_route": "unknown",
+                    "attempt": 1,
+                }
+            )
+            raise
+        except Exception as exc:
+            emit_event(
+                {
+                    "type": "model.request.error",
+                    "operation_id": operation_id,
+                    "context_id": context_id,
+                    "provider": requested_family,
+                    "model": requested_route,
+                    "requested_route": requested_route,
+                    "effective_route": "unknown",
+                    "attempt": 1,
+                    "max_attempts": 1,
+                    "status_code": None,
+                    "retriable": False,
+                    "failure_category": "unknown",
+                    "error_type": type(exc).__name__,
+                }
+            )
+            raise
+        serving_provider = _route_provider(self._provider)
+        effective_route = _provider_route(serving_provider, configured_model)
+        emit_event(
+            {
+                "type": "model.request.completed",
+                "operation_id": operation_id,
+                "context_id": context_id,
+                "provider": effective_route.split("/", 1)[0],
+                "model": effective_route,
+                "requested_route": requested_route,
+                "effective_route": effective_route,
+                "attempt": 1,
+                "prompt_tokens": completion.prompt_tokens,
+                "completion_tokens": completion.completion_tokens,
+                "cache_read_tokens": completion.cache_read_tokens,
+                "cache_write_tokens": completion.cache_write_tokens,
+                "usage_source": completion.usage_source,
+                "stop_category": completion_stop_category(
+                    completion.stop_reason
+                ).value,
+            }
         )
         return (
             parse_sprint_response(completion.text, fallback_goal=user_request.strip()),

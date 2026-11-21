@@ -3285,6 +3285,45 @@ def test_runtime_event_replay_validates_cursor_and_limit(tmp_path: Path) -> None
         store.list_runtime_events("missing", limit=0)
 
 
+def test_recent_runtime_event_tail_is_bounded_indexed_and_session_scoped(
+    tmp_path: Path,
+) -> None:
+    store = SessionStore(tmp_path / "events.db")
+    session = store.create_session(str(tmp_path / "project"))
+    other = store.create_session(str(tmp_path / "other"))
+    events = [
+        {
+            "event_id": f"recent-{index}",
+            "session_id": session.session_id,
+            "timestamp": "2026-11-21T00:00:00+00:00",
+            "type": "turn.started",
+        }
+        for index in range(5_000)
+    ]
+    assert store.save_runtime_events(events) == len(events)
+    assert store.save_runtime_events(
+        [{"event_id": "other-session", "session_id": other.session_id, "type": "turn.started"}]
+    ) == 1
+
+    with closing(get_db_connection(store.db_path)) as conn, conn:
+        conn.execute(
+            "UPDATE runtime_events SET event_json = ? WHERE session_id = ? "
+            "AND sequence = (SELECT MAX(sequence) FROM runtime_events WHERE session_id = ?)",
+            ("not-json", session.session_id, session.session_id),
+        )
+
+    recent = store.list_recent_runtime_events(session.session_id, limit=300)
+    assert len(recent) == 299
+    assert recent[0].sequence == 4_701
+    assert recent[-1].sequence == 4_999
+    assert {item.event["session_id"] for item in recent} == {session.session_id}
+    assert store.list_recent_runtime_events(other.session_id)[0].event[
+        "session_id"
+    ] == other.session_id
+    with pytest.raises(ValueError, match="limit"):
+        store.list_recent_runtime_events(session.session_id, limit=301)
+
+
 def test_newer_database_schema_is_refused(tmp_path: Path) -> None:
     db_path = tmp_path / "future.db"
     with sqlite3.connect(db_path) as conn:

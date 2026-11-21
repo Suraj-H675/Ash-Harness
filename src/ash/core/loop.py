@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 from contextlib import asynccontextmanager, contextmanager
 from copy import deepcopy
+from dataclasses import dataclass
 import fnmatch
 import hashlib
 import json
@@ -322,11 +323,25 @@ class RuntimeEventObserver(Protocol):
     def close(self) -> None: ...
 
 
+@dataclass(frozen=True)
+class PreparedModelInput:
+    """One assembled provider input and the ID of its exact assembly event."""
+
+    messages: list[dict[str, Any]]
+    context_id: str
+    estimated_input_tokens: int | None = None
+
+
 _OBSERVER_EVENT_FIELDS: dict[str, frozenset[str]] = {
     "context.usage": frozenset(
         {
+            "context_id",
+            "assembly_purpose",
+            "estimate_source",
             "current",
             "maximum",
+            "estimator_route",
+            "estimator_count_mode",
             "system_tokens",
             "tool_schema_tokens",
             "history_tokens",
@@ -335,12 +350,31 @@ _OBSERVER_EVENT_FIELDS: dict[str, frozenset[str]] = {
             "history_message_count",
             "tool_message_count",
             "tool_message_chars",
+            "provider_replay_state_preserved",
+        }
+    ),
+    "context.request.rejected": frozenset(
+        {
+            "context_id",
+            "cause",
+            "scope",
+            "dispatch_status",
+            "required_input_tokens",
+            "input_limit",
+            "protected_current_turn",
+            "opaque_provider_replay_state_preserved",
+            "required_history_summary",
+            "turn_tokens_used",
+            "turn_token_limit",
         }
     ),
     "model.request.started": frozenset(
         {
+            "context_id",
             "provider",
             "model",
+            "requested_route",
+            "effective_route",
             "attempt",
             "max_attempts",
             "message_count",
@@ -352,8 +386,11 @@ _OBSERVER_EVENT_FIELDS: dict[str, frozenset[str]] = {
     ),
     "model.request.completed": frozenset(
         {
+            "context_id",
             "provider",
             "model",
+            "requested_route",
+            "effective_route",
             "attempt",
             "prompt_tokens",
             "completion_tokens",
@@ -365,11 +402,17 @@ _OBSERVER_EVENT_FIELDS: dict[str, frozenset[str]] = {
             "credential_pool_size",
         }
     ),
-    "model.request.waiting": frozenset({"attempt", "elapsed_seconds"}),
+    "model.request.waiting": frozenset(
+        {"context_id", "attempt", "elapsed_seconds"}
+    ),
+    "model.request.first_output": frozenset({"context_id", "attempt"}),
     "model.request.error": frozenset(
         {
+            "context_id",
             "provider",
             "model",
+            "requested_route",
+            "effective_route",
             "attempt",
             "status_code",
             "retriable",
@@ -383,8 +426,11 @@ _OBSERVER_EVENT_FIELDS: dict[str, frozenset[str]] = {
     ),
     "model.request.cancelled": frozenset(
         {
+            "context_id",
             "provider",
             "model",
+            "requested_route",
+            "effective_route",
             "attempt",
             "credential_profile",
             "credential_pool_size",
@@ -392,6 +438,7 @@ _OBSERVER_EVENT_FIELDS: dict[str, frozenset[str]] = {
     ),
     "provider.retrying": frozenset(
         {
+            "context_id",
             "attempt",
             "max_attempts",
             "delay_seconds",
@@ -887,6 +934,30 @@ def _provider_request_identity(
         getattr(request_provider, "provider_family", "custom") or "custom"
     )
     return family, _provider_model_id(request_provider, configured_model)
+
+
+def _context_estimator_route(
+    provider: ProviderABC, configured_model: str | None = None
+) -> str:
+    """Name the route that owns the input counter, or say it is composite."""
+
+    if isinstance(provider, FailoverProvider):
+        return "unknown"
+    return _provider_model_id(provider, configured_model)
+
+
+def _provider_effective_route(
+    provider: ProviderABC, configured_model: str | None = None
+) -> str:
+    """Return the provider/model left active after a successful dispatch."""
+
+    if isinstance(provider, FailoverProvider):
+        providers = provider.providers
+        index = provider.active_index
+        if not 0 <= index < len(providers):
+            return "unknown"
+        provider = providers[index]
+    return _provider_model_id(provider, configured_model)
 
 
 def _provider_credential_context(
@@ -2030,6 +2101,73 @@ class AshLoop:
                 self._flush_runtime_events_nonfatal()
             self._bound_pending_runtime_events()
         return event
+
+    def _emit_context_rejection(
+        self,
+        context_id: str,
+        *,
+        cause: Literal["input_limit", "turn_budget", "opaque_context"],
+        required_input_tokens: int,
+        input_limit: int | None,
+        protected_current_turn: bool,
+        opaque_provider_replay_state_preserved: bool,
+        required_history_summary: bool,
+        turn_tokens_used: int | None = None,
+        turn_token_limit: int | None = None,
+    ) -> None:
+        """Record why this request attempt stopped before provider dispatch."""
+
+        payload: dict[str, Any] = {
+            "type": "context.request.rejected",
+            "context_id": context_id,
+            "cause": cause,
+            "scope": "request_attempt",
+            "dispatch_status": "not_dispatched",
+            "required_input_tokens": max(0, int(required_input_tokens)),
+            "input_limit": input_limit,
+            "protected_current_turn": protected_current_turn,
+            "opaque_provider_replay_state_preserved": (
+                opaque_provider_replay_state_preserved
+            ),
+            "required_history_summary": required_history_summary,
+        }
+        if turn_tokens_used is not None:
+            payload["turn_tokens_used"] = max(0, int(turn_tokens_used))
+        if turn_token_limit is not None:
+            payload["turn_token_limit"] = max(0, int(turn_token_limit))
+        self._emit_event(payload)
+
+    def _context_usage_event_payload(
+        self,
+        payload: dict[str, Any],
+        *,
+        context_id: str,
+        assembly_purpose: Literal["request", "preview"],
+        estimate_source: Literal["local", "unavailable"],
+        estimator_provider: ProviderABC | None = None,
+        estimator_route_override: str | None = None,
+        configured_model_override: str | None = None,
+    ) -> dict[str, Any]:
+        """Add safe route and purpose metadata to one exact input measurement."""
+
+        provider = estimator_provider or self.provider
+        configured_model = configured_model_override
+        if configured_model is None:
+            configured_model = (
+                getattr(self._config, "model", None)
+                if self._config is not None
+                else None
+            )
+        return {
+            **payload,
+            "type": "context.usage",
+            "context_id": context_id,
+            "assembly_purpose": assembly_purpose,
+            "estimate_source": estimate_source,
+            "estimator_route": estimator_route_override
+            or _context_estimator_route(provider, configured_model),
+            "estimator_count_mode": "unknown",
+        }
 
     def _emit_event(self, payload: dict[str, Any]) -> None:
         event = self._envelope_event(payload)
@@ -4297,6 +4435,7 @@ class AshLoop:
                     )
             request_budget = self._resolve_request_token_budget()
             repo_map_refresh_error = await self._refresh_repo_map_before_prompt()
+            context_id = str(uuid4())
             try:
                 messages = self._build_messages(
                     session,
@@ -4305,15 +4444,40 @@ class AshLoop:
                     provider_tools=iteration_tools,
                     tool_schema_payload=iteration_tool_schema,
                     repo_map_refresh_error=repo_map_refresh_error,
+                    context_id=context_id,
+                    assembly_purpose="request",
                 )
             except ContextBudgetExceededError as exc:
                 used_before_request = total_prompt_tokens + total_completion_tokens
                 remaining = turn_token_budget - used_before_request
-                if (
+                blocked_by_turn_budget = (
                     turn_token_budget > 0
                     and used_before_request > 0
                     and remaining <= exc.required_tokens
-                ):
+                )
+                self._emit_context_rejection(
+                    context_id,
+                    cause=(
+                        "turn_budget"
+                        if blocked_by_turn_budget
+                        else "opaque_context"
+                        if (
+                            exc.provider_replay_state_preserved
+                            and exc.required_tokens <= exc.limit
+                        )
+                        else "input_limit"
+                    ),
+                    required_input_tokens=exc.required_tokens,
+                    input_limit=exc.limit,
+                    protected_current_turn=exc.protected_current_turn,
+                    opaque_provider_replay_state_preserved=(
+                        exc.provider_replay_state_preserved
+                    ),
+                    required_history_summary=exc.required_history_summary,
+                    turn_tokens_used=(used_before_request if turn_token_budget > 0 else None),
+                    turn_token_limit=(turn_token_budget if turn_token_budget > 0 else None),
+                )
+                if blocked_by_turn_budget:
                     turn_budget_exhausted = True
                     self._last_turn_stop_reason = "token_budget"
                     final_text = (
@@ -4324,6 +4488,9 @@ class AshLoop:
                     ).strip()
                     break
                 raise
+            assembled_input_tokens = (
+                self._last_context_tokens if self._config is not None else None
+            )
             if request_budget is not None:
                 remaining_turn_tokens: int | None = None
                 estimated_prompt = 0
@@ -4331,12 +4498,26 @@ class AshLoop:
                 if turn_token_budget > 0:
                     used_before_request = total_prompt_tokens + total_completion_tokens
                     remaining_turn_tokens = turn_token_budget - used_before_request
-                    estimated_prompt = max(1, self._last_context_tokens)
+                    estimated_prompt = max(1, assembled_input_tokens or 0)
                 response_limit = request_budget.response_limit_for_request(
                     estimated_input_tokens=estimated_prompt,
                     remaining_turn_tokens=remaining_turn_tokens,
                 )
                 if response_limit is None:
+                    self._emit_context_rejection(
+                        context_id,
+                        cause="turn_budget",
+                        required_input_tokens=estimated_prompt,
+                        input_limit=request_budget.input_limit,
+                        protected_current_turn=True,
+                        opaque_provider_replay_state_preserved=any(
+                            message.get("provider_state")
+                            for message in messages
+                        ),
+                        required_history_summary=False,
+                        turn_tokens_used=used_before_request,
+                        turn_token_limit=turn_token_budget,
+                    )
                     turn_budget_exhausted = True
                     self._last_turn_stop_reason = "token_budget"
                     final_text = (
@@ -4350,8 +4531,26 @@ class AshLoop:
             elif turn_token_budget > 0:
                 used_before_request = total_prompt_tokens + total_completion_tokens
                 remaining = turn_token_budget - used_before_request
-                estimated_prompt = max(1, self._last_context_tokens)
+                estimated_prompt = max(1, assembled_input_tokens or 0)
                 if remaining <= estimated_prompt:
+                    self._emit_context_rejection(
+                        context_id,
+                        cause="turn_budget",
+                        required_input_tokens=estimated_prompt,
+                        input_limit=(
+                            request_budget.input_limit
+                            if request_budget is not None
+                            else None
+                        ),
+                        protected_current_turn=True,
+                        opaque_provider_replay_state_preserved=any(
+                            message.get("provider_state")
+                            for message in messages
+                        ),
+                        required_history_summary=False,
+                        turn_tokens_used=used_before_request,
+                        turn_token_limit=turn_token_budget,
+                    )
                     turn_budget_exhausted = True
                     self._last_turn_stop_reason = "token_budget"
                     final_text = (
@@ -4385,7 +4584,11 @@ class AshLoop:
             )
             try:
                 model_completion = await self._stream_one_completion(
-                    messages,
+                    PreparedModelInput(
+                        messages,
+                        context_id,
+                        estimated_input_tokens=assembled_input_tokens,
+                    ),
                     provider_tools=iteration_tools,
                     provider_tool_schema=iteration_tool_schema,
                     session_id=session.session_id,
@@ -5205,7 +5408,32 @@ class AshLoop:
         if not isinstance(self.planner, Planner):
             # Defensive: only Planner is supported in V5.
             raise TypeError(f"Unsupported planner type: {type(self.planner).__name__}")
-        return await self.planner.decompose_with_usage(
+        planner = self.planner
+
+        def emit_planner_context(
+            context_id: str,
+            current: int | None,
+            maximum: int | None,
+            estimator_route: str,
+            available: bool,
+        ) -> None:
+            self._emit_event(
+                self._context_usage_event_payload(
+                    {"current": current, "maximum": maximum},
+                    context_id=context_id,
+                    assembly_purpose="request",
+                    estimate_source="local" if available else "unavailable",
+                    estimator_provider=planner.provider,
+                    estimator_route_override=estimator_route,
+                    configured_model_override=(
+                        getattr(self._config, "model", None)
+                        if self._config is not None
+                        else None
+                    ),
+                )
+            )
+
+        return await planner.decompose_with_usage(
             user_input,
             project_root=self.project_root,
             repo_map_excerpt=repo_excerpt,
@@ -5216,8 +5444,15 @@ class AshLoop:
                 getattr(self._config, "max_turn_total_tokens", 0)
             ),
             request_budget=self._resolve_request_token_budget(
-                self.planner.provider
+                planner.provider
             ),
+            configured_model=(
+                getattr(self._config, "model", None)
+                if self._config is not None
+                else None
+            ),
+            event_sink=self._emit_event,
+            context_event_sink=emit_planner_context,
         )
 
     # --- streaming & parsing ---------------------------------------------
@@ -5421,16 +5656,30 @@ class AshLoop:
 
     async def _stream_one_completion(
         self,
-        messages: list[dict[str, Any]],
+        messages: list[dict[str, Any]] | PreparedModelInput,
         *,
         provider_tools: dict[str, BaseTool] | None = None,
         provider_tool_schema: list[dict[str, Any]] | None = None,
         session_id: str | None = None,
         allow_tool_calls: bool = True,
+        event_turn_id: str | None = None,
     ) -> CompletionOutcome:
         """Stream one completion with normalized token and cache usage."""
 
-        canonical_messages = normalize_messages(messages)
+        def emit_request_event(payload: dict[str, Any]) -> None:
+            if event_turn_id is not None:
+                payload.setdefault("turn_id", event_turn_id)
+            self._emit_event(payload)
+
+        if isinstance(messages, PreparedModelInput):
+            prepared_input: PreparedModelInput | None = messages
+            request_messages = messages.messages
+            context_id: str | None = messages.context_id
+        else:
+            prepared_input = None
+            request_messages = messages
+            context_id = None
+        canonical_messages = normalize_messages(request_messages)
         has_replay = any(
             message.get("provider_state") for message in canonical_messages
         )
@@ -5524,6 +5773,8 @@ class AshLoop:
         if replay_owner is not None and isinstance(self.provider, FailoverProvider):
             provider_family, _ = replay_owner.split("/", 1)
             request_model_id = replay_owner
+        requested_route = request_model_id
+        effective_route = "unknown"
 
         try:
             self.provider_circuit_breaker.before_request(self._provider_circuit_key)
@@ -5533,12 +5784,15 @@ class AshLoop:
                     emitted_output = False
                     active_request_attempt = attempt
                     active_request_id = str(uuid4())
-                    self._emit_event(
+                    emit_request_event(
                         {
                             "type": "model.request.started",
                             "operation_id": active_request_id,
+                            **({"context_id": context_id} if context_id else {}),
                             "provider": provider_family,
                             "model": request_model_id,
+                            "requested_route": requested_route,
+                            "effective_route": "unknown",
                             "attempt": attempt,
                             "max_attempts": maximum_attempts,
                             "message_count": len(canonical_messages),
@@ -5561,10 +5815,11 @@ class AshLoop:
                             active_request_id == operation_id
                             and not emitted_output
                         ):
-                            self._emit_event(
+                            emit_request_event(
                                 {
                                     "type": "model.request.waiting",
                                     "operation_id": operation_id,
+                                    **({"context_id": context_id} if context_id else {}),
                                     "attempt": request_attempt,
                                     "elapsed_seconds": MODEL_FIRST_OUTPUT_NOTICE_SECONDS,
                                 }
@@ -5780,10 +6035,11 @@ class AshLoop:
                                 # Request latency alone cannot distinguish
                                 # waiting for the first provider output from
                                 # subsequent generation. Never persist output.
-                                self._emit_event(
+                                emit_request_event(
                                     {
                                         "type": "model.request.first_output",
                                         "operation_id": active_request_id,
+                                        **({"context_id": context_id} if context_id else {}),
                                         "attempt": attempt,
                                     }
                                 )
@@ -5920,12 +6176,15 @@ class AshLoop:
                         can_retry = failure.retriable and not (
                             malformed_arguments and malformed_argument_retries >= 1
                         )
-                        self._emit_event(
+                        emit_request_event(
                             {
                                 "type": "model.request.error",
                                 "operation_id": active_request_id,
+                                **({"context_id": context_id} if context_id else {}),
                                 "provider": provider_family,
                                 "model": self.active_model_id,
+                                "requested_route": requested_route,
+                                "effective_route": "unknown",
                                 "attempt": attempt,
                                 "status_code": failure.status_code,
                                 "retriable": can_retry,
@@ -5952,7 +6211,7 @@ class AshLoop:
                                 snapshot = self.provider_circuit_breaker.snapshot(
                                     self._provider_circuit_key
                                 )
-                                self._emit_event(
+                                emit_request_event(
                                     {
                                         "type": "provider.circuit_opened",
                                         "provider": self._provider_circuit_key,
@@ -5974,9 +6233,10 @@ class AshLoop:
                             max_delay=retry_max_delay,
                         )
                         safe_reason = redact_text(failure.message)
-                        self._emit_event(
+                        emit_request_event(
                             {
                                 "type": "provider.retrying",
+                                **({"context_id": context_id} if context_id else {}),
                                 "attempt": attempt + 1,
                                 "max_attempts": maximum_attempts,
                                 "delay_seconds": delay,
@@ -6051,16 +6311,24 @@ class AshLoop:
                 # omit usage entirely; the durable turn already estimates it,
                 # so emitting pre-estimation zeros misreports the same request.
                 if usage_source == "unavailable":
-                    prompt_tokens = self._last_context_tokens or max(
-                        0,
-                        int(
-                            self.provider.count_tokens(
-                                json.dumps(
-                                    messages, default=str, separators=(",", ":")
+                    if (
+                        prepared_input is not None
+                        and prepared_input.estimated_input_tokens is not None
+                    ):
+                        prompt_tokens = prepared_input.estimated_input_tokens
+                    else:
+                        prompt_tokens = max(
+                            0,
+                            int(
+                                self.provider.count_tokens(
+                                    json.dumps(
+                                        request_messages,
+                                        default=str,
+                                        separators=(",", ":"),
+                                    )
                                 )
-                            )
-                        ),
-                    )
+                            ),
+                        )
                     completion_payload = "".join(response_fragments)
                     if native_tool_calls_from_api:
                         completion_payload += json.dumps(
@@ -6075,15 +6343,26 @@ class AshLoop:
                     cache_write_tokens = 0
                     usage_source = "estimated"
                 self.provider_circuit_breaker.record_success(self._provider_circuit_key)
-                self._emit_event(
+                configured_model = (
+                    getattr(self._config, "model", None)
+                    if self._config is not None
+                    else None
+                )
+                effective_route = _provider_effective_route(
+                    self.provider, configured_model
+                )
+                emit_request_event(
                     {
                         "type": "model.request.completed",
                         "operation_id": active_request_id,
+                        **({"context_id": context_id} if context_id else {}),
                         "provider": str(
                             getattr(self.provider, "provider_family", "custom")
                             or "custom"
                         ),
                         "model": self.active_model_id,
+                        "requested_route": requested_route,
+                        "effective_route": effective_route,
                         "attempt": active_request_attempt,
                         "prompt_tokens": prompt_tokens,
                         "completion_tokens": completion_tokens,
@@ -6107,12 +6386,15 @@ class AshLoop:
                     primary_error=cancellation,
                 )
             if active_request_id is not None:
-                self._emit_event(
+                emit_request_event(
                     {
                         "type": "model.request.cancelled",
                         "operation_id": active_request_id,
+                        **({"context_id": context_id} if context_id else {}),
                         "provider": provider_family,
                         "model": self.active_model_id,
+                        "requested_route": requested_route,
+                        "effective_route": "unknown",
                         "attempt": active_request_attempt,
                         **_provider_credential_event_fields(self.provider),
                     }
@@ -6130,12 +6412,15 @@ class AshLoop:
                 )
             if active_request_id is not None:
                 failure = classify_provider_failure(exc)
-                self._emit_event(
+                emit_request_event(
                     {
                         "type": "model.request.error",
                         "operation_id": active_request_id,
+                        **({"context_id": context_id} if context_id else {}),
                         "provider": provider_family,
                         "model": self.active_model_id,
+                        "requested_route": requested_route,
+                        "effective_route": "unknown",
                         "attempt": active_request_attempt,
                         "status_code": failure.status_code,
                         "retriable": failure.retriable,
@@ -7842,8 +8127,12 @@ class AshLoop:
         provider_tools: dict[str, BaseTool] | None = None,
         tool_schema_payload: list[dict[str, Any]] | None = None,
         repo_map_refresh_error: Exception | None = None,
+        context_id: str | None = None,
+        assembly_purpose: Literal["request", "preview"] = "preview",
     ) -> list[dict[str, Any]]:
         """Build the messages payload for the provider."""
+
+        context_id = context_id or str(uuid4())
 
         if (
             tool_result_images is not None
@@ -8011,7 +8300,14 @@ class AshLoop:
             )
             self._last_context_tokens = assembly.tokens
             self._last_context_maximum = assembly.maximum_input
-            self._emit_event(assembly.usage_event)
+            self._emit_event(
+                self._context_usage_event_payload(
+                    assembly.usage_event,
+                    context_id=context_id,
+                    assembly_purpose=assembly_purpose,
+                    estimate_source="local",
+                )
+            )
             self.ui.update_token_count(assembly.tokens, assembly.maximum_input)
 
             compaction = assembly.compaction
@@ -8069,6 +8365,17 @@ class AshLoop:
             mark_runtime_only=False,
         )
         messages.extend(history)
+        self._emit_event(
+            self._context_usage_event_payload(
+                {
+                    "current": None,
+                    "maximum": None,
+                },
+                context_id=context_id,
+                assembly_purpose=assembly_purpose,
+                estimate_source="unavailable",
+            )
+        )
         return messages
 
     async def _refresh_repo_map_before_prompt(self) -> Exception | None:

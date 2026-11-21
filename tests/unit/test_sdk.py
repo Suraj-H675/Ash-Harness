@@ -1009,6 +1009,7 @@ async def test_async_sdk_streams_real_turn_events(tmp_path) -> None:
         workspace_root=tmp_path,
         db_directory=tmp_path / "db",
         memory_backend="off",
+        repo_map_enabled=False,
     )
     async with await AshClient.create(config=config, provider=SDKProvider()) as client:
         events = [event async for event in client.stream_prompt("hello")]
@@ -1019,6 +1020,24 @@ async def test_async_sdk_streams_real_turn_events(tmp_path) -> None:
     assert all(event.timestamp for event in events)
     assert all(event.source == {"type": "runtime", "id": "ash"} for event in events)
     assert any(event.type == "context.usage" for event in events)
+    assembly = next(
+        event
+        for event in events
+        if event.type == "context.usage"
+        and event.data.get("assembly_purpose") == "request"
+    )
+    request_start = next(
+        event for event in events if event.type == "model.request.started"
+    )
+    request_completion = next(
+        event for event in events if event.type == "model.request.completed"
+    )
+    assert assembly.data["context_id"] == request_start.data["context_id"]
+    assert request_start.data["context_id"] == request_completion.data["context_id"]
+    assert request_start.operation_id == request_completion.operation_id
+    assert request_start.data["requested_route"] == "ollama/sdk-model"
+    assert request_completion.data["effective_route"] == "ollama/sdk-model"
+    assert request_completion.data["usage_source"] == "provider"
     assert (
         "".join(
             event.data["text"] for event in events if event.type == "assistant.delta"

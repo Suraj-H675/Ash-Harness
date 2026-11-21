@@ -435,6 +435,169 @@ def _render_context_provenance(report: Any | None) -> str:
     return "\n".join(lines)
 
 
+def _context_diagnostics_for_session(
+    session_store: Any, session_id: str
+) -> dict[str, Any]:
+    """Combine a bounded event tail with exact durable state for its latest request."""
+
+    from ash.core.activity import summarize_context_diagnostics
+
+    records = session_store.list_recent_runtime_events(session_id, limit=300)
+    diagnostics = summarize_context_diagnostics(records, session_id=session_id)
+    request = diagnostics.get("request")
+    if not isinstance(request, dict) or request.get("state") != "pending":
+        return diagnostics
+
+    turn_id = request.get("turn_id")
+    status: str | None = None
+    if isinstance(turn_id, str) and 0 < len(turn_id) <= 64:
+        try:
+            status = session_store.turn_journal_status(session_id, turn_id)
+        except Exception:  # noqa: BLE001 - diagnosis stays non-critical
+            status = None
+    request["state"] = {
+        "started": "pending",
+        "interrupted": "interrupted",
+        "completed": "missing",
+    }.get(status or "", "unknown")
+    return diagnostics
+
+
+def _render_context_diagnostics(diagnostics: dict[str, Any]) -> str:
+    """Render bounded, session-specific request evidence for `/context`."""
+
+    lines: list[str] = []
+    assembly = diagnostics.get("assembly")
+    if isinstance(assembly, dict):
+        current = assembly.get("current")
+        maximum = assembly.get("maximum")
+        if type(current) is int and type(maximum) is int:
+            lines.append(
+                f"Last recorded request assembly: ~{current:,}/{maximum:,} "
+                "estimated input tokens"
+            )
+        else:
+            lines.append("Last recorded request assembly: estimate unavailable")
+        lines.append(
+            "  estimator route="
+            f"{assembly.get('estimator_route') or 'unknown'}; count mode="
+            f"{assembly.get('estimator_count_mode') or 'unknown'}; "
+            f"context_id={assembly.get('context_id') or 'unknown'}"
+        )
+    else:
+        lines.append("Last recorded request assembly: unavailable")
+
+    request = diagnostics.get("request")
+    if isinstance(request, dict):
+        state = request.get("state") or "missing"
+        usage_source = request.get("usage_source") or "unavailable"
+        if state == "interrupted":
+            lines.append(
+                "Last dispatched request attempt: turn interrupted; "
+                "provider outcome=unknown; usage=unavailable"
+            )
+        elif state in {"missing", "unknown"}:
+            lines.append(
+                f"Last dispatched request attempt: {state}; "
+                "provider outcome=unknown; usage=unavailable"
+            )
+        else:
+            lines.append(
+                f"Last dispatched request attempt: {state}; usage={usage_source}"
+            )
+        if usage_source in {"provider", "estimated"}:
+            prompt = request.get("prompt_tokens")
+            completion = request.get("completion_tokens")
+            if type(prompt) is int and type(completion) is int:
+                lines.append(
+                    f"  input={prompt:,}; completion={completion:,} tokens"
+                )
+                read = request.get("cache_read_tokens")
+                written = request.get("cache_write_tokens")
+                if type(read) is int and type(written) is int:
+                    lines.append(
+                        f"  prompt cache subsets: {read:,} read, {written:,} written"
+                    )
+        matched_assembly = request.get("assembly")
+        if isinstance(matched_assembly, dict):
+            current = matched_assembly.get("current")
+            maximum = matched_assembly.get("maximum")
+            if type(current) is int and type(maximum) is int:
+                lines.append(
+                    f"  matched local estimate: ~{current:,}/{maximum:,} input tokens"
+                )
+            else:
+                lines.append("  matched local estimate: unavailable")
+        else:
+            lines.append("  matched local estimate: unavailable")
+        lines.append(
+            f"  route: {request.get('requested_route') or 'unknown'} -> "
+            f"{request.get('effective_route') or 'unknown'} "
+            f"(parity: {request.get('route_parity') or 'unknown'}); "
+            f"context_id={request.get('context_id') or 'unknown'}; "
+            f"operation_id={request.get('operation_id') or 'unknown'}"
+        )
+    else:
+        lines.append("Last dispatched request attempt: unavailable")
+
+    rejection = diagnostics.get("rejection")
+    if isinstance(rejection, dict):
+        cause = rejection.get("cause") or "unknown"
+        required = rejection.get("required_input_tokens")
+        limit = rejection.get("input_limit")
+        numeric = (
+            f"; required ~{required:,}, input ceiling {limit:,}"
+            if type(required) is int and type(limit) is int
+            else ""
+        )
+        turn_used = rejection.get("turn_tokens_used")
+        turn_limit = rejection.get("turn_token_limit")
+        turn_budget = (
+            f"; cumulative turn budget {turn_used:,}/{turn_limit:,}"
+            if type(turn_used) is int and type(turn_limit) is int
+            else ""
+        )
+        lines.append(
+            f"Latest local stop: {cause}, scope={rejection.get('scope') or 'unknown'}, "
+            f"dispatch={rejection.get('dispatch_status') or 'unknown'}"
+            f"{numeric}{turn_budget}; earlier requests may have completed"
+        )
+        lines.append(
+            "  protected current turn="
+            f"{rejection.get('protected_current_turn')}; opaque replay preserved="
+            f"{rejection.get('opaque_provider_replay_state_preserved')}; "
+            f"context_id={rejection.get('context_id') or 'unknown'}"
+        )
+    else:
+        lines.append("Latest local stop: none retained")
+
+    turn_usage = diagnostics.get("turn_usage")
+    if isinstance(turn_usage, dict):
+        prompt = turn_usage.get("prompt_tokens")
+        completion = turn_usage.get("completion_tokens")
+        if type(prompt) is int and type(completion) is int:
+            lines.append(
+                f"Last persisted turn cumulative usage ({turn_usage.get('usage_source') or 'unknown'}): "
+                f"{prompt:,} prompt, {completion:,} completion tokens"
+            )
+            read = turn_usage.get("cache_read_tokens")
+            written = turn_usage.get("cache_write_tokens")
+            if type(read) is int and type(written) is int:
+                hit_rate = turn_usage.get("cache_hit_rate")
+                hit_text = (
+                    f" ({hit_rate:.1%} hit)"
+                    if type(hit_rate) in {int, float}
+                    else ""
+                )
+                lines.append(
+                    f"  prompt cache subsets: {read:,} read, {written:,} written"
+                    f"{hit_text}"
+                )
+    else:
+        lines.append("Last persisted turn cumulative usage: unavailable")
+    return "\n".join(lines)
+
+
 def _render_memory_hit(hit: Any) -> str:
     """Render one project-memory hit without trusting workspace terminal text."""
 
@@ -2025,16 +2188,6 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                 transition_feedback("Imported and resumed chat.")
                 continue
             if command.name == "context":
-                maximum = max(
-                    1,
-                    int(
-                        getattr(
-                            loop,
-                            "_last_context_maximum",
-                            config.max_context_tokens - config.max_completion_tokens,
-                        )
-                    ),
-                )
                 has_summary = bool(
                     loop.current_session and loop.current_session.context_summary
                 )
@@ -2046,15 +2199,19 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                     continue
                 budget = _render_context_budget(loop._last_context_budget)
                 budget_suffix = f"\n{budget}" if budget else ""
-                last_usage = loop.last_turn_usage
+                diagnostics: dict[str, Any] = {}
+                if loop.current_session is not None:
+                    try:
+                        diagnostics = _context_diagnostics_for_session(
+                            loop.session_store,
+                            loop.current_session.session_id,
+                        )
+                    except Exception:  # noqa: BLE001 - diagnosis stays non-critical
+                        diagnostics = {}
+                rendered_diagnostics = _render_context_diagnostics(diagnostics)
                 print(
-                    f"Context: ~{loop._last_context_tokens}/{maximum} input tokens; "
-                    f"summary={'yes' if has_summary else 'no'}"
-                    f"; last cache={last_usage['cache_read_tokens']} read/"
-                    f"{last_usage['cache_write_tokens']} written "
-                    f"({float(last_usage['cache_hit_rate']):.1%} hit)"
-                    f"; last usage={last_usage['usage_source']}"
-                    f"{budget_suffix}",
+                    f"Context: summary={'yes' if has_summary else 'no'}\n"
+                    f"{rendered_diagnostics}{budget_suffix}",
                     flush=True,
                 )
                 continue

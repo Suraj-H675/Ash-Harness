@@ -18,7 +18,10 @@ from ash.core.loop import (
     MAX_PARALLEL_READ_ONLY_TOOL_CALLS,
     MAX_TOOL_CALLS_PER_COMPLETION,
 )
-from ash.core.activity import summarize_operational_events
+from ash.core.activity import (
+    summarize_context_diagnostics,
+    summarize_operational_events,
+)
 from ash.core.secret_middleware import SecretRedactionMiddleware
 from ash.tools.base import (
     BaseTool,
@@ -1885,38 +1888,70 @@ async def test_provider_request_timeout_retries_only_before_output(tmp_path) -> 
 
         def __init__(self) -> None:
             self.calls = 0
+            self.seen = []
 
         def count_tokens(self, text):
             return len(str(text))
 
         async def stream_chat(self, messages, temperature=0.0, tools=None):
             self.calls += 1
+            self.seen.append(messages)
             if self.calls == 1:
-                await asyncio.sleep(1)
+                await asyncio.sleep(2)
                 return
-            yield StreamChunk(content="done", is_done=True, stop_reason="stop")
+            yield StreamChunk(
+                content="<response>done</response>",
+                is_done=True,
+                stop_reason="stop",
+            )
 
     provider = RetryAfterTimeoutProvider()
+    ui = EventUI()
     loop = AshLoop(
         SessionStore(tmp_path / "retry-timeout.db"),
         provider,
         SafetyGuard(project_root=tmp_path),
-        EventUI(),
+        ui,
         tmp_path,
-    )
-    loop._config = SimpleNamespace(
-        provider_request_timeout_seconds=0.01,
-        provider_max_attempts=2,
-        provider_retry_base_delay=0.0,
-        provider_retry_max_delay=0.0,
-    )
-
-    result = await loop._stream_one_completion(
-        [{"role": "user", "content": "retry safely"}]
+        config=AshConfig(
+            model="custom/retry-after-timeout",
+            provider_request_timeout_seconds=1.0,
+            provider_max_attempts=2,
+            provider_retry_base_delay=0.0,
+            provider_retry_max_delay=0.0,
+        ),
     )
 
-    assert result.text == "done"
+    session = await loop.start_session()
+    result = await loop.run_turn("retry safely")
+
+    assert result == "done"
     assert provider.calls == 2
+    assert provider.seen[0] == provider.seen[1]
+    assembly = next(
+        event for event in ui.events if event["type"] == "context.usage"
+    )
+    started = [
+        event for event in ui.events if event["type"] == "model.request.started"
+    ]
+    failed = [
+        event for event in ui.events if event["type"] == "model.request.error"
+    ]
+    completed = [
+        event for event in ui.events if event["type"] == "model.request.completed"
+    ]
+    assert len(started) == 2
+    assert len(failed) == len(completed) == 1
+    assert {event["context_id"] for event in (*started, *failed, *completed)} == {
+        assembly["context_id"]
+    }
+    assert started[0]["operation_id"] == failed[0]["operation_id"]
+    assert started[1]["operation_id"] == completed[0]["operation_id"]
+    assert started[0]["operation_id"] != started[1]["operation_id"]
+    assert started[0]["requested_route"] == "custom/retry-after-timeout"
+    assert completed[0]["effective_route"] == "custom/retry-after-timeout"
+    assert completed[0]["usage_source"] == "estimated"
+    assert session.session_id == completed[0]["session_id"]
 
 
 @pytest.mark.asyncio
@@ -2475,6 +2510,32 @@ def test_first_output_wait_observer_projection_never_includes_payload_content() 
     assert "PRIVATE_" not in repr(event)
 
 
+def test_context_rejection_observer_projection_is_bounded_and_content_free() -> None:
+    event = loop_module._observer_event_projection(
+        {
+            "type": "context.request.rejected",
+            "context_id": "11111111-1111-4111-8111-111111111111",
+            "cause": "input_limit",
+            "scope": "request_attempt",
+            "dispatch_status": "not_dispatched",
+            "required_input_tokens": 90_000,
+            "input_limit": 80_000,
+            "protected_current_turn": True,
+            "opaque_provider_replay_state_preserved": True,
+            "required_history_summary": False,
+            "prompt": "PRIVATE_PROMPT",
+            "encrypted_content": "PRIVATE_REPLAY_STATE",
+            "api_key": "PRIVATE_CREDENTIAL",
+        }
+    )
+
+    assert event["context_id"] == "11111111-1111-4111-8111-111111111111"
+    assert event["dispatch_status"] == "not_dispatched"
+    assert event["required_input_tokens"] == 90_000
+    assert event["opaque_provider_replay_state_preserved"] is True
+    assert "PRIVATE_" not in repr(event)
+
+
 @pytest.mark.asyncio
 async def test_terminal_usage_only_does_not_count_as_first_provider_output(
     tmp_path,
@@ -2831,41 +2892,52 @@ async def test_provider_transport_error_event_preserves_only_failure_phase(tmp_p
                 raise RuntimeError("sanitized provider error") from cause
             yield StreamChunk(is_done=True)  # pragma: no cover
 
-    class Observer:
-        def __init__(self):
-            self.events = []
-
-        def on_event(self, event):
-            self.events.append(event)
-
-        def close(self):
-            pass
-
-    observer = Observer()
     ui = EventUI()
+    store = SessionStore(tmp_path / "transport.db")
     loop = AshLoop(
-        SessionStore(tmp_path / "transport.db"),
+        store,
         BrokenProvider(),
         SafetyGuard(tmp_path),
         ui,
         tmp_path,
-        event_observer=observer,
-        config=AshConfig(model="local/broken-connection", provider_max_attempts=1),
+        config=AshConfig(
+            model="local/broken-connection",
+            workspace_root=tmp_path,
+            db_directory=tmp_path / "db",
+            memory_backend="off",
+            provider_max_attempts=1,
+        ),
     )
     try:
         session = await loop.start_session()
         with pytest.raises(RuntimeError, match="sanitized provider error"):
-            await loop._stream_one_completion(
-                [{"role": "user", "content": "ping"}],
-                provider_tools={},
-                provider_tool_schema=[],
-                session_id=session.session_id,
-            )
-        errors = [event for event in observer.events if event["type"] == "model.request.error"]
+            await loop.run_turn("ping")
+        errors = [event for event in ui.events if event["type"] == "model.request.error"]
+        starts = [
+            event for event in ui.events if event["type"] == "model.request.started"
+        ]
+        assemblies = [
+            event for event in ui.events if event["type"] == "context.usage"
+        ]
         assert len(errors) == 1
+        assert len(starts) == len(assemblies) == 1
+        assert errors[0]["context_id"] == starts[0]["context_id"] == (
+            assemblies[0]["context_id"]
+        )
+        assert errors[0]["operation_id"] == starts[0]["operation_id"]
+        assert errors[0]["effective_route"] == "unknown"
+        assert errors[0]["requested_route"] == "local/broken-connection"
         assert errors[0]["transport_phase"] == "connect_timeout"
         assert errors[0]["error_type"] == "RuntimeError"
-        assert "PRIVATE_HOST_AND_TOKEN" not in repr(observer.events)
+        projected_error = loop_module._observer_event_projection(errors[0])
+        assert "PRIVATE_HOST_AND_TOKEN" not in repr(projected_error)
+        persisted = store.list_recent_runtime_events(session.session_id, limit=100)
+        persisted_error = next(
+            event.event
+            for event in persisted
+            if event.event.get("type") == "model.request.error"
+        )
+        assert persisted_error["context_id"] == errors[0]["context_id"]
     finally:
         await loop.aclose()
 
@@ -3868,11 +3940,12 @@ async def test_completed_turn_survives_runtime_event_flush_failure_and_retries(
     monkeypatch,
 ):
     store = SessionStore(tmp_path / "turn-event-flush.db")
+    ui = EventUI()
     loop = AshLoop(
         store,
         BudgetProvider(),
         SafetyGuard(tmp_path),
-        EventUI(),
+        ui,
         tmp_path,
     )
     await loop.start_session()
@@ -3891,11 +3964,21 @@ async def test_completed_turn_survives_runtime_event_flush_failure_and_retries(
 
     assert await loop.run_turn("first") == "done"
     assert loop._pending_runtime_events
+    session_id = loop.current_session.session_id
+    assert store.list_recent_runtime_events(session_id) == []
+    assert any(event["type"] == "context.usage" for event in ui.events)
+    missing_diagnostics = summarize_context_diagnostics(
+        store.list_recent_runtime_events(session_id), session_id=session_id
+    )
+    assert missing_diagnostics["assembly"] is None
+    assert missing_diagnostics["request"] is None
 
     allow_save = True
     assert await loop.run_turn("second") == "done"
     assert attempts >= 2
     assert not loop._pending_runtime_events
+    persisted = store.list_recent_runtime_events(session_id)
+    assert any(item.event.get("type") == "context.usage" for item in persisted)
     await loop.aclose()
 
 
@@ -4474,17 +4557,35 @@ async def test_queued_steering_is_persisted_and_applied_to_running_turn(tmp_path
         event["type"] for event in ui.events if event["type"] != "assistant.delta"
     ] == [
         "turn.started",
+        "context.usage",
         "model.request.started",
         "turn.steering.queued",
         "model.request.first_output",
         "model.request.completed",
         "turn.steering.applied",
+        "context.usage",
         "model.request.started",
         "model.request.first_output",
         "model.request.completed",
         "turn.usage",
         "turn.completed",
     ]
+    assemblies = [event for event in ui.events if event["type"] == "context.usage"]
+    requests = [
+        event for event in ui.events if event["type"] == "model.request.started"
+    ]
+    completions = [
+        event for event in ui.events if event["type"] == "model.request.completed"
+    ]
+    assert len(assemblies) == len(requests) == len(completions) == 2
+    assert assemblies[0]["context_id"] != assemblies[1]["context_id"]
+    for assembly, request, completion in zip(
+        assemblies, requests, completions, strict=True
+    ):
+        assert assembly["assembly_purpose"] == "request"
+        assert assembly["context_id"] == request["context_id"]
+        assert request["context_id"] == completion["context_id"]
+        assert request["operation_id"] == completion["operation_id"]
     loaded = store.load_session(loop.current_session.session_id)
     steering = next(
         message for message in loaded.messages if message.metadata.get("steering")
@@ -5177,11 +5278,12 @@ async def test_oversized_current_request_fails_before_provider_dispatch(tmp_path
 
     provider = NeverCalledProvider()
     store = SessionStore(tmp_path / "context-budget.db")
+    ui = EventUI()
     loop = AshLoop(
         store,
         provider,
         SafetyGuard(project_root=tmp_path),
-        EventUI(),
+        ui,
         tmp_path,
         tools={},
         config=AshConfig(
@@ -5204,6 +5306,78 @@ async def test_oversized_current_request_fails_before_provider_dispatch(tmp_path
     assert provider.calls == 0
     assert loop.is_turn_running is False
     assert store.reconcile_interrupted_turns(session.session_id) == 0
+    rejection = next(
+        event for event in ui.events if event["type"] == "context.request.rejected"
+    )
+    assert rejection["cause"] == "input_limit"
+    assert rejection["scope"] == "request_attempt"
+    assert rejection["dispatch_status"] == "not_dispatched"
+    assert rejection["required_input_tokens"] > rejection["input_limit"]
+    assert rejection["protected_current_turn"] is True
+    assert rejection["opaque_provider_replay_state_preserved"] is False
+    assert not any(event["type"] == "model.request.started" for event in ui.events)
+
+
+@pytest.mark.asyncio
+async def test_opaque_context_rejection_reports_preserved_replay_state(tmp_path) -> None:
+    class NeverCalledProvider(ProviderABC):
+        model_name = "context-budget-opaque"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def count_tokens(self, text):
+            return len(text.split())
+
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            self.calls += 1
+            yield StreamChunk(content="unexpected", is_done=True, stop_reason="stop")
+
+    provider = NeverCalledProvider()
+    store = SessionStore(tmp_path / "opaque-context-budget.db")
+    ui = EventUI()
+    loop = AshLoop(
+        store,
+        provider,
+        SafetyGuard(project_root=tmp_path),
+        ui,
+        tmp_path,
+        config=AshConfig(
+            model="custom/context-budget-opaque",
+            workspace_root=tmp_path,
+            db_directory=tmp_path / "db",
+            memory_backend="off",
+            max_context_tokens=120,
+            max_completion_tokens=20,
+        ),
+    )
+    session = await loop.start_session()
+    opaque_message = Message(
+        role="assistant",
+        content="retained reasoning",
+        timestamp=datetime.now(timezone.utc),
+        metadata={
+            "provider_state": [
+                {"type": "reasoning", "encrypted_content": "opaque-fixture"}
+            ],
+            "provider_state_owner": "custom/context-budget-opaque",
+        },
+    )
+    store.save_message(session.session_id, opaque_message)
+    session.messages.append(opaque_message)
+
+    with pytest.raises(ContextBudgetExceededError):
+        await loop.run_turn("protected current request " + "word " * 500)
+
+    rejection = next(
+        event for event in ui.events if event["type"] == "context.request.rejected"
+    )
+    assert provider.calls == 0
+    assert rejection["cause"] == "input_limit"
+    assert rejection["opaque_provider_replay_state_preserved"] is True
+    assert rejection["protected_current_turn"] is True
+    assert rejection["dispatch_status"] == "not_dispatched"
+    assert not any(event["type"] == "model.request.started" for event in ui.events)
 
 
 @pytest.mark.asyncio
@@ -6349,6 +6523,25 @@ async def test_native_tool_calls_are_normalized_and_persisted(tmp_path):
 
     assert response == "done"
     assert tool.arguments == {"text": "hello"}
+    context_events = [
+        event for event in ui.events if event["type"] == "context.usage"
+    ]
+    request_starts = [
+        event for event in ui.events if event["type"] == "model.request.started"
+    ]
+    request_completions = [
+        event for event in ui.events if event["type"] == "model.request.completed"
+    ]
+    assert len(context_events) == len(request_starts) == len(request_completions) == 2
+    assert context_events[0]["context_id"] != context_events[1]["context_id"]
+    assert all(event["assembly_purpose"] == "request" for event in context_events)
+    for context_event, started, completed in zip(
+        context_events, request_starts, request_completions, strict=True
+    ):
+        assert started["context_id"] == completed["context_id"] == (
+            context_event["context_id"]
+        )
+        assert started["operation_id"] == completed["operation_id"]
     second_request = provider.received_messages[1]
     assistant = next(
         message
@@ -6364,12 +6557,14 @@ async def test_native_tool_calls_are_normalized_and_persisted(tmp_path):
         event["type"] for event in ui.events if event["type"] != "assistant.delta"
     ] == [
         "turn.started",
+        "context.usage",
         "model.request.started",
         "model.request.first_output",
         "model.request.completed",
         "tool.requested",
         "tool.started",
         "tool.completed",
+        "context.usage",
         "model.request.started",
         "model.request.first_output",
         "model.request.completed",
@@ -7005,6 +7200,7 @@ async def test_turn_token_budget_stops_before_tool_side_effects(tmp_path):
 async def test_turn_token_budget_blocks_next_provider_request(tmp_path):
     provider = MultiStepBudgetProvider()
     tool = CaptureTool(SafetyGuard(project_root=tmp_path))
+    ui = EventUI()
     config = AshConfig(
         workspace_root=tmp_path,
         db_directory=tmp_path / "db",
@@ -7017,7 +7213,7 @@ async def test_turn_token_budget_blocks_next_provider_request(tmp_path):
         SessionStore(tmp_path / "multi-turn-budget.db"),
         provider,
         tool.safety_guard,
-        EventUI(),
+        ui,
         tmp_path,
         tools={tool.name: tool},
         config=config,
@@ -7034,6 +7230,22 @@ async def test_turn_token_budget_blocks_next_provider_request(tmp_path):
     assert provider.completion_limits == [4]
     assert loop._last_turn_budget_exhausted is True
     assert loop._last_turn_stop_reason == "token_budget"
+    rejection = next(
+        event for event in ui.events if event["type"] == "context.request.rejected"
+    )
+    request_starts = [
+        event for event in ui.events if event["type"] == "model.request.started"
+    ]
+    assert rejection["cause"] == "turn_budget"
+    assert rejection["dispatch_status"] == "not_dispatched"
+    assert rejection["turn_token_limit"] == 80
+    assert rejection["context_id"] not in {
+        event.get("context_id") for event in request_starts
+    }
+    assert any(
+        event["type"] == "model.request.completed"
+        for event in ui.events
+    )
 
 
 @pytest.mark.asyncio
@@ -9565,6 +9777,21 @@ async def test_turn_usage_tracks_cache_and_configured_cost(tmp_path):
     context_event = next(
         event for event in ui.events if event["type"] == "context.usage"
     )
+    request_started = [
+        event for event in ui.events if event["type"] == "model.request.started"
+    ]
+    request_completed = [
+        event for event in ui.events if event["type"] == "model.request.completed"
+    ]
+    assert len(request_started) == len(request_completed) == 1
+    assert context_event["assembly_purpose"] == "request"
+    assert context_event["context_id"]
+    assert request_started[0]["context_id"] == context_event["context_id"]
+    assert request_completed[0]["context_id"] == context_event["context_id"]
+    assert context_event["estimator_count_mode"] == "unknown"
+    assert request_started[0]["requested_route"] == "openai/cache-test"
+    assert request_completed[0]["effective_route"] == "openai/cache-test"
+    assert request_completed[0]["usage_source"] == "provider"
     assert loop._last_context_tokens == context_event["current"]
     for source, event_key in (
         ("system", "system_tokens"),
@@ -9907,8 +10134,9 @@ async def test_failover_model_events_identify_requested_and_serving_provider(
 
     provider = FailoverProvider([PrimaryProvider(), BackupProvider()])
     ui = EventUI()
+    store = SessionStore(tmp_path / "failover-events.db")
     loop = AshLoop(
-        SessionStore(tmp_path / "failover-events.db"),
+        store,
         provider,
         SafetyGuard(project_root=tmp_path),
         ui,
@@ -9916,21 +10144,29 @@ async def test_failover_model_events_identify_requested_and_serving_provider(
         config=AshConfig(model="anthropic/primary"),
     )
 
-    assert (await loop._stream_one_completion([])).text == "backup"
-    assert (await loop._stream_one_completion([])).text == "backup"
+    session = await loop.start_session()
+    assert await loop.run_turn("use the configured backup route") == "backup"
 
+    context_events = [
+        event for event in ui.events if event["type"] == "context.usage"
+    ]
     started = [event for event in ui.events if event["type"] == "model.request.started"]
     completed = [
         event for event in ui.events if event["type"] == "model.request.completed"
     ]
-    assert [(event["provider"], event["model"]) for event in started] == [
-        ("anthropic", "anthropic/primary"),
-        ("anthropic", "anthropic/primary"),
-    ]
-    assert [(event["provider"], event["model"]) for event in completed] == [
-        ("openai", "openai/backup"),
-        ("openai", "openai/backup"),
-    ]
+    assert len(context_events) == len(started) == len(completed) == 1
+    assert context_events[0]["estimator_route"] == "unknown"
+    assert started[0]["requested_route"] == "anthropic/primary"
+    assert completed[0]["effective_route"] == "openai/backup"
+    assert started[0]["context_id"] == completed[0]["context_id"] == (
+        context_events[0]["context_id"]
+    )
+    assert started[0]["operation_id"] == completed[0]["operation_id"]
+    diagnostics = summarize_context_diagnostics(
+        store.list_recent_runtime_events(session.session_id),
+        session_id=session.session_id,
+    )
+    assert diagnostics["request"]["route_parity"] == "mismatch"
 
 
 def test_empty_model_pricing_entry_falls_back_to_provider_family(tmp_path) -> None:
@@ -12445,6 +12681,10 @@ async def test_credential_rotation_is_one_model_attempt_with_profile_telemetry(
     tmp_path,
 ) -> None:
     from ash.providers.credential_pool import CredentialPoolProvider
+    from ash.sdk import AshEvent
+
+    profile_label = "SECRET_LOOKING_PROFILE_LABEL_FOR_TEST_ONLY"
+    backup_label = "BACKUP_SECRET_LOOKING_PROFILE_LABEL_FOR_TEST_ONLY"
 
     class APIError(RuntimeError):
         status_code = 401
@@ -12457,13 +12697,15 @@ async def test_credential_rotation_is_one_model_attempt_with_profile_telemetry(
         def __init__(self, *, fail: bool) -> None:
             self.fail = fail
             self.calls = 0
+            self.seen: list[list[dict[str, Any]]] = []
 
         def count_tokens(self, text):
             return len(text)
 
         async def stream_chat(self, messages, temperature=0.0, tools=None):
-            del messages, temperature, tools
+            del temperature, tools
             self.calls += 1
+            self.seen.append(list(messages))
             if self.fail:
                 raise APIError("invalid key")
             yield StreamChunk(content="recovered")
@@ -12473,44 +12715,73 @@ async def test_credential_rotation_is_one_model_attempt_with_profile_telemetry(
     backup = CredentialProvider(fail=False)
     provider = CredentialPoolProvider(
         [primary, backup],
-        ["OPENAI_PRIMARY", "OPENAI_BACKUP"],
+        [profile_label, backup_label],
     )
     ui = EventUI()
+    store = SessionStore(tmp_path / "credential-rotation-events.db")
     loop = AshLoop(
-        SessionStore(tmp_path / "credential-rotation-events.db"),
+        store,
         provider,
         SafetyGuard(project_root=tmp_path),
         ui,
         tmp_path,
         config=AshConfig(
             model="openai/gpt-test",
+            workspace_root=tmp_path,
+            db_directory=tmp_path / "db",
+            memory_backend="off",
             provider_max_attempts=3,
             provider_retry_base_delay=0,
         ),
     )
 
-    outcome = await loop._stream_one_completion([])
+    try:
+        await loop.start_session()
+        assert await loop.run_turn("recover through the credential pool") == "recovered"
 
-    assert outcome.text == "recovered"
-    assert primary.calls == 1
-    assert backup.calls == 1
-    started = next(
-        event for event in ui.events if event["type"] == "model.request.started"
-    )
-    completed = next(
-        event for event in ui.events if event["type"] == "model.request.completed"
-    )
-    assert started["attempt"] == 1
-    assert started["credential_profile"] == "OPENAI_PRIMARY"
-    assert started["credential_pool_size"] == 2
-    assert completed["attempt"] == 1
-    assert completed["credential_profile"] == "OPENAI_BACKUP"
-    assert completed["credential_pool_size"] == 2
-    assert not any(
-        event["type"] == "provider.retrying"
-        for event in ui.events
-    )
-    assert loop._provider_circuit_key == "openai/gpt-test"
+        assert primary.calls == 1
+        assert backup.calls == 1
+        assert primary.seen == backup.seen
+        context_event = next(
+            event for event in ui.events if event["type"] == "context.usage"
+        )
+        started = next(
+            event for event in ui.events if event["type"] == "model.request.started"
+        )
+        completed = next(
+            event for event in ui.events if event["type"] == "model.request.completed"
+        )
+        assert started["attempt"] == 1
+        assert started["credential_profile"] == profile_label
+        assert started["credential_pool_size"] == 2
+        assert completed["attempt"] == 1
+        assert completed["credential_profile"] == backup_label
+        assert completed["credential_pool_size"] == 2
+        observed_context = loop_module._observer_event_projection(context_event)
+        stored_context = next(
+            item.event
+            for item in store.list_recent_runtime_events(
+                loop.current_session.session_id, limit=100
+            )
+            if item.event.get("type") == "context.usage"
+        )
+        sdk_context = AshEvent.from_wire(context_event).to_wire()
+        for surface in (context_event, observed_context, stored_context, sdk_context):
+            assert "credential_profile" not in surface
+            assert "credential_pool_size" not in surface
+            assert profile_label not in repr(surface)
+            assert backup_label not in repr(surface)
+        assert context_event["context_id"] == started["context_id"] == (
+            completed["context_id"]
+        )
+        assert started["operation_id"] == completed["operation_id"]
+        assert started["requested_route"] == completed["effective_route"] == (
+            "openai/gpt-test"
+        )
+        assert not any(event["type"] == "provider.retrying" for event in ui.events)
+        assert loop._provider_circuit_key == "openai/gpt-test"
+    finally:
+        await loop.aclose()
 
 
 def test_replay_credential_telemetry_resolves_nonprimary_model_and_profile() -> None:
