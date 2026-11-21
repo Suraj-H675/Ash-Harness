@@ -283,10 +283,23 @@ def test_native_codex_resolver_accepts_stock_binary_without_custom_alias(
     assert _native_codex_binary() == native
 
 
+@pytest.mark.parametrize(
+    ("system", "architecture", "expected_denial"),
+    [
+        ("linux", "x86_64", "not independently attested"),
+        ("darwin", "arm64", "need Linux x86_64 attestation"),
+    ],
+)
 def test_unsealed_plain_codex_model_dispatch_fails_before_host_or_auth_access(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    system: str,
+    architecture: str,
+    expected_denial: str,
 ) -> None:
-    """A real model launch must never proceed under the broad host-read profile."""
+    """Both missing proof and unsupported macOS must refuse before auth or model."""
+    monkeypatch.setattr(runner.sys, "platform", system)
+    monkeypatch.setattr(runner.platform, "machine", lambda: architecture)
 
     def unexpected_call(*_args: object, **_kwargs: object) -> None:
         pytest.fail("unsealed dispatch reached native binary, profile, or process")
@@ -297,7 +310,7 @@ def test_unsealed_plain_codex_model_dispatch_fails_before_host_or_auth_access(
     private = tmp_path / "attestation"
     private.mkdir(mode=0o700)
     monkeypatch.setattr(runner, "_LOCAL_ATTESTATION", private / "absent.json")
-    with pytest.raises(RuntimeError, match="not independently attested"):
+    with pytest.raises(RuntimeError, match=expected_denial):
         runner._run_codex(
             tmp_path / "task-workspace",
             tmp_path / "evidence",
