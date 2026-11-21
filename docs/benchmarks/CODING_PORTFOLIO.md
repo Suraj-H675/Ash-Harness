@@ -7,7 +7,7 @@ not a claim that all scenarios have been run or passed.
 
 ## First portfolio: existing cases, not invented benchmarks
 
-R1–R16 are pinned repository tasks. Some share an upstream project.
+R1–R17 are pinned repository tasks. Some share an upstream project.
 S1–S6 are synthetic tasks.
 Keep the lanes separate and do not pool their scores into a single win rate.
 
@@ -28,7 +28,8 @@ Keep the lanes separate and do not pool their scores into a single win rate.
 | R13 | `moreitertools-peekable-reverse-slice` | Pinned real repo | Prevent `peekable` from exhausting an infinite or large finite iterator when reverse slicing with a known start and omitted stop; preserve caching and genuine right-relative indexing | **First sequential 65K pair: both pass**; Ash 69.16s / 6 model requests / 6 tools / 0 rejects, Codex 53.46s / 3 non-test shell commands; one observation and native policy-parity caveat |
 | R14 | `toolz-partition-invalid-length` | Pinned real repo | Detect an iterable's incorrect reported length rather than silently truncate a partially filled partition; preserve correct normal and no-length iteration | **First sequential 65K pair: both pass**; Ash 88.85s / 8 model requests / 8 tool calls (one safe edit rejection), Codex 104.25s / 4 non-test commands; one sample, with policy-parity limits |
 | R15 | `click-clirunner-context-settings` | Pinned real repo | Extend Click's `CliRunner.invoke` public API with context-settings overrides that avoid parameter-name collisions while preserving existing invocation behavior | **First sequential 65K pair: both pass**; Ash 113.51s / 12 model requests / 15 tools (one rejected regex), Codex 86.05s / four non-test shell commands; one sample and native-policy caveat |
-| R16 | `pyflakes-functional-typing-fields` | Pinned real repo | Python static analysis in Pyflakes. Track name uses in runtime `TypedDict` and `NamedTuple` field expressions while preserving annotation handling | **First matched pair: Ash fail (malformed provider tool-call arguments before any edit), plain Codex pass (visible and hidden oracles).** One trial only; no stable reliability or speed ranking. Independent source preflight remains red/red base and green/green fix. |
+| R16 | `pyflakes-functional-typing-fields` | Pinned real repo | Python static analysis in Pyflakes. Track name uses in runtime `TypedDict` and `NamedTuple` field expressions while preserving annotation handling | **Original pair: Ash fail / plain Codex pass. Post-reliability-fix pair: both pass** visible+hidden oracles and complete CLI; Ash 71.63s, Codex 55.07s. One post-fix observation cannot establish causality or a reliable speed ranking. |
+| R17 | `pytest-mixed-indirect-fixture-precedence` | Pinned real repo | Fix mixed `indirect=[...]` fixture precedence when a direct parameter shares a name with a parametrized fixture; preserves boolean indirect modes and unknown-fixture errors | **Fixture independently validated; no model-driven Ash/Codex pair yet.** Historical base visible/hidden both red, upstream reference both green; chief-only behavioral holdouts 9/9 expected checks. Linux `/usr/bin/python3` + locked source-only overlay; comparisons must remain qualified for tool/permission parity. |
 | S1 | `marker` | Synthetic CLI smoke | Exact file creation and protected-file preservation | Exists; record separately as smoke |
 | S2 | `build-run` | Synthetic CLI smoke | Create a script, then execute authorized check | Exists; verify tool execution and terminal completion |
 | S3 | `repair-test` | Synthetic repair | Single-file bug and independent hidden check | Exists; current strong-model baseline pending |
@@ -80,6 +81,50 @@ requested context, and isolated credentials; system prompts, tools, shell
 permissions and actual served-model details were not proven equivalent.
 This is **one Ash failure and one Codex success**, not a stable performance
 estimate or evidence that the preceding reference-lookup optimization regressed.
+
+**R16 post-reliability-fix matched follow-up (2026-11-20):** After the
+bounded native tool-call recovery fix passed independent safety reviews and
+18/18 Linux/macOS hosted CI jobs at Ash `de1dc94`, one new sequential matched
+pair repeated the *unchanged* pinned R16 task, prompt and oracles. Both sides
+requested `gpt-6-luna` at `xhigh`, 65,536-token context and 210 seconds per
+engine. **Ash and plain Codex both passed** visible and sealed hidden
+checks, edited only `pyflakes/checker.py`, ran the visible check and completed
+successfully with clean scope evidence. Ash took **71.63s** (9 model
+requests, 12 tool calls, no unsuccessful model requests, valid session audit);
+plain Codex took **55.07s** (4 shell calls, including the visible test).
+The comparator verified identical task/user prompt, source pins, oracle
+*source* hashes and requested model/effort/context, but not serving-model,
+system-prompt, skill stack, native tools, permission or complete sandbox parity.
+Importantly, no malformed response occurred in the post-fix model-driven
+sample, so this pass **does not demonstrate the retry mechanism being used**
+or isolate the repair as the cause of improvement; separate synthetic real-CLI
+negative tests establish that boundary. Preserve the prior Ash failure as
+historical evidence, do not claim a coding win from one pass, and rotate to
+fresh held-out tasks. Private receipts:
+`/var/tmp/ash-r16-pyflakes-postfix-paired-20261120-r01/`.
+
+**R17 fixture provenance and initial acceptance (2026-11-21):** The pinned
+[pytest PR #13976](https://github.com/pytest-dev/pytest/pull/13976) has
+original `fd47511afeb024d2fbad9257d1b44310672c6a0f` and merged
+reference `6b6502e94b78b41951b70265a84187a419e8ce8c`. Exact upstream
+differences cover two permitted production modules and two protected test
+modules; unlike multi-file refactors, changing only one permitted production
+module can correctly repair the behavior. The system-Python 3.14.10 trusted
+host reproduced **base visible/hidden 1/1, reference 0/0** on the revised
+graders, with a 380-file pure-Python dependency overlay validated against
+version-locked installed RECORDs plus independently frozen, observed source
+fingerprints. These fingerprints are not PyPI artifact authentication.
+Nine chief-only preauthored Bubblewrap holdout checks passed their expected
+outcomes on the original, reference and a one-file-repaired copy; protected
+upstream tests, `qa_visible.py`, and runtime-overlay changes are rejected.
+Author-written R17 hidden probe observations are compared with parent-only
+expectations; this makes the grading more defensible but does not make the
+fixture an independent **unseen generalization** benchmark or immune to
+malicious output spoofing. Three older real-repo preflight controls (R1, R9,
+R16) remained valid; the original legacy single-red acceptance policy was
+preserved separately from R17's stronger two-red requirement. Fresh validated
+tool/permission parity, Linux/macOS CI and any live model outcomes must be
+recorded separately. **No R17 inference trial or performance claim yet.**
 
 **R15 provenance and preflight (2026-11-17):**
 The independently selected [pallets/click PR #3896](https://github.com/pallets/click/pull/3896),

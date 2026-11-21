@@ -4,10 +4,11 @@ For the current cross-scenario inventory, stopping rules, and evaluation
 priorities, see [Coding evaluation portfolio](../benchmarks/CODING_PORTFOLIO.md).
 
 This is a **curated historical-regression replay** on publicly available,
-pre-existing source repositories, not a synthetic project and not yet a
-SWE-bench or Codex/Claude Code head-to-head comparison. It exercises Ash's
-actual `ash -p --mode auto_edit` CLI against a disposable Git checkout and
-tests both visible and hidden behavior outside the model's workspace.
+pre-existing source repositories, not a synthetic project or SWE-bench.
+The optional plain-Codex comparator is a **qualified operational comparison**,
+not a fully controlled benchmark of the underlying coding models. It exercises
+Ash's actual `ash -p --mode auto_edit` CLI against a disposable Git checkout
+and grades visible and hidden behavior outside the model's workspace.
 
 The operator-run entry point is `devtools/repository_benchmark.py`. It
 requires Linux, Bubblewrap, Git, the checked-out Ash development environment,
@@ -16,12 +17,18 @@ lifetime for the chosen trial. Model IDs are confirmed in the account catalog.
 
 ## Task provenance
 
+The table below shows the initial four tasks and the R17 pytest fixture.
+It is **not** the complete portfolio: the authoritative list of currently
+runnable task IDs and pinned revisions is `TASKS` in
+`devtools/repository_benchmark.py`, with status tracked in the portfolio.
+
 | Task | Public repository | Pinned original | Original upstream fix | Authorized source |
 |---|---|---|---|---|
 | `h11-chunk-footer` | [python-hyper/h11](https://github.com/python-hyper/h11) | `31e626c64e1e28db3cd73a6aa0ac057f1b915c18` | `dff7cc397a26ed4acdedd92d1bda6c8f18a6ed9f` | `h11/_readers.py` |
 | `urllib3-header-sanitization` | [urllib3/urllib3](https://github.com/urllib3/urllib3) | `8883fd900057ee65f553586389ecd70269f05e04` | `96449eb1ac8cfca8fb9605b8bbff7a5fe0081dd2` | `src/urllib3/connection.py` |
 | `urllib3-proxy-redirect` | [urllib3/urllib3](https://github.com/urllib3/urllib3) | `e349d97f2bf234b95d5dd9e689d056a521dfc3b0` | `01cd60b539f808a65e9c5aa93db1c48292432176` | `src/urllib3/connectionpool.py` and `src/urllib3/poolmanager.py` |
 | `urllib3-url-auth-feature` | [urllib3/urllib3](https://github.com/urllib3/urllib3) | `5454903f272718f19d68d5f78789251bd5c5b443` | `5cf0247049a4baa02e830666de53431e5b575694` | `src/urllib3/util/url.py` |
+| `pytest-mixed-indirect-fixture-precedence` (R17) | [pytest-dev/pytest](https://github.com/pytest-dev/pytest) | `fd47511afeb024d2fbad9257d1b44310672c6a0f` | `6b6502e94b78b41951b70265a84187a419e8ce8c` ([PR #13976](https://github.com/pytest-dev/pytest/pull/13976)) | `src/_pytest/fixtures.py` and/or `src/_pytest/python.py` |
 
 Each original repository is fetched at the **exact pinned Git commit**, with
 no agent access to the later reference fix. Before inference, the benchmark
@@ -50,11 +57,45 @@ semantics. Only `src/urllib3/util/url.py` may change. The upstream feature
 commit also contained ancillary socks and documentation updates, which are
 not part of this deliberately scoped task.
 
+**R17 (pytest)** specifically tests mixed direct/indirect parametrization
+when a direct argument shares a name with a parametrized fixture. It preserves
+`indirect=True`, `indirect=False`, missing-indirect-fixture diagnostics and
+ordinary parametrization. Unlike earlier tasks, a one-file repair in either
+allowed production module can pass. Upstream test files, the visible test and
+the fixture runtime overlay remain protected. R17's historical baseline must
+fail both visible and hidden grading and the pinned reference must pass both;
+R1–R16 retain their existing rule that at least one original oracle must fail.
+
+The R17 task is **Linux-only** for its model-driven replay. Its system
+`python3` command must resolve to `/usr/bin/python3`, meet the upstream
+Python **3.10+** requirement, and match the actual grader interpreter; the
+preflight records the exact system interpreter version. The source checkout
+requires generated ignored version metadata plus a bounded source-only
+runtime overlay. The overlay consists of 380 whitelisted pure-Python files
+sourced from the active locked development venv, checked against installed
+`RECORD` and separately frozen source-byte fingerprints. These fingerprints
+are chief-observed installed source digests, **not** an independent
+cryptographic verification of PyPI wheel artifacts; changes require
+preflight reproving and updated provenance. No untrusted installer or network
+fetch is used to build the overlay.
+
+R17's candidate-executed hidden **probe** receives only the candidate-visible
+cases and emits observations; the expected observations live in the trusted
+parent grader, outside candidate-visible process arguments and files. Its
+hidden test is authored for this task, **not** a previously unseen independent
+generalization holdout. Independent chief-owned holdout checks are maintained
+separately and never sent to the implementing agent. A malicious candidate
+may still spoof or infer probe observations; this fixture does not claim to
+prove adversarial resistance in every case. The authenticated task inputs,
+source and oracle fingerprints, visible grant and frozen checker all belong
+to the comparative test contract. No paid R17 model-driven comparison had
+run when this documentation entry was written.
+
 ## Example usage
 
 ```sh
 PYTHONPATH=src .venv/bin/python devtools/repository_benchmark.py \
-  --task h11-chunk-footer --chatgpt-model gpt-6.1-sol \
+  --task h11-chunk-footer --chatgpt-model gpt-6-luna \
   --context-tokens 32768 --turn-token-budget 120000 --timeout 240 \
   --evidence-dir /var/tmp/ash-h11-replay-001
 ```
@@ -116,12 +157,17 @@ exact block at a different location; it never silently relocates or
 fuzzily applies the edit. Use explicit current bounds when the old block
 is duplicated or location is important.
 
-Interpret each trial narrowly. This replay suite contains two real-world
-**single-module regression repairs**, one **two-module regression repair**,
-and one **single-module feature addition**. It does not yet cover more
-substantial feature work, language/build ecosystem diversity,
-interruption/resume, repeated reliability, or a fair same-model competitor
-baseline. Those remain open acceptance work.
+Interpret each trial narrowly. The *original four* replay tasks consisted
+of two single-module repairs, one two-module repair and one feature addition.
+The portfolio now contains substantially more pinned tasks, including R17;
+the real-task inventory and evidence status are maintained in
+`docs/benchmarks/CODING_PORTFOLIO.md`. Requested model/effort/context,
+source pins and user prompt may match between engines while effective system
+instructions, native tools, command permissions and other limits do not.
+Paired reports therefore distinguish `comparison_verified` (the checked
+receipt invariants) from `fully_controlled: false` and explicitly list the
+operational parity caveats. Do not infer repeat-run reliability or a product
+coding win from preflight validity, source-based tests or one paired sample.
 
 ## Repeatable plain-Codex comparator
 
@@ -168,10 +214,12 @@ and a fresh evidence directory, passing `--fair-prompt` to
 `devtools/repository_benchmark.py`. The two runners record the actual
 user-prompt SHA-256; `devtools/coding_comparison.py` rejects different
 user prompts or historical task-objective hashes when both are present.
-New receipts also include content-free SHA-256 fingerprints of both
-visible and hidden oracle *source*; a mismatch is rejected when both
-runners provide these fields. This proves the declared grader text
-matches, not identical grader environments or oracle inaccessibility.
+New receipts include content-free SHA-256 fingerprints of the visible
+and hidden oracle definitions; a mismatch is rejected when both runners
+provide them. R17 additionally fingerprints its candidate-visible probe and
+a combined probe/parent-expectations payload, without putting the latter in
+the candidate checkout. This proves declared grader material matches, not
+identical grader environments or immunity to crafted output.
 The old Poteto trials have no matched actual-user-prompt receipt and
 cannot be treated as plain-Codex comparisons.
 

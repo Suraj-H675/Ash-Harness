@@ -31,8 +31,11 @@ from repository_benchmark import (
     preflight,
     remove_reference_checkout,
     shared_user_prompt,
+    hidden_oracle_classification,
+    hidden_oracle_sha256,
     snapshot_files,
     validate_editable_paths,
+    verify_task_runtime,
 )
 from coding_benchmark import _chatgpt_tmpfs_root
 
@@ -331,6 +334,11 @@ def run_task(
         remove_reference_checkout(scratch)
         workspace = scratch / "workspace"
         shutil.copytree(baseline, workspace, symlinks=True)
+        if task.runtime is not None:
+            runtime_receipt = preflight_receipt.get("runtime_overlay")
+            if not isinstance(runtime_receipt, dict):
+                raise RuntimeError("preflight omitted the required runtime receipt")
+            verify_task_runtime(workspace, task.runtime, runtime_receipt)
         initial = snapshot_files(workspace)
         validate_editable_paths(initial, task.editable, preflight_receipt)
 
@@ -339,6 +347,8 @@ def run_task(
         manifest = {
             "task": name,
             "source": task.source,
+            "upstream_pr": task.upstream_pr,
+            "license": task.license,
             "base_sha": task.base_sha,
             "reference_fix_sha": task.reference_fix_sha,
             "preflight": preflight_receipt,
@@ -350,9 +360,11 @@ def run_task(
             "visible_oracle_sha256": hashlib.sha256(
                 task.visible_source.encode()
             ).hexdigest(),
-            "hidden_oracle_sha256": hashlib.sha256(
+            "hidden_oracle_sha256": hidden_oracle_sha256(task),
+            "hidden_probe_sha256": hashlib.sha256(
                 task.hidden_source.encode()
             ).hexdigest(),
+            "hidden_oracle_classification": hidden_oracle_classification(task),
         }
         (evidence / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
         if preflight_only:
@@ -372,7 +384,12 @@ def run_task(
             json.dumps(invocation, indent=2) + "\n"
         )
         updated = snapshot_files(workspace)
-        protected, changed = check_edits(initial, updated, task.editable)
+        protected, changed = check_edits(
+            initial,
+            updated,
+            task.editable,
+            require_all_editable_changed=task.require_all_editable_changed,
+        )
         oracles = check_oracles(workspace, task)
         try:
             events = summarize_codex_events(

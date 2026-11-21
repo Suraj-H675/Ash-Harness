@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import subprocess
 import sys
@@ -476,3 +477,113 @@ def test_codex_scoring_accepts_new_editable_source_modules(
     assert result["required_source_changed"] is True
     assert result["changed_paths"] == ["src/pkg/_caller.py", "src/pkg/_hooks.py"]
     assert result["visible_test_command_executed"] is True
+
+
+def test_r17_codex_fake_grade_accepts_one_semantic_source_repair(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    task_name = "pytest-mixed-indirect-fixture-precedence"
+    task = runner.TASKS[task_name]
+    scratch_roots: list[Path] = []
+
+    def preflight(_task: RepositoryTask, scratch: Path):
+        scratch_roots.append(scratch)
+        baseline = scratch / "baseline"
+        source = baseline / "src/_pytest"
+        source.mkdir(parents=True)
+        (source / "fixtures.py").write_text("baseline", encoding="utf-8")
+        (source / "python.py").write_text("unchanged", encoding="utf-8")
+        (source / "_version.py").write_text("generated", encoding="utf-8")
+        overlay = baseline / ".benchmark_runtime/site/pluggy"
+        overlay.mkdir(parents=True)
+        (overlay / "__init__.py").write_text("locked source", encoding="utf-8")
+        (baseline / task.visible_script).write_text(
+            task.visible_source, encoding="utf-8"
+        )
+        (scratch / "reference").mkdir()
+        return baseline, {
+            "base_visible_exit": 2,
+            "base_hidden_exit": 2,
+            "reference_visible_exit": 0,
+            "reference_hidden_exit": 0,
+            "reference_added_paths": [],
+            "runtime_overlay": {"overlay_sha256": "fixture"},
+        }
+
+    def verify_runtime(workspace: Path, _runtime: object, receipt: object) -> None:
+        assert receipt == {"overlay_sha256": "fixture"}
+        assert (workspace / ".benchmark_runtime/site/pluggy/__init__.py").is_file()
+        assert (workspace / "src/_pytest/_version.py").is_file()
+
+    def fake_codex(workspace: Path, evidence: Path, **_kwargs: object):
+        assert not (workspace.parent / "reference").exists()
+        assert all(
+            task.hidden_expected_json not in path.read_text(encoding="utf-8")
+            for path in workspace.rglob("*")
+            if path.is_file()
+        )
+        (workspace / "src/_pytest/fixtures.py").write_text(
+            "repaired", encoding="utf-8"
+        )
+        events = [
+            {
+                "type": "item.completed",
+                "item": {
+                    "type": "command_execution",
+                    "command": "/usr/bin/zsh -lc 'python3 -B qa_visible.py'",
+                    "status": "completed",
+                    "exit_code": 0,
+                },
+            },
+            {"type": "turn.completed", "usage": {"input_tokens": 40}},
+        ]
+        (evidence / "codex.jsonl").write_text(
+            "".join(json.dumps(item) + "\n" for item in events),
+            encoding="utf-8",
+        )
+        return {
+            "exit_code": 0,
+            "timed_out": False,
+            "cli_seconds": 1.0,
+            "native_binary_direct": True,
+            "isolated_codex_home": True,
+            "isolated_home_xdg": True,
+            "memory_backed_auth_copy_cleaned": True,
+        }
+
+    monkeypatch.setattr(runner, "preflight", preflight)
+    monkeypatch.setattr(runner, "verify_task_runtime", verify_runtime)
+    monkeypatch.setattr(runner, "_run_codex", fake_codex)
+    monkeypatch.setattr(
+        runner,
+        "check_oracles",
+        lambda *_args: {
+            "correct": True,
+            "visible_oracle_exit": 0,
+            "hidden_oracle_exit": 0,
+        },
+    )
+    evidence = tmp_path / "r17-evidence"
+    evidence.mkdir()
+    result = run_task(
+        task_name,
+        evidence=evidence,
+        model="gpt-6-luna",
+        effort="xhigh",
+        timeout=30,
+    )
+    assert result["passed"] is True
+    assert result["required_source_changed"] is True
+    assert result["visible_test_command_executed"] is True
+    assert result["shell_command_policy_enforced"] is False
+    assert result["scratch_removed"] is True
+    assert not scratch_roots[0].exists()
+    manifest = json.loads((evidence / "manifest.json").read_text())
+    assert manifest["license"] == "MIT"
+    assert manifest["hidden_oracle_sha256"] == runner.hidden_oracle_sha256(task)
+    assert manifest["hidden_probe_sha256"] == hashlib.sha256(
+        task.hidden_source.encode()
+    ).hexdigest()
+    assert manifest["hidden_oracle_classification"] == (
+        "arm-sealed-authored-parent-checker; not an independent holdout"
+    )

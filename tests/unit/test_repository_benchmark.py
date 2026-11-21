@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import importlib.util
 import json
 import os
@@ -286,6 +288,11 @@ def test_headless_error_category_refuses_untrusted_or_large_output(
             "https://github.com/PyCQA/pyflakes.git",
             {"pyflakes/checker.py"},
         ),
+        (
+            "pytest-mixed-indirect-fixture-precedence",
+            "https://github.com/pytest-dev/pytest.git",
+            {"src/_pytest/fixtures.py", "src/_pytest/python.py"},
+        ),
     ],
 )
 def test_upstream_tasks_are_pinned_and_oracles_sealed(
@@ -314,10 +321,93 @@ def test_pyflakes_r16_pins_and_model_inputs() -> None:
     assert task.base_sha == "9f0a7f9c8feb4d086a918a708bb778b38ce7a248"
     assert task.reference_fix_sha == "5f2af952d81a8bead32d3ab91a60f7efbc6d8aea"
 
-    for model_input in (task.prompt, bench.shared_user_prompt(task), task.visible_source):
+    for model_input in (
+        task.prompt,
+        bench.shared_user_prompt(task),
+        task.visible_source,
+    ):
         assert task.hidden_source not in model_input
         assert "PYFLAKES_TYPING_FIELDS_HIDDEN_OK" not in model_input
         assert task.reference_fix_sha not in model_input
+
+
+def test_pytest_r17_provenance_scope_and_runtime_contract() -> None:
+    task = bench.TASKS["pytest-mixed-indirect-fixture-precedence"]
+    assert task.source == "pytest-dev/pytest"
+    assert task.base_sha == "fd47511afeb024d2fbad9257d1b44310672c6a0f"
+    assert task.reference_fix_sha == "6b6502e94b78b41951b70265a84187a419e8ce8c"
+    assert task.upstream_pr == "https://github.com/pytest-dev/pytest/pull/13976"
+    assert task.license == "MIT"
+    assert task.require_all_editable_changed is False
+    assert task.expected_reference_paths == frozenset(
+        {
+            "src/_pytest/fixtures.py",
+            "src/_pytest/python.py",
+            "testing/python/collect.py",
+            "testing/python/metafunc.py",
+        }
+    )
+    assert task.runtime is bench.PYTEST_R17_RUNTIME
+    assert hashlib.sha256(task.visible_source.encode()).hexdigest() == (
+        "1594f93a769f5201c3295b657f6e193191bbb8a835db08fe68c33882f32419c6"
+    )
+    assert hashlib.sha256(task.hidden_source.encode()).hexdigest() == (
+        "92a099461feb5b73c7a0dde779482f78914213d3e152038055bb6766c9b7481a"
+    )
+    assert bench.hidden_oracle_sha256(task) == (
+        "a5081d5881cda1de372a6476e07203ff7672b11cf71a1e67e27001bb59b7d895"
+    )
+    assert bench.hidden_oracle_classification(task) == (
+        "arm-sealed-authored-parent-checker; not an independent holdout"
+    )
+    assert task.hidden_expected_json is not None
+    assert "R17_PROBE_RESULT" not in task.hidden_expected_json
+    assert [
+        (
+            package.distribution,
+            package.package,
+            package.version,
+            package.trusted_source_sha256,
+        )
+        for package in task.runtime.packages
+    ] == [
+        (
+            "pluggy", "pluggy", "1.6.0",
+            "730093250a37d7d717dd7e7f1437bbedac53b1b378c79ecd27ae255b19ef2304",
+        ),
+        (
+            "iniconfig", "iniconfig", "2.3.0",
+            "fbb6f8782db1b0c49aafda68456e08ffe2051c2b6b69b61fde9f04313cf949de",
+        ),
+        (
+            "Pygments", "pygments", "2.21.0",
+            "eef8783697c9205496d5c357e9be17a75e0d3895d02e7cd9e4b4b5a6f250210b",
+        ),
+        (
+            "packaging", "packaging", "26.3",
+            "eb4f1d0f37a10fe5ac03972ecba52dd94f2cd0f06bf66dcc61dd0c10af736764",
+        ),
+    ]
+    assert task.runtime.generated_files[0][0] == "src/_pytest/_version.py"
+    assert task.runtime.trusted_overlay_sha256 == (
+        "06f72d92dfa1f1bc0b9b1863ec21b5deee01cdc5f721f6ae148ae225a4bc0db7"
+    )
+    assert "sys.version_info < (3, 10)" in task.visible_source
+    assert "sys.version_info < (3, 10)" in task.hidden_source
+    assert "(3, 14)" not in task.visible_source + task.hidden_source
+    assert "indirect" in task.prompt.lower()
+    assert "duplicate parametrization" not in task.prompt.lower()
+    for model_input in (
+        task.prompt,
+        bench.shared_user_prompt(task),
+        task.visible_source,
+    ):
+        assert task.hidden_source not in model_input
+        assert task.hidden_expected_json not in model_input
+        assert task.reference_fix_sha not in model_input
+        assert "pytest-dev/pytest/pull/13976" not in model_input
+    compile(task.visible_source, task.visible_script, "exec")
+    compile(task.hidden_source, "<r17-sealed-oracle>", "exec")
 
 
 @pytest.mark.parametrize("task_id", tuple(bench.TASKS))
@@ -409,7 +499,7 @@ def test_repository_preflight_refuses_reference_mode_only_source_change(
     task = bench.TASKS["h11-chunk-footer"]
 
     def fake_fetch(destination: Path, _task: object, sha: str) -> None:
-        destination.mkdir()
+        destination.mkdir(parents=True)
         source = destination / "h11/_readers.py"
         source.parent.mkdir()
         source.write_text("same source\n", encoding="utf-8")
@@ -530,6 +620,698 @@ def test_two_module_scoring_rejects_partial_repair_and_modified_qa() -> None:
     assert bench.check_edits(original, both_fixed, required) == (True, True)
     altered_test = {**both_fixed, "qa_visible.py": "sha-altered-test"}
     assert bench.check_edits(original, altered_test, required) == (False, True)
+
+
+def test_single_file_repair_can_pass_when_task_allows_it() -> None:
+    task = bench.TASKS["pytest-mixed-indirect-fixture-precedence"]
+    fixtures = "src/_pytest/fixtures.py"
+    original = {path: f"original:{path}" for path in task.editable}
+    one_file_fixed = {**original, fixtures: "fixed fixtures"}
+    assert bench.check_edits(original, one_file_fixed, task.editable) == (
+        True,
+        False,
+    )
+    assert bench.check_edits(
+        original,
+        one_file_fixed,
+        task.editable,
+        require_all_editable_changed=task.require_all_editable_changed,
+    ) == (True, True)
+    two_file_fixed = {
+        **one_file_fixed,
+        "src/_pytest/python.py": "fixed python module",
+    }
+    assert bench.check_edits(
+        original,
+        two_file_fixed,
+        task.editable,
+        require_all_editable_changed=task.require_all_editable_changed,
+    ) == (True, True)
+    assert bench.check_edits(
+        original,
+        original,
+        task.editable,
+        require_all_editable_changed=task.require_all_editable_changed,
+    ) == (True, False)
+
+
+def test_r17_upstream_test_and_runtime_paths_remain_protected() -> None:
+    task = bench.TASKS["pytest-mixed-indirect-fixture-precedence"]
+    source = "src/_pytest/fixtures.py"
+    original = {
+        source: "original source",
+        "src/_pytest/python.py": "other source",
+        "testing/python/collect.py": "sealed upstream tests",
+        "src/_pytest/_version.py": "generated metadata",
+        ".benchmark_runtime/site/pluggy/__init__.py": "runtime overlay",
+    }
+    changed = {
+        **original,
+        source: "repaired source",
+        "testing/python/collect.py": "attempted test edit",
+    }
+    assert bench.check_edits(
+        original,
+        changed,
+        task.editable,
+        require_all_editable_changed=task.require_all_editable_changed,
+    ) == (False, True)
+
+
+def test_r17_parent_checker_rejects_boolean_number_substitution() -> None:
+    """JSON booleans must never compare equal to numeric fixture observations."""
+    task = bench.TASKS["pytest-mixed-indirect-fixture-precedence"]
+    expected = json.loads(task.hidden_expected_json)
+    valid_result = {
+        "valid_exit": expected["valid_exit"],
+        "observations": expected["observations"],
+        "unknown_exit": expected["unknown_exit"],
+        "unknown_output": expected["unknown_error"],
+    }
+
+    def result_for(payload: dict[str, object]) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(
+            [], 0, "R17_PROBE_RESULT:" + json.dumps(payload), ""
+        )
+
+    assert bench._r17_hidden_probe_matches(task, result_for(valid_result))
+    corrupted = json.loads(json.dumps(valid_result))
+    assert ["ordinary", 0] in corrupted["observations"]
+    corrupted["observations"] = [
+        ["ordinary", False] if item == ["ordinary", 0] else item
+        for item in corrupted["observations"]
+    ]
+    assert not bench._r17_hidden_probe_matches(task, result_for(corrupted))
+
+
+def test_r17_hidden_oracle_is_run_in_memory_and_never_written(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task = bench.TASKS["pytest-mixed-indirect-fixture-precedence"]
+    visible = tmp_path / task.visible_script
+    visible.write_text(task.visible_source, encoding="utf-8")
+    calls: list[tuple[str | None, str | None]] = []
+
+    def fake_oracle(
+        workspace: Path, script: str | None = None, *, code: str | None = None
+    ) -> subprocess.CompletedProcess[str]:
+        assert workspace == tmp_path
+        calls.append((script, code))
+        assert not (workspace / "hidden_oracle.py").exists()
+        if code is not None:
+            assert task.hidden_expected_json not in code
+            payload = json.loads(task.hidden_expected_json)
+            probe_result = {
+                "valid_exit": payload["valid_exit"],
+                "observations": payload["observations"],
+                "unknown_exit": payload["unknown_exit"],
+                "unknown_output": payload["unknown_error"],
+            }
+            return subprocess.CompletedProcess(
+                [], 0, "R17_PROBE_RESULT:" + json.dumps(probe_result), ""
+            )
+        return subprocess.CompletedProcess([], 0, "passed", "")
+
+    monkeypatch.setattr(bench, "oracle_python", fake_oracle)
+    result = bench.check_oracles(tmp_path, task)
+    assert result["correct"] is True
+    assert calls == [(task.visible_script, None), (None, task.hidden_source)]
+
+
+def test_r17_parent_expectations_are_absent_from_candidate_process_surfaces(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task = bench.TASKS["pytest-mixed-indirect-fixture-precedence"]
+    sentinel = "R17_PARENT_ONLY_EXPECTATION_SENTINEL_7cb4a6"
+    task = replace(task, hidden_expected_json=json.dumps({"secret": sentinel}))
+    case_file = tmp_path / "hidden_cases.py"
+    case_file.write_text(task.hidden_source, encoding="utf-8")
+    scanner = r"""from pathlib import Path
+import os
+import sys
+
+test_file = Path(sys.argv[3])
+visible = [repr(sys.argv), Path('/proc/self/cmdline').read_bytes().decode('utf-8', 'ignore')]
+visible.append(repr(dict(os.environ)))
+visible.extend(str(path) for path in Path.cwd().rglob('*'))
+visible.extend(path.read_text(encoding='utf-8', errors='ignore') for path in Path.cwd().rglob('*') if path.is_file())
+visible.append(test_file.read_text(encoding='utf-8'))
+print('\n'.join(visible))
+"""
+    candidate_view = subprocess.run(
+        [sys.executable, "-B", "-c", scanner, "source", "overlay", str(case_file)],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    assert sentinel not in candidate_view
+    assert str(case_file) in candidate_view
+    assert task.hidden_source in candidate_view
+
+    def fake_oracle(
+        workspace: Path, script: str | None = None, *, code: str | None = None
+    ) -> subprocess.CompletedProcess[str]:
+        if code is not None:
+            assert sentinel not in code
+            return subprocess.CompletedProcess([], 0, "R17_PROBE_RESULT:{}", "")
+        return subprocess.CompletedProcess([], 0, "visible", "")
+
+    monkeypatch.setattr(bench, "oracle_python", fake_oracle)
+    result = bench.check_oracles(tmp_path, task)
+    assert result["hidden_oracle_exit"] == 1
+
+
+def _git_ignored_pytest_tree(root: Path) -> None:
+    root.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+    (root / ".gitignore").write_text("/src/_pytest/_version.py\n", encoding="utf-8")
+    (root / "src/_pytest").mkdir(parents=True)
+    (root / "src/_pytest/__init__.py").write_text("", encoding="utf-8")
+
+
+def test_r17_runtime_overlay_is_lock_verified_deterministic_and_ignored_neutral(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task = bench.TASKS["pytest-mixed-indirect-fixture-precedence"]
+    baseline = tmp_path / "baseline"
+    reference = tmp_path / "reference"
+    _git_ignored_pytest_tree(baseline)
+    _git_ignored_pytest_tree(reference)
+
+    git_calls: list[list[str]] = []
+    original_command = bench.command
+
+    def local_git_only(
+        argv: list[str], *, cwd: Path, env: dict[str, str], timeout: int
+    ) -> subprocess.CompletedProcess[str]:
+        assert argv == ["git", "check-ignore", "-q", "--", "src/_pytest/_version.py"]
+        assert env["GIT_CONFIG_GLOBAL"] == "/dev/null"
+        assert env["GIT_CONFIG_NOSYSTEM"] == "1"
+        assert not {
+            "OPENAI_API_KEY",
+            "OPENROUTER_API_KEY",
+            "ANTHROPIC_API_KEY",
+        }.intersection(env)
+        git_calls.append(argv)
+        return original_command(argv, cwd=cwd, env=env, timeout=timeout)
+
+    monkeypatch.setattr(bench, "command", local_git_only)
+
+    baseline_receipt = bench.materialize_task_runtime(baseline, task.runtime)
+    reference_receipt = bench.materialize_task_runtime(reference, task.runtime)
+    assert baseline_receipt == reference_receipt
+    assert baseline_receipt["source"] == (
+        "active Ash virtualenv; uv.lock and installed RECORD checked; "
+        "source bytes matched chief-observed fingerprints, not PyPI wheel hashes"
+    )
+    assert set(baseline_receipt["dependencies"]) == {
+        "pluggy",
+        "iniconfig",
+        "Pygments",
+        "packaging",
+    }
+    assert baseline_receipt["overlay_file_count"] > 300
+    assert baseline_receipt["overlay_sha256"] == (
+        "06f72d92dfa1f1bc0b9b1863ec21b5deee01cdc5f721f6ae148ae225a4bc0db7"
+    )
+    assert baseline_receipt["oracle_interpreter"] == (
+        "Linux /usr/bin/python3, Python 3.10 or newer, shared by task and grader"
+    )
+    assert baseline_receipt["lock_sha256"]
+    assert len(git_calls) == 2
+    assert set(baseline_receipt["generated_files"]) == {"src/_pytest/_version.py"}
+
+    for tree in (baseline, reference):
+        ignored = subprocess.run(
+            ["git", "check-ignore", "-q", "--", "src/_pytest/_version.py"],
+            cwd=tree,
+            check=False,
+        )
+        assert ignored.returncode == 0
+        files = bench.snapshot_files(tree)
+        assert "src/_pytest/_version.py" in files
+        assert ".benchmark_runtime/site/pluggy/__init__.py" in files
+        assert not any("__pycache__" in path or path.endswith(".pyc") for path in files)
+        assert bench.snapshot_files(tree) == files
+        bench.verify_task_runtime(tree, task.runtime, baseline_receipt)
+        status = subprocess.run(
+            ["git", "status", "--porcelain", "--untracked-files=all"],
+            cwd=tree,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+        assert "src/_pytest/_version.py" not in status
+
+    baseline_runtime = {
+        path.relative_to(baseline).as_posix(): path.read_bytes()
+        for path in (baseline / ".benchmark_runtime").rglob("*")
+        if path.is_file()
+    }
+    reference_runtime = {
+        path.relative_to(reference).as_posix(): path.read_bytes()
+        for path in (reference / ".benchmark_runtime").rglob("*")
+        if path.is_file()
+    }
+    assert baseline_runtime == reference_runtime
+
+    tampered = baseline / ".benchmark_runtime/site/iniconfig/__init__.py"
+    tampered.write_text("# changed\n", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="bytes differ"):
+        bench.verify_task_runtime(baseline, task.runtime, baseline_receipt)
+    tampered.unlink()
+    (baseline / ".benchmark_runtime/site/stray.so").write_bytes(b"not executable")
+    with pytest.raises(RuntimeError, match="unexpected file set"):
+        bench.verify_task_runtime(baseline, task.runtime, baseline_receipt)
+
+
+def test_r17_runtime_refuses_package_symlinks_and_special_files(
+    tmp_path: Path,
+) -> None:
+    task = bench.TASKS["pytest-mixed-indirect-fixture-precedence"]
+    _, purelib, metadata = bench._locked_runtime_versions(task.runtime)
+    package = next(
+        item for item in task.runtime.packages if item.package == "iniconfig"
+    )
+    recorded = metadata[package.distribution.casefold()][1]
+    source_root = purelib / package.package
+    symlink_root = tmp_path / "symlink-purelib" / package.package
+    symlink_root.parent.mkdir()
+    import shutil
+
+    shutil.copytree(source_root, symlink_root)
+    source_file = next(path for path in symlink_root.rglob("*.py") if path.is_file())
+    external = tmp_path / "external-source.py"
+    external.write_text("must not be read", encoding="utf-8")
+    source_file.unlink()
+    source_file.symlink_to(external)
+    with pytest.raises(RuntimeError, match="symlink"):
+        bench._package_source_files(symlink_root.parent, package, recorded)
+
+    if not hasattr(os, "mkfifo"):
+        pytest.skip("FIFO creation unavailable")
+    special_root = tmp_path / "special-purelib" / package.package
+    special_root.parent.mkdir()
+    shutil.copytree(source_root, special_root)
+    os.mkfifo(special_root / "unexpected.py")
+    with pytest.raises(RuntimeError, match="special file"):
+        bench._package_source_files(special_root.parent, package, recorded)
+
+
+def test_r17_runtime_rejects_modified_source_even_with_matching_record(
+    tmp_path: Path,
+) -> None:
+    task = bench.TASKS["pytest-mixed-indirect-fixture-precedence"]
+    _, purelib, metadata = bench._locked_runtime_versions(task.runtime)
+    package = next(item for item in task.runtime.packages if item.package == "iniconfig")
+    recorded = dict(metadata[package.distribution.casefold()][1])
+    modified_root = tmp_path / "modified-purelib" / package.package
+    modified_root.parent.mkdir()
+    import shutil
+
+    shutil.copytree(purelib / package.package, modified_root)
+    changed = next(path for path in modified_root.rglob("*.py") if path.is_file())
+    data = changed.read_bytes() + b"# attacker-controlled source\n"
+    changed.write_bytes(data)
+    relative = (Path(package.package) / changed.relative_to(modified_root)).as_posix()
+    digest = base64.urlsafe_b64encode(hashlib.sha256(data).digest())
+    recorded[relative] = (
+        "sha256=" + digest.rstrip(b"=").decode("ascii"),
+        str(len(data)),
+    )
+
+    with pytest.raises(RuntimeError, match="trusted runtime source fingerprint mismatch"):
+        bench._package_source_files(modified_root.parent, package, recorded)
+
+
+def test_r17_runtime_rejects_hardlinked_source_even_with_forged_record(
+    tmp_path: Path,
+) -> None:
+    task = bench.TASKS["pytest-mixed-indirect-fixture-precedence"]
+    _, purelib, metadata = bench._locked_runtime_versions(task.runtime)
+    package = next(item for item in task.runtime.packages if item.package == "iniconfig")
+    recorded = dict(metadata[package.distribution.casefold()][1])
+    linked_root = tmp_path / "linked-purelib" / package.package
+    linked_root.parent.mkdir()
+    import shutil
+
+    shutil.copytree(purelib / package.package, linked_root)
+    linked = next(path for path in linked_root.rglob("*.py") if path.is_file())
+    external = tmp_path / "host-only-source.py"
+    external.write_text("synthetic host-only bytes", encoding="utf-8")
+    linked.unlink()
+    os.link(external, linked)
+    relative = (Path(package.package) / linked.relative_to(linked_root)).as_posix()
+    data = external.read_bytes()
+    digest = base64.urlsafe_b64encode(hashlib.sha256(data).digest())
+    recorded[relative] = (
+        "sha256=" + digest.rstrip(b"=").decode("ascii"),
+        str(len(data)),
+    )
+
+    with pytest.raises(RuntimeError, match="hardlinked"):
+        bench._package_source_files(linked_root.parent, package, recorded)
+    assert external.read_text(encoding="utf-8") == "synthetic host-only bytes"
+
+
+def test_r17_runtime_source_requires_locked_active_venv(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task = bench.TASKS["pytest-mixed-indirect-fixture-precedence"]
+    outside = tmp_path / "external-site"
+    outside.mkdir()
+    original_paths = bench.sysconfig.get_paths
+    monkeypatch.setattr(
+        bench.sysconfig,
+        "get_paths",
+        lambda: {**original_paths(), "purelib": str(outside)},
+    )
+    with pytest.raises(RuntimeError, match="outside the active Ash virtualenv"):
+        bench._locked_runtime_versions(task.runtime)
+    monkeypatch.setattr(bench.sysconfig, "get_paths", original_paths)
+
+    lock_root = tmp_path / "wrong-lock"
+    lock_root.mkdir()
+    (lock_root / "uv.lock").write_text(
+        '[[package]]\nname = "pluggy"\nversion = "0.1.0"\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(bench, "REPO", lock_root)
+    with pytest.raises(RuntimeError, match="does not uniquely pin pluggy"):
+        bench._locked_runtime_versions(task.runtime)
+
+    untrusted = tmp_path / "untrusted-python"
+    untrusted.mkdir()
+    monkeypatch.setattr(bench.sys, "prefix", str(untrusted))
+    with pytest.raises(RuntimeError, match="active Ash virtualenv"):
+        bench._locked_runtime_versions(task.runtime)
+
+
+def test_r17_task_command_and_grader_interpreters_must_match(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # This unit checks OS-specific logic without requiring macOS to run Linux.
+    monkeypatch.setattr(bench.sys, "platform", "linux")
+    monkeypatch.setattr(
+        bench.shutil,
+        "which",
+        lambda _name, *, path: "/usr/bin/python3",
+    )
+    bench._verify_r17_python_command_parity()
+
+    monkeypatch.setattr(
+        bench.shutil,
+        "which",
+        lambda _name, *, path: (
+            "/usr/local/bin/python3" if path.startswith("/usr/local")
+            else "/usr/bin/python3"
+        ),
+    )
+    with pytest.raises(RuntimeError, match="resolve to /usr/bin/python3"):
+        bench._verify_r17_python_command_parity()
+
+    monkeypatch.setattr(bench.sys, "platform", "darwin")
+    with pytest.raises(RuntimeError, match="Linux host"):
+        bench._verify_r17_python_command_parity()
+
+
+def test_legacy_preflight_accepts_baseline_with_only_hidden_red(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Preserve R1-R16 acceptance when visible misses a real original defect."""
+    task = bench.TASKS["h11-chunk-footer"]
+
+    def fake_fetch(destination: Path, _task: object, sha: str) -> None:
+        path = destination / "h11/_readers.py"
+        path.parent.mkdir(parents=True)
+        path.write_text(
+            "reference code\n" if sha == task.reference_fix_sha else "broken code\n",
+            encoding="utf-8",
+        )
+
+    def fake_grade(workspace: Path, _task: object) -> dict[str, object]:
+        if workspace.name == "baseline":
+            return {
+                "correct": False,
+                "visible_oracle_exit": 0,
+                "hidden_oracle_exit": 1,
+            }
+        return {
+            "correct": True,
+            "visible_oracle_exit": 0,
+            "hidden_oracle_exit": 0,
+        }
+
+    monkeypatch.setattr(bench, "fetch_pinned", fake_fetch)
+    monkeypatch.setattr(bench, "check_oracles", fake_grade)
+    _, proof = bench.preflight(task, tmp_path)
+    assert proof["base_visible_exit"] == 0
+    assert proof["base_hidden_exit"] == 1
+    assert proof["reference_visible_exit"] == 0
+    assert proof["reference_hidden_exit"] == 0
+
+
+def test_r17_preflight_records_exact_reference_paths_and_provenance(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task = bench.TASKS["pytest-mixed-indirect-fixture-precedence"]
+    # Real Linux-only host validation is covered by the separate parity test.
+    monkeypatch.setattr(bench, "_verify_r17_python_command_parity", lambda: None)
+    monkeypatch.setattr(bench, "_attest_r17_system_python_version", lambda: "3.14.10")
+
+    def fake_fetch(destination: Path, _task: object, sha: str) -> None:
+        destination.mkdir(parents=True)
+        source = destination / "src/_pytest"
+        source.mkdir(parents=True)
+        (source / "fixtures.py").write_text(
+            "fixed" if sha == task.reference_fix_sha else "base",
+            encoding="utf-8",
+        )
+        (source / "python.py").write_text(
+            "reference" if sha == task.reference_fix_sha else "same",
+            encoding="utf-8",
+        )
+        upstream_tests = destination / "testing/python"
+        upstream_tests.mkdir(parents=True)
+        test_version = "reference" if sha == task.reference_fix_sha else "base"
+        (upstream_tests / "collect.py").write_text(test_version, encoding="utf-8")
+        (upstream_tests / "metafunc.py").write_text(test_version, encoding="utf-8")
+
+    runtime_receipt = {"overlay_sha256": "same-overlay"}
+
+    def fake_runtime(root: Path, _runtime: object) -> dict[str, object]:
+        overlay = root / ".benchmark_runtime/site/pluggy"
+        overlay.mkdir(parents=True)
+        (overlay / "__init__.py").write_text("trusted", encoding="utf-8")
+        (root / "src/_pytest/_version.py").write_text(
+            "__version__ = '9.1.0.dev0'\n", encoding="utf-8"
+        )
+        return runtime_receipt
+
+    def fake_grade(workspace: Path, _task: object) -> dict[str, object]:
+        assert (workspace / ".benchmark_runtime/site/pluggy/__init__.py").is_file()
+        assert (workspace / "src/_pytest/_version.py").is_file()
+        assert (workspace / "qa_visible.py").is_file()
+        good = workspace.name == "reference"
+        return {
+            "correct": good,
+            "visible_oracle_exit": 0 if good else 2,
+            "hidden_oracle_exit": 0 if good else 2,
+        }
+
+    monkeypatch.setattr(bench, "fetch_pinned", fake_fetch)
+    monkeypatch.setattr(bench, "materialize_task_runtime", fake_runtime)
+    monkeypatch.setattr(bench, "check_oracles", fake_grade)
+    _, proof = bench.preflight(task, tmp_path)
+    assert proof["base_visible_exit"] == 2
+    assert proof["reference_visible_exit"] == 0
+    assert proof["reference_modified_paths"] == [
+        "src/_pytest/fixtures.py",
+        "src/_pytest/python.py",
+    ]
+    assert proof["upstream_changed_paths"] == sorted(task.expected_reference_paths)
+    assert set(proof["base_editable_sha256"]) == task.editable
+    assert set(proof["reference_editable_sha256"]) == task.editable
+    assert proof["base_sha"] == task.base_sha
+    assert proof["reference_fix_sha"] == task.reference_fix_sha
+    assert proof["upstream_pr"] == task.upstream_pr
+    assert proof["license"] == "MIT"
+    assert proof["runtime_overlay"] == runtime_receipt
+    assert proof["hidden_oracle_sha256"] == bench.hidden_oracle_sha256(task)
+    assert proof["hidden_probe_sha256"] == hashlib.sha256(
+        task.hidden_source.encode()
+    ).hexdigest()
+    assert proof["hidden_oracle_classification"] == (
+        "arm-sealed-authored-parent-checker; not an independent holdout"
+    )
+    assert proof["system_python_version"]
+    assert proof["system_python_executable"] == "/usr/bin/python3"
+
+    def extra_reference_path(destination: Path, selected: object, sha: str) -> None:
+        fake_fetch(destination, selected, sha)
+        if sha == task.reference_fix_sha:
+            (destination / "testing/python/unexpected.py").write_text(
+                "outside the pinned PR path set", encoding="utf-8"
+            )
+
+    monkeypatch.setattr(bench, "fetch_pinned", extra_reference_path)
+    with pytest.raises(
+        RuntimeError, match="source paths differ from the task manifest"
+    ):
+        bench.preflight(task, tmp_path / "extra-path")
+
+    def one_base_oracle_green(workspace: Path, _task: object) -> dict[str, object]:
+        if workspace.name == "reference":
+            return {
+                "correct": True,
+                "visible_oracle_exit": 0,
+                "hidden_oracle_exit": 0,
+            }
+        return {
+            "correct": False,
+            "visible_oracle_exit": 2,
+            "hidden_oracle_exit": 0,
+        }
+
+    monkeypatch.setattr(bench, "fetch_pinned", fake_fetch)
+    monkeypatch.setattr(bench, "check_oracles", one_base_oracle_green)
+    with pytest.raises(RuntimeError, match="not independently reproducible"):
+        bench.preflight(task, tmp_path / "partial-red")
+
+
+def test_r17_ash_fake_grade_accepts_one_semantic_source_repair(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task_name = "pytest-mixed-indirect-fixture-precedence"
+    task = bench.TASKS[task_name]
+    scratch_roots: list[Path] = []
+
+    def preflight(_task: object, scratch: Path):
+        scratch_roots.append(scratch)
+        baseline = scratch / "baseline"
+        source = baseline / "src/_pytest"
+        source.mkdir(parents=True)
+        (source / "fixtures.py").write_text("baseline", encoding="utf-8")
+        (source / "python.py").write_text("unchanged", encoding="utf-8")
+        (source / "_version.py").write_text("generated", encoding="utf-8")
+        overlay = baseline / ".benchmark_runtime/site/pluggy"
+        overlay.mkdir(parents=True)
+        (overlay / "__init__.py").write_text("locked source", encoding="utf-8")
+        (baseline / task.visible_script).write_text(
+            task.visible_source, encoding="utf-8"
+        )
+        (scratch / "reference").mkdir()
+        return baseline, {
+            "base_visible_exit": 2,
+            "base_hidden_exit": 2,
+            "reference_visible_exit": 0,
+            "reference_hidden_exit": 0,
+            "reference_added_paths": [],
+            "runtime_overlay": {"overlay_sha256": "fixture"},
+        }
+
+    def fake_command(
+        argv: list[str], *, cwd: Path, env: dict[str, str], timeout: int
+    ) -> subprocess.CompletedProcess[str]:
+        assert cwd.exists()
+        assert timeout > 0
+        assert not {
+            "OPENAI_API_KEY", "OPENROUTER_API_KEY", "ANTHROPIC_API_KEY"
+        }.intersection(env)
+        setup_commands.append(argv)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    class FakeChild:
+        def wait(self, *, timeout: int) -> int:
+            assert timeout == 30
+            return 0
+
+    def fake_popen(argv: list[str], **_kwargs: object) -> FakeChild:
+        assert task.prompt in argv
+        cwd = _kwargs["cwd"]
+        assert isinstance(cwd, Path)
+        (cwd / "src/_pytest/fixtures.py").write_text("repaired", encoding="utf-8")
+        return FakeChild()
+
+    tool_calls = [
+        {
+            "tool": next(iter(bench.EDIT_TOOL_NAMES)),
+            "success": True,
+            "executed": True,
+        },
+        {
+            "tool": "run_command",
+            "success": True,
+            "executed": True,
+            "command": task.command_grant,
+        },
+    ]
+
+    setup_commands: list[list[str]] = []
+    monkeypatch.setattr(bench, "preflight", preflight)
+    monkeypatch.setattr(bench, "verify_task_runtime", lambda *_args: None)
+    monkeypatch.setattr(bench, "_chatgpt_tmpfs_root", lambda: tmp_path / "memory")
+    (tmp_path / "memory").mkdir()
+    def fake_stage_access(home: Path, *_args: object, **_kwargs: object) -> None:
+        (home / ".ash").mkdir()
+
+    monkeypatch.setattr(bench, "_stage_chatgpt_access_only", fake_stage_access)
+    monkeypatch.setattr(bench, "command", fake_command)
+    monkeypatch.setattr(bench.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(
+        bench.subprocess,
+        "check_output",
+        lambda *_args, **_kwargs: task.base_sha,
+    )
+    monkeypatch.setattr(
+        bench,
+        "collect_coding_session_receipts",
+        lambda *_args: {
+            "calls": tool_calls,
+            "audit_ok": True,
+            "lineage_ok": True,
+            "events": {},
+            "usage": {"prompt_tokens": 100, "completion_tokens": 20},
+            "terminals": ["turn.completed"],
+            "context_continuations": 0,
+            "session_count": 1,
+        },
+    )
+    monkeypatch.setattr(
+        bench,
+        "check_oracles",
+        lambda *_args: {
+            "correct": True,
+            "visible_oracle_exit": 0,
+            "hidden_oracle_exit": 0,
+        },
+    )
+
+    evidence = tmp_path / "ash-evidence"
+    evidence.mkdir()
+    result = bench.run_task(
+        task_name,
+        model="gpt-6-luna",
+        account=object(),
+        evidence=evidence,
+        timeout=30,
+        context_tokens=32768,
+        turn_token_budget=0,
+    )
+    assert result["passed"] is True, result
+    assert result["protected_files_unchanged"] is True
+    assert result["required_sources_changed"] is True
+    assert result["required_tools_succeeded"] is True
+    assert result["oracle"]["correct"] is True
+    assert result["scratch_removed"] is True
+    assert any(task.command_grant in " ".join(argv) for argv in setup_commands)
+    assert not scratch_roots[0].exists()
 
 
 def test_fetch_pinned_checks_out_only_exact_commit(

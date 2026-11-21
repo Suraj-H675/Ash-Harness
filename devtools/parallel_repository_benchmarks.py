@@ -23,7 +23,7 @@ from typing import Any, Callable
 
 from coding_comparison import compare
 from ash.providers.openai_chatgpt_auth import ChatGPTAuthSession, ChatGPTCredentialStore
-from repository_benchmark import TASKS
+from repository_benchmark import TASKS, hidden_oracle_classification
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -113,6 +113,14 @@ def run_pair(
         "engine_order": list(order),
         "runner_exit_codes": exit_codes,
         "comparison_verified": False,
+        "fully_controlled": False,
+        "comparison_scope": "operational_qualified",
+        "comparison_caveats": [
+            "system prompts are not matched or attested",
+            "tool and command authorizations are not identical",
+            "requested model settings do not attest every effective limit",
+        ],
+        "hidden_oracle_classification": hidden_oracle_classification(TASKS[task]),
     }
     try:
         comparison = compare(directory / "ash", directory / "codex")
@@ -138,6 +146,11 @@ def run_pair(
         result.update(
             comparison_verified=bool(matched),
             reason="verified" if matched else "provider_outage_or_parity_unverified",
+            fully_controlled=evaluation["fully_controlled"] is True,
+            comparison_scope=(
+                "controlled" if evaluation["fully_controlled"] is True
+                else "operational_qualified"
+            ),
             ash_pass=comparison["ash"]["scored_pass"],
             codex_pass=comparison["codex"]["scored_pass"],
             ash_cli_seconds=comparison["ash"]["cli_seconds"],

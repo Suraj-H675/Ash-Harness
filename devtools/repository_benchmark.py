@@ -8,18 +8,24 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
+import csv
 import hashlib
+import importlib.metadata
 import json
 import os
 import re
 import shutil
 import signal
+import stat
 import subprocess
 import sys
+import sysconfig
 import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
+import tomllib
 
 from ash.commands.chatgpt_auth import list_chatgpt_models
 from ash.core.activity import EDIT_TOOL_NAMES, summarize_operational_events
@@ -1673,6 +1679,387 @@ class RepositoryTask:
     hidden_source: str
     command_grant: str
     prompt: str
+    hidden_expected_json: str | None = None
+    runtime: "PythonSourceRuntime | None" = None
+    upstream_pr: str | None = None
+    license: str | None = None
+    require_all_editable_changed: bool = True
+    expected_reference_paths: frozenset[str] | None = None
+
+
+@dataclass(frozen=True)
+class RuntimePackage:
+    distribution: str
+    package: str
+    version: str
+    trusted_source_sha256: str
+
+
+@dataclass(frozen=True)
+class PythonSourceRuntime:
+    """A tiny source-only overlay needed by a pinned Python checkout."""
+
+    packages: tuple[RuntimePackage, ...]
+    generated_files: tuple[tuple[str, bytes], ...]
+    trusted_overlay_sha256: str
+
+
+PYTEST_R17_RUNTIME = PythonSourceRuntime(
+    packages=(
+        RuntimePackage(
+            "pluggy", "pluggy", "1.6.0",
+            "730093250a37d7d717dd7e7f1437bbedac53b1b378c79ecd27ae255b19ef2304",
+        ),
+        RuntimePackage(
+            "iniconfig", "iniconfig", "2.3.0",
+            "fbb6f8782db1b0c49aafda68456e08ffe2051c2b6b69b61fde9f04313cf949de",
+        ),
+        RuntimePackage(
+            "Pygments", "pygments", "2.21.0",
+            "eef8783697c9205496d5c357e9be17a75e0d3895d02e7cd9e4b4b5a6f250210b",
+        ),
+        RuntimePackage(
+            "packaging", "packaging", "26.3",
+            "eb4f1d0f37a10fe5ac03972ecba52dd94f2cd0f06bf66dcc61dd0c10af736764",
+        ),
+    ),
+    generated_files=(
+        (
+            "src/_pytest/_version.py",
+            b'"""Disposable offline benchmark equivalent of setuptools_scm generated metadata."""\n'
+            b'__version__ = version = "9.1.0.dev0"\n'
+            b'__version_tuple__ = version_tuple = (9, 1, 0, "dev0")\n'
+            b"__commit_id__ = commit_id = None\n",
+        ),
+    ),
+    trusted_overlay_sha256=(
+        "06f72d92dfa1f1bc0b9b1863ec21b5deee01cdc5f721f6ae148ae225a4bc0db7"
+    ),
+)
+
+
+PYTEST_MIXED_INDIRECT_VISIBLE = r'''from __future__ import annotations
+
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+
+
+PYTESTS = r"""
+import pytest
+
+
+@pytest.fixture(params=("fixture-left", "fixture-right"))
+def shade(request):
+    return "fixture:" + request.param
+
+
+@pytest.fixture
+def wrapped(request, shade):
+    return request.param, shade
+
+
+@pytest.mark.parametrize(
+    ("wrapped", "shade"),
+    (("first", "direct-a"), ("second", "direct-b")),
+    indirect=["wrapped"],
+)
+def test_list_indirect_keeps_direct_fixture_name(wrapped, shade):
+    assert wrapped[0] in {"first", "second"}
+    assert wrapped[1] == shade
+    assert shade in {"direct-a", "direct-b"}
+
+
+@pytest.mark.parametrize(
+    ("shade", "wrapped"),
+    (("direct-c", "third"), ("direct-d", "fourth")),
+    indirect=["wrapped"],
+)
+def test_reversed_argument_order_keeps_direct_value(shade, wrapped):
+    assert wrapped[0] in {"third", "fourth"}
+    assert wrapped[1] == shade
+    assert shade in {"direct-c", "direct-d"}
+
+
+@pytest.fixture
+def token(request):
+    return "token:" + request.param
+
+
+@pytest.mark.parametrize("token", ("one", "two"), indirect=True)
+def test_boolean_true_routes_values_through_fixture(token):
+    assert token in {"token:one", "token:two"}
+
+
+@pytest.mark.parametrize("shade", ("plain-a", "plain-b"), indirect=False)
+def test_boolean_false_keeps_values_direct(shade):
+    assert shade in {"plain-a", "plain-b"}
+
+
+@pytest.mark.parametrize("number", (3, 8))
+def test_ordinary_parametrize_path(number):
+    assert number in {3, 8}
+"""
+
+MISSING_FIXTURE = r"""
+import pytest
+
+
+@pytest.mark.parametrize("value", (1,), indirect=["missing"])
+def test_unknown_indirect_fixture(value):
+    assert value == 1
+"""
+
+CHILD = r"""
+import importlib
+from pathlib import Path
+import sys
+
+source, overlay, test_file = map(Path, sys.argv[1:4])
+source = source.resolve()
+overlay = overlay.resolve()
+sys.path[:0] = [str(source), str(overlay)]
+
+import pytest
+
+for name in ("pluggy", "iniconfig", "pygments", "packaging"):
+    module = importlib.import_module(name)
+    origin = Path(module.__file__).resolve()
+    if not origin.is_relative_to(overlay):
+        raise AssertionError(f"{name} did not load from the pinned runtime overlay")
+if not Path(pytest.__file__).resolve().is_relative_to(source):
+    raise AssertionError("pytest did not load from this pinned source checkout")
+if not (source / "_pytest" / "_version.py").is_file():
+    raise AssertionError("generated version metadata is missing")
+
+result = pytest.main([
+    "-q", "-p", "no:cacheprovider", "--noconftest", str(test_file)
+])
+sys.exit(int(result))
+"""
+
+
+def run_cases(root: Path, name: str, source_text: str) -> tuple[int, str]:
+    test_file = root / f"{name}.py"
+    test_file.write_text(source_text, encoding="utf-8")
+    env = {
+        "PATH": "/usr/bin:/bin",
+        "HOME": str(root),
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1",
+        "PYTHONNOUSERSITE": "1",
+    }
+    completed = subprocess.run(
+        [
+            sys.executable, "-B", "-S", "-c", CHILD,
+            str(Path(__file__).resolve().parent / "src"),
+            str(Path(__file__).resolve().parent / ".benchmark_runtime" / "site"),
+            str(test_file),
+        ],
+        cwd=root,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    return completed.returncode, completed.stdout + completed.stderr
+
+
+if Path(sys.executable).resolve() != Path("/usr/bin/python3").resolve():
+    raise SystemExit("R17 requires the same /usr/bin/python3 used by the grader")
+if sys.version_info < (3, 10):
+    raise SystemExit("R17 requires Python 3.10 or newer")
+
+with tempfile.TemporaryDirectory(prefix="pytest-r17-visible-") as temporary:
+    root = Path(temporary)
+    valid_exit, valid_output = run_cases(root, "valid_cases", PYTESTS)
+    if valid_exit != 0 or "10 passed" not in valid_output:
+        raise AssertionError(f"valid pytest cases failed: {valid_output[-1200:]}")
+    invalid_exit, invalid_output = run_cases(
+        root, "invalid_case", MISSING_FIXTURE
+    )
+    if (
+        invalid_exit != 2
+        or "indirect fixture 'missing' doesn't exist" not in invalid_output.lower()
+    ):
+        raise AssertionError(f"missing indirect fixture was not diagnosed: {invalid_output[-1200:]}")
+
+print("PYTEST_MIXED_INDIRECT_VISIBLE_OK")
+'''
+
+
+PYTEST_MIXED_INDIRECT_HIDDEN = r'''from __future__ import annotations
+
+import json
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+
+
+HIDDEN_CASES = r"""
+import json
+import pytest
+
+
+@pytest.fixture(params=("unused-0", "unused-1"))
+def flavor(request):
+    return request.param
+
+
+@pytest.fixture
+def left(request, flavor):
+    return (request.param, flavor)
+
+
+@pytest.fixture
+def right(request, flavor):
+    return (request.param, flavor)
+
+
+@pytest.mark.parametrize(
+    ("right", "flavor", "left"),
+    (("R0", "chosen-0", "L0"), ("R1", "chosen-1", "L1")),
+    indirect=["right", "left"],
+)
+def test_multiple_indirect_arguments_share_direct_capture(right, flavor, left):
+    print("R17_OBSERVATION:" + json.dumps(["multiple", right, flavor, left]))
+
+
+@pytest.fixture
+def first(request):
+    return "first=" + request.param
+
+
+@pytest.fixture
+def second(request):
+    return "second=" + request.param
+
+
+@pytest.mark.parametrize(
+    ("first", "second"), (("a", "x"), ("b", "y")), indirect=True
+)
+def test_boolean_true_applies_to_every_argument(first, second):
+    print("R17_OBSERVATION:" + json.dumps(["true", first, second]))
+
+
+@pytest.mark.parametrize("flavor", ("direct-1", "direct-2"), indirect=False)
+def test_direct_false_shadows_parametrized_fixture(flavor):
+    print("R17_OBSERVATION:" + json.dumps(["false", flavor]))
+
+
+@pytest.mark.parametrize("count", (0, 5, 11))
+def test_unmarked_parametrize_stays_ordinary(count):
+    print("R17_OBSERVATION:" + json.dumps(["ordinary", count]))
+"""
+
+UNKNOWN_CASE = r"""
+import pytest
+
+
+@pytest.mark.parametrize("value", ("x",), indirect=["absent"])
+def test_unknown_indirect_name(value):
+    print(value)
+"""
+
+CHILD = r"""
+import importlib
+from pathlib import Path
+import sys
+
+source, overlay, test_file = map(Path, sys.argv[1:4])
+source = source.resolve()
+overlay = overlay.resolve()
+sys.path[:0] = [str(source), str(overlay)]
+import pytest
+for name in ("pluggy", "iniconfig", "pygments", "packaging"):
+    origin = Path(importlib.import_module(name).__file__).resolve()
+    if not origin.is_relative_to(overlay):
+        raise RuntimeError(f"unexpected runtime package origin: {name}")
+if not Path(pytest.__file__).resolve().is_relative_to(source):
+    raise RuntimeError("probe did not import pytest from the pinned checkout")
+if not (source / "_pytest" / "_version.py").is_file():
+    raise RuntimeError("generated version metadata is missing")
+result = pytest.main([
+    "-q", "-s", "-p", "no:cacheprovider", "--noconftest", str(test_file)
+])
+sys.exit(int(result))
+"""
+
+if Path(sys.executable).resolve() != Path("/usr/bin/python3").resolve():
+    raise SystemExit("R17 requires the same /usr/bin/python3 for tests and grading")
+if sys.version_info < (3, 10):
+    raise SystemExit("R17 requires Python 3.10 or newer")
+
+with tempfile.TemporaryDirectory(prefix="pytest-r17-probe-") as temporary:
+    root = Path(temporary)
+    source = Path.cwd() / "src"
+    overlay = Path.cwd() / ".benchmark_runtime" / "site"
+    env = {
+        "PATH": "/usr/bin:/bin",
+        "HOME": str(root),
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1",
+        "PYTHONNOUSERSITE": "1",
+    }
+
+    def invoke(name: str, content: str) -> tuple[int, str]:
+        test_file = root / f"{name}.py"
+        test_file.write_text(content, encoding="utf-8")
+        result = subprocess.run(
+            [
+                sys.executable, "-B", "-S", "-c", CHILD,
+                str(source), str(overlay), str(test_file),
+            ],
+            cwd=root,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        return result.returncode, result.stdout + result.stderr
+
+    valid_exit, valid_output = invoke("valid_cases", HIDDEN_CASES)
+    # Pytest's progress reporter prefixes subsequent captured stdout lines
+    # with a dot (e.g. ".R17_OBSERVATION:"). Strip only that progress marker.
+    observations = [
+        json.loads(line.partition(":")[2])
+        for line in valid_output.splitlines()
+        if line.lstrip(".").startswith("R17_OBSERVATION:")
+    ]
+    unknown_exit, unknown_output = invoke("unknown_case", UNKNOWN_CASE)
+    print("R17_PROBE_RESULT:" + json.dumps({
+        "valid_exit": valid_exit,
+        "observations": observations,
+        "unknown_exit": unknown_exit,
+        "unknown_output": unknown_output[-4000:],
+    }, sort_keys=True))
+'''
+
+PYTEST_MIXED_INDIRECT_HIDDEN_EXPECTED = json.dumps(
+    {
+        "valid_exit": 0,
+        "observations": [
+            ["multiple", ["R0", "chosen-0"], "chosen-0", ["L0", "chosen-0"]],
+            ["multiple", ["R1", "chosen-1"], "chosen-1", ["L1", "chosen-1"]],
+            ["true", "first=a", "second=x"],
+            ["true", "first=b", "second=y"],
+            ["false", "direct-1"],
+            ["false", "direct-2"],
+            ["ordinary", 0],
+            ["ordinary", 5],
+            ["ordinary", 11],
+        ],
+        "unknown_exit": 2,
+        "unknown_error": "indirect fixture 'absent' doesn't exist",
+    },
+    separators=(",", ":"),
+    sort_keys=True,
+)
 
 
 TASKS = {
@@ -2125,6 +2512,45 @@ TASKS = {
             "No other commands are authorized. Preserve other files and APIs."
         ),
     ),
+    "pytest-mixed-indirect-fixture-precedence": RepositoryTask(
+        source="pytest-dev/pytest",
+        upstream="https://github.com/pytest-dev/pytest.git",
+        base_sha="fd47511afeb024d2fbad9257d1b44310672c6a0f",
+        reference_fix_sha="6b6502e94b78b41951b70265a84187a419e8ce8c",
+        editable=frozenset({"src/_pytest/fixtures.py", "src/_pytest/python.py"}),
+        visible_script="qa_visible.py",
+        visible_source=PYTEST_MIXED_INDIRECT_VISIBLE,
+        hidden_source=PYTEST_MIXED_INDIRECT_HIDDEN,
+        hidden_expected_json=PYTEST_MIXED_INDIRECT_HIDDEN_EXPECTED,
+        command_grant="python3 -B qa_visible.py",
+        prompt=(
+            "Repair mixed direct and indirect parameter handling in this "
+            "pinned pytest repository. When a parametrized test marks only "
+            "selected arguments as indirect, the remaining arguments must "
+            "retain their direct values even if a fixture with the same name "
+            "declares its own parameters. Preserve fixture setup and dependency "
+            "capture, argument ordering, indirect=True and indirect=False, "
+            "ordinary parametrization, and a clear collection error when an "
+            "indirect fixture name does not exist. Inspect qa_visible.py and "
+            "the relevant implementation. Edit only "
+            "src/_pytest/fixtures.py and src/_pytest/python.py as needed, then "
+            "run exactly python3 -B qa_visible.py with run_command. No other "
+            "commands are authorized. Do not modify tests, documentation, "
+            "metadata, or other files."
+        ),
+        runtime=PYTEST_R17_RUNTIME,
+        upstream_pr="https://github.com/pytest-dev/pytest/pull/13976",
+        license="MIT",
+        require_all_editable_changed=False,
+        expected_reference_paths=frozenset(
+            {
+                "src/_pytest/fixtures.py",
+                "src/_pytest/python.py",
+                "testing/python/collect.py",
+                "testing/python/metafunc.py",
+            }
+        ),
+    ),
 }
 
 
@@ -2168,7 +2594,11 @@ def fetch_pinned(destination: Path, task: RepositoryTask, sha: str) -> None:
 
 
 def check_edits(
-    original: dict[str, str], updated: dict[str, str], editable: frozenset[str]
+    original: dict[str, str],
+    updated: dict[str, str],
+    editable: frozenset[str],
+    *,
+    require_all_editable_changed: bool = True,
 ) -> tuple[bool, bool]:
     if UNSAFE_ENTRIES.intersection(original.values()) or UNSAFE_ENTRIES.intersection(updated.values()):
         return False, False
@@ -2183,11 +2613,471 @@ def check_edits(
     # Editable paths may be new or intentionally removed by a refactor.
     # Every other addition, deletion, or content change remains protected.
     protected = changed_paths.issubset(editable)
-    changed = bool(editable) and all(
-        content_identity(original.get(path)) != content_identity(updated.get(path))
+    content_changed = {
+        path
         for path in editable
-    )
+        if content_identity(original.get(path)) != content_identity(updated.get(path))
+    }
+    changed = bool(editable) and bool(content_changed)
+    if require_all_editable_changed:
+        changed = changed and content_changed == editable
     return protected, changed
+
+
+_RUNTIME_MAX_FILES = 1024
+_RUNTIME_MAX_BYTES = 64 * 1024 * 1024
+
+
+def _is_within(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+    except ValueError:
+        return False
+    return True
+
+
+def _real_directory(path: Path) -> None:
+    try:
+        mode = path.lstat().st_mode
+    except OSError as error:
+        raise RuntimeError(
+            f"required runtime directory is unavailable: {path.name}"
+        ) from error
+    if stat.S_ISLNK(mode) or not stat.S_ISDIR(mode):
+        raise RuntimeError(f"runtime path is not a plain directory: {path.name}")
+
+
+def _locked_runtime_versions(
+    runtime: PythonSourceRuntime,
+) -> tuple[
+    bytes,
+    Path,
+    dict[str, tuple[RuntimePackage, dict[str, tuple[str, str]]]],
+]:
+    """Resolve the active Ash venv and exact lock-approved purelib sources."""
+    prefix = Path(sys.prefix).resolve(strict=True)
+    base_prefix = Path(sys.base_prefix).resolve(strict=True)
+    if prefix == base_prefix or prefix.name != ".venv":
+        raise RuntimeError("R17 runtime source must come from an active Ash virtualenv")
+    pyvenv_cfg = prefix / "pyvenv.cfg"
+    try:
+        cfg_mode = pyvenv_cfg.lstat().st_mode
+    except OSError as error:
+        raise RuntimeError("active Ash virtualenv metadata is missing") from error
+    if stat.S_ISLNK(cfg_mode) or not stat.S_ISREG(cfg_mode):
+        raise RuntimeError("active Ash virtualenv metadata is unsafe")
+
+    purelib_text = sysconfig.get_paths().get("purelib")
+    if not isinstance(purelib_text, str):
+        raise RuntimeError("active Python has no purelib directory")
+    purelib = Path(purelib_text).resolve(strict=True)
+    if not _is_within(purelib, prefix):
+        raise RuntimeError(
+            "runtime source directory is outside the active Ash virtualenv"
+        )
+    _real_directory(purelib)
+
+    lock_path = REPO / "uv.lock"
+    try:
+        lock_bytes = lock_path.read_bytes()
+        lock = tomllib.loads(lock_bytes.decode("utf-8"))
+    except (OSError, UnicodeError, tomllib.TOMLDecodeError) as error:
+        raise RuntimeError(
+            "R17 dependency lockfile is unavailable or invalid"
+        ) from error
+    lock_packages = lock.get("package")
+    if not isinstance(lock_packages, list):
+        raise RuntimeError("R17 dependency lockfile has no package table")
+
+    package_metadata: dict[str, tuple[RuntimePackage, dict[str, tuple[str, str]]]] = {}
+    for package in runtime.packages:
+        matching = [
+            item
+            for item in lock_packages
+            if isinstance(item, dict)
+            and str(item.get("name", "")).casefold() == package.distribution.casefold()
+        ]
+        if len(matching) != 1 or matching[0].get("version") != package.version:
+            raise RuntimeError(
+                f"R17 lock does not uniquely pin {package.distribution} {package.version}"
+            )
+        try:
+            distribution = importlib.metadata.distribution(package.distribution)
+        except importlib.metadata.PackageNotFoundError as error:
+            raise RuntimeError(
+                f"trusted runtime package is missing: {package.distribution}"
+            ) from error
+        metadata_path = Path(getattr(distribution, "_path", ""))
+        _real_directory(metadata_path)
+        resolved_metadata = metadata_path.resolve(strict=True)
+        if not _is_within(resolved_metadata, purelib):
+            raise RuntimeError(
+                f"runtime metadata is outside the active Ash virtualenv: {package.distribution}"
+            )
+        metadata_file = metadata_path / "METADATA"
+        record_file = metadata_path / "RECORD"
+        for metadata_entry in (metadata_file, record_file):
+            try:
+                metadata_mode = metadata_entry.lstat().st_mode
+            except OSError as error:
+                raise RuntimeError(
+                    f"runtime package metadata is incomplete: {package.distribution}"
+                ) from error
+            if stat.S_ISLNK(metadata_mode) or not stat.S_ISREG(metadata_mode):
+                raise RuntimeError(
+                    f"runtime package metadata is unsafe: {package.distribution}"
+                )
+        metadata_text = _read_regular_source(
+            metadata_file, f"{package.distribution}/METADATA"
+        ).decode("utf-8")
+        headers: dict[str, str] = {}
+        for line in metadata_text.splitlines():
+            key, separator, value = line.partition(":")
+            if separator:
+                headers.setdefault(key.strip().casefold(), value.strip())
+        if (
+            headers.get("name", "").casefold() != package.distribution.casefold()
+            or headers.get("version") != package.version
+        ):
+            raise RuntimeError(
+                f"runtime package identity mismatch: {package.distribution}"
+            )
+        record_text = _read_regular_source(
+            record_file, f"{package.distribution}/RECORD"
+        ).decode("utf-8")
+        recorded: dict[str, tuple[str, str]] = {}
+        try:
+            rows = csv.reader(record_text.splitlines())
+            for row in rows:
+                if len(row) != 3:
+                    raise ValueError("invalid RECORD row")
+                relative = Path(row[0])
+                if relative.parts and relative.parts[0] == package.package:
+                    if relative.is_absolute() or ".." in relative.parts:
+                        raise ValueError("unsafe package RECORD path")
+                    if relative.suffix not in {".py", ".typed"}:
+                        raise ValueError("non-source package entry")
+                    recorded[relative.as_posix()] = (row[1], row[2])
+        except (csv.Error, ValueError) as error:
+            raise RuntimeError(
+                f"runtime package RECORD is invalid: {package.distribution}"
+            ) from error
+        if not recorded:
+            raise RuntimeError(
+                f"runtime package has no source RECORD: {package.distribution}"
+            )
+        package_metadata[package.distribution.casefold()] = (package, recorded)
+    return lock_bytes, purelib, package_metadata
+
+
+def _read_regular_source(
+    path: Path, relative_name: str, *, require_unlinked: bool = False
+) -> bytes:
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError as error:
+        raise RuntimeError(
+            f"runtime source cannot be opened safely: {relative_name}"
+        ) from error
+    try:
+        before = os.fstat(fd)
+        if not stat.S_ISREG(before.st_mode):
+            raise RuntimeError(f"runtime source is not a regular file: {relative_name}")
+        if require_unlinked and before.st_nlink != 1:
+            raise RuntimeError(f"runtime source file is hardlinked: {relative_name}")
+        with os.fdopen(fd, "rb", closefd=False) as source:
+            data = source.read(_RUNTIME_MAX_BYTES + 1)
+        after = os.fstat(fd)
+        if (before.st_dev, before.st_ino, before.st_size) != (
+            after.st_dev, after.st_ino, after.st_size
+        ):
+            raise RuntimeError(f"runtime source changed while reading: {relative_name}")
+        if len(data) > _RUNTIME_MAX_BYTES:
+            raise RuntimeError("runtime source file exceeds the bounded size")
+        return data
+    finally:
+        os.close(fd)
+
+
+def _package_source_files(
+    purelib: Path,
+    package: RuntimePackage,
+    recorded: dict[str, tuple[str, str]],
+) -> dict[str, bytes]:
+    source_root = purelib / package.package
+    try:
+        root_mode = source_root.lstat().st_mode
+    except OSError as error:
+        raise RuntimeError(
+            f"runtime source package is missing: {package.distribution}"
+        ) from error
+    if stat.S_ISLNK(root_mode) or not stat.S_ISDIR(root_mode):
+        raise RuntimeError(
+            f"runtime source package path is unsafe: {package.distribution}"
+        )
+    if source_root.resolve(strict=True) != source_root:
+        raise RuntimeError(
+            f"runtime source package resolves unexpectedly: {package.distribution}"
+        )
+
+    found: dict[str, bytes] = {}
+    total_bytes = 0
+
+    def visit(directory: Path, relative: Path, *, copy_source: bool = True) -> None:
+        nonlocal total_bytes
+        for entry in sorted(os.scandir(directory), key=lambda item: item.name):
+            path = Path(entry.path)
+            child_relative = relative / entry.name
+            try:
+                mode = path.lstat().st_mode
+            except OSError as error:
+                raise RuntimeError(
+                    "runtime package contains an unreadable entry"
+                ) from error
+            if stat.S_ISLNK(mode):
+                raise RuntimeError("runtime package contains a symlink")
+            if stat.S_ISDIR(mode):
+                visit(
+                    path,
+                    child_relative,
+                    copy_source=copy_source and entry.name != "__pycache__",
+                )
+                continue
+            if not stat.S_ISREG(mode):
+                raise RuntimeError("runtime package contains a special file")
+            if entry.name.endswith(".pyc") or "__pycache__" in child_relative.parts:
+                continue
+            if not copy_source:
+                continue
+            if path.suffix not in {".py", ".typed"}:
+                raise RuntimeError("runtime package contains a non-source file")
+            relative_name = (Path(package.package) / child_relative).as_posix()
+            if relative_name not in recorded:
+                raise RuntimeError(
+                    "runtime source entry is not covered by package RECORD"
+                )
+            hash_record, size_record = recorded[relative_name]
+            if not hash_record.startswith("sha256=") or not size_record.isdecimal():
+                raise RuntimeError(
+                    "runtime package source lacks a bounded SHA-256 RECORD"
+                )
+            data = _read_regular_source(path, relative_name, require_unlinked=True)
+            digest = base64.urlsafe_b64encode(hashlib.sha256(data).digest())
+            digest_text = digest.rstrip(b"=").decode("ascii")
+            if digest_text != hash_record.partition("=")[2] or len(data) != int(
+                size_record
+            ):
+                raise RuntimeError(
+                    "runtime package source does not match package RECORD"
+                )
+            found[relative_name] = data
+            total_bytes += len(data)
+            if len(found) > _RUNTIME_MAX_FILES or total_bytes > _RUNTIME_MAX_BYTES:
+                raise RuntimeError(
+                    "runtime package source exceeds bounded overlay limits"
+                )
+
+    visit(source_root, Path())
+    if set(found) != set(recorded):
+        raise RuntimeError(
+            f"runtime package source inventory mismatch: {package.distribution}"
+        )
+    if _hash_file_map(found) != package.trusted_source_sha256:
+        raise RuntimeError(
+            f"trusted runtime source fingerprint mismatch: {package.distribution}"
+        )
+    return found
+
+
+def _hash_file_map(files: dict[str, bytes]) -> str:
+    digest = hashlib.sha256()
+    for name, data in sorted(files.items()):
+        digest.update(name.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(hashlib.sha256(data).digest())
+    return digest.hexdigest()
+
+
+def _collect_source_runtime(
+    runtime: PythonSourceRuntime,
+) -> tuple[dict[str, bytes], dict[str, bytes], dict[str, object]]:
+    lock_bytes, purelib, package_metadata = _locked_runtime_versions(runtime)
+    files: dict[str, bytes] = {}
+    package_receipt: dict[str, dict[str, object]] = {}
+    for package in runtime.packages:
+        metadata = package_metadata.get(package.distribution.casefold())
+        if metadata is None or metadata[0] != package:
+            raise RuntimeError("trusted runtime package metadata was not resolved")
+        source_files = _package_source_files(purelib, package, metadata[1])
+        for name, content in source_files.items():
+            if name in files:
+                raise RuntimeError("duplicate package path in runtime overlay")
+            files[name] = content
+        package_receipt[package.distribution] = {
+            "version": package.version,
+            "source_files": len(source_files),
+            "source_sha256": _hash_file_map(source_files),
+            "fingerprint_provenance": "chief-observed installed source bytes",
+        }
+    generated: dict[str, bytes] = {}
+    for name, content in runtime.generated_files:
+        path = Path(name)
+        if path.is_absolute() or ".." in path.parts or not content:
+            raise RuntimeError("generated runtime metadata path is invalid")
+        if name in generated:
+            raise RuntimeError("duplicate generated runtime metadata path")
+        generated[name] = content
+    overlay_sha256 = _hash_file_map(files)
+    if overlay_sha256 != runtime.trusted_overlay_sha256:
+        raise RuntimeError("trusted runtime overlay fingerprint mismatch")
+    receipt: dict[str, object] = {
+        "source": (
+            "active Ash virtualenv; uv.lock and installed RECORD checked; "
+            "source bytes matched chief-observed fingerprints, not PyPI wheel hashes"
+        ),
+        "oracle_interpreter": (
+            "Linux /usr/bin/python3, Python 3.10 or newer, shared by task and grader"
+        ),
+        "lock_sha256": hashlib.sha256(lock_bytes).hexdigest(),
+        "dependencies": package_receipt,
+        "overlay_file_count": len(files),
+        "overlay_sha256": overlay_sha256,
+        "generated_files": {
+            name: hashlib.sha256(content).hexdigest()
+            for name, content in sorted(generated.items())
+        },
+    }
+    return files, generated, receipt
+
+
+def _ensure_directory(root: Path, relative: Path) -> Path:
+    current = root
+    for part in relative.parts:
+        if part in {"", ".", ".."}:
+            raise RuntimeError("runtime directory path is invalid")
+        current = current / part
+        try:
+            mode = current.lstat().st_mode
+        except FileNotFoundError:
+            os.mkdir(current, 0o755)
+            mode = current.lstat().st_mode
+        except OSError as error:
+            raise RuntimeError("runtime directory cannot be inspected") from error
+        if stat.S_ISLNK(mode) or not stat.S_ISDIR(mode):
+            raise RuntimeError("runtime destination contains a symlink or special path")
+    return current
+
+
+def _write_new_file(root: Path, relative_name: str, content: bytes) -> None:
+    relative = Path(relative_name)
+    if relative.is_absolute() or ".." in relative.parts:
+        raise RuntimeError("runtime artifact path is invalid")
+    parent = _ensure_directory(root, relative.parent)
+    destination = parent / relative.name
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(destination, flags, 0o644)
+    except FileExistsError as error:
+        raise RuntimeError("runtime artifact path already exists") from error
+    except OSError as error:
+        raise RuntimeError("runtime artifact could not be written safely") from error
+    with os.fdopen(fd, "wb") as output:
+        output.write(content)
+
+
+def _assert_generated_file_ignored(root: Path, relative_name: str) -> None:
+    result = command(
+        ["git", "check-ignore", "-q", "--", relative_name],
+        cwd=root,
+        env={
+            "PATH": "/usr/bin:/bin",
+            "HOME": "/tmp",
+            "GIT_CONFIG_GLOBAL": "/dev/null",
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_TERMINAL_PROMPT": "0",
+        },
+        timeout=5,
+    )
+    if result.returncode != 0:
+        raise RuntimeError("generated pytest version metadata is not Git-ignored")
+
+
+def materialize_task_runtime(
+    root: Path, runtime: PythonSourceRuntime
+) -> dict[str, object]:
+    """Create only the verified pure-Python runtime artifacts in a fresh checkout."""
+    root_mode = root.lstat().st_mode
+    if stat.S_ISLNK(root_mode) or not stat.S_ISDIR(root_mode):
+        raise RuntimeError("pinned source checkout is not a plain directory")
+    files, generated, receipt = _collect_source_runtime(runtime)
+    runtime_root = root / ".benchmark_runtime"
+    if runtime_root.exists() or runtime_root.is_symlink():
+        raise RuntimeError("runtime overlay path already exists in pinned checkout")
+    for name in generated:
+        destination = root / name
+        if destination.exists() or destination.is_symlink():
+            raise RuntimeError("generated runtime metadata path already exists")
+    for name, content in sorted(files.items()):
+        _write_new_file(root, f".benchmark_runtime/site/{name}", content)
+    for name, content in sorted(generated.items()):
+        _write_new_file(root, name, content)
+        _assert_generated_file_ignored(root, name)
+    verify_task_runtime(root, runtime, receipt)
+    return receipt
+
+
+def verify_task_runtime(
+    root: Path, runtime: PythonSourceRuntime, expected: dict[str, object]
+) -> None:
+    """Verify copied runtime bytes exactly before a workspace snapshot."""
+    files, generated, receipt = _collect_source_runtime(runtime)
+    if receipt != expected:
+        raise RuntimeError("runtime source or lock changed after preflight")
+    expected_files = {
+        f".benchmark_runtime/site/{name}": content for name, content in files.items()
+    }
+    expected_files.update(generated)
+    actual_names: set[str] = set()
+    overlay_root = root / ".benchmark_runtime"
+    _real_directory(overlay_root)
+    site_root = overlay_root / "site"
+    _real_directory(site_root)
+    for path in overlay_root.rglob("*"):
+        try:
+            mode = path.lstat().st_mode
+        except OSError as error:
+            raise RuntimeError(
+                "runtime overlay contains an unreadable entry"
+            ) from error
+        if stat.S_ISLNK(mode) or not (stat.S_ISDIR(mode) or stat.S_ISREG(mode)):
+            raise RuntimeError("runtime overlay contains a symlink or special file")
+        if stat.S_ISREG(mode):
+            actual_names.add(path.relative_to(root).as_posix())
+    if actual_names != set(expected_files) - set(generated):
+        raise RuntimeError("runtime overlay contains an unexpected file set")
+    for name, content in expected_files.items():
+        destination = root / name
+        try:
+            mode = destination.lstat().st_mode
+        except OSError as error:
+            raise RuntimeError("required runtime artifact is missing") from error
+        if stat.S_ISLNK(mode) or not stat.S_ISREG(mode):
+            raise RuntimeError("runtime artifact is not a regular file")
+        if _read_regular_source(destination, name) != content:
+            raise RuntimeError("runtime artifact bytes differ from the pinned overlay")
+
+
+def _verify_r17_python_command_parity() -> None:
+    if not sys.platform.startswith("linux"):
+        raise RuntimeError("R17 requires a Linux host with Bubblewrap")
+    expected = Path("/usr/bin/python3").resolve()
+    for path in ("/usr/bin:/bin", "/usr/local/bin:/usr/bin:/bin"):
+        executable = shutil.which("python3", path=path)
+        if executable is None or Path(executable).resolve() != expected:
+            raise RuntimeError(
+                "R17 requires python3 to resolve to /usr/bin/python3 for both runners"
+            )
 
 
 def validate_editable_paths(
@@ -2255,49 +3145,239 @@ def headless_error_category(stdout_path: Path) -> str | None:
 def check_oracles(workspace: Path, task: RepositoryTask) -> dict[str, object]:
     visible = oracle_python(workspace, task.visible_script)
     hidden = oracle_python(workspace, code=task.hidden_source)
+    if task.hidden_expected_json is None:
+        hidden_correct = hidden.returncode == 0
+        hidden_exit = hidden.returncode
+    else:
+        hidden_correct = _r17_hidden_probe_matches(task, hidden)
+        hidden_exit = 0 if hidden_correct else 1
     return {
-        "correct": visible.returncode == 0 and hidden.returncode == 0,
+        "correct": visible.returncode == 0 and hidden_correct,
         "visible_oracle_exit": visible.returncode,
-        "hidden_oracle_exit": hidden.returncode,
+        "hidden_oracle_exit": hidden_exit,
+        **(
+            {"hidden_probe_exit": hidden.returncode}
+            if task.hidden_expected_json is not None
+            else {}
+        ),
         "oracle_stderr_tail": (visible.stderr + hidden.stderr)[-400:],
     }
 
 
+def _json_same_typed_value(expected: object, actual: object) -> bool:
+    """Compare JSON observations without Python's bool/int numeric coercion."""
+    if type(expected) is not type(actual):
+        return False
+    if isinstance(expected, list):
+        return len(expected) == len(actual) and all(
+            _json_same_typed_value(left, right)
+            for left, right in zip(expected, actual)
+        )
+    if isinstance(expected, dict):
+        return expected.keys() == actual.keys() and all(
+            _json_same_typed_value(value, actual[key])
+            for key, value in expected.items()
+        )
+    return expected == actual
+
+
+def _r17_hidden_probe_matches(
+    task: RepositoryTask, completed: subprocess.CompletedProcess[str]
+) -> bool:
+    if completed.returncode != 0 or task.hidden_expected_json is None:
+        return False
+    prefix = "R17_PROBE_RESULT:"
+    rows = [
+        line[len(prefix):]
+        for line in completed.stdout.splitlines()
+        if line.startswith(prefix)
+    ]
+    if len(rows) != 1:
+        return False
+    try:
+        expected = json.loads(task.hidden_expected_json)
+        actual = json.loads(rows[0])
+    except (TypeError, ValueError):
+        return False
+    if not isinstance(expected, dict) or not isinstance(actual, dict):
+        return False
+    required_actual = {"valid_exit", "observations", "unknown_exit", "unknown_output"}
+    if set(actual) != required_actual:
+        return False
+    if (
+        type(actual["valid_exit"]) is not int
+        or type(actual["unknown_exit"]) is not int
+        or not isinstance(actual["observations"], list)
+        or not isinstance(actual["unknown_output"], str)
+        or len(actual["unknown_output"]) > 4096
+    ):
+        return False
+    unknown_error = expected.get("unknown_error")
+    return (
+        actual["valid_exit"] == expected.get("valid_exit")
+        and _json_same_typed_value(
+            expected.get("observations"), actual["observations"]
+        )
+        and actual["unknown_exit"] == expected.get("unknown_exit")
+        and isinstance(unknown_error, str)
+        and unknown_error.casefold() in actual["unknown_output"].casefold()
+    )
+
+
+def hidden_oracle_sha256(task: RepositoryTask) -> str:
+    """Fingerprint both the candidate-visible probe and its parent-only checker."""
+    payload = task.hidden_source.encode("utf-8")
+    if task.hidden_expected_json is not None:
+        payload += b"\0parent-checker\0" + task.hidden_expected_json.encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def hidden_oracle_classification(task: RepositoryTask) -> str:
+    if task.hidden_expected_json is not None:
+        return "arm-sealed-authored-parent-checker; not an independent holdout"
+    return "arm-sealed-authored-inline-oracle"
+
+
+def _assert_safe_source_tree(root: Path) -> None:
+    """Reject pinned trees with links or special files before artifact setup."""
+    try:
+        root_mode = root.lstat().st_mode
+    except OSError as error:
+        raise RuntimeError("pinned checkout is unavailable") from error
+    if stat.S_ISLNK(root_mode) or not stat.S_ISDIR(root_mode):
+        raise RuntimeError("pinned checkout is not a plain directory")
+
+    def visit(directory: Path) -> None:
+        try:
+            entries = sorted(os.scandir(directory), key=lambda item: item.name)
+            for entry in entries:
+                path = Path(entry.path)
+                try:
+                    mode = path.lstat().st_mode
+                except OSError as error:
+                    raise RuntimeError(
+                        "pinned checkout has an unreadable path"
+                    ) from error
+                if stat.S_ISLNK(mode):
+                    raise RuntimeError("pinned checkout contains a symlink")
+                if stat.S_ISDIR(mode):
+                    if not (directory == root and entry.name == ".git"):
+                        visit(path)
+                elif not stat.S_ISREG(mode):
+                    raise RuntimeError("pinned checkout has a special file")
+        except OSError as error:
+            raise RuntimeError("pinned checkout cannot be inspected safely") from error
+
+    visit(root)
+
+
+def _attest_r17_system_python_version() -> str:
+    """Pin the effective Linux test/grading interpreter for reproducible receipts."""
+    version = subprocess.run(
+        [
+            "/usr/bin/python3", "-B", "-c",
+            "import sys; print('.'.join(map(str, sys.version_info[:3])))",
+        ],
+        cwd=REPO,
+        env={"PATH": "/usr/bin:/bin", "PYTHONNOUSERSITE": "1"},
+        capture_output=True,
+        text=True,
+        timeout=5,
+        check=False,
+    )
+    if version.returncode != 0 or not re.fullmatch(
+        r"\d+\.\d+\.\d+\n?", version.stdout
+    ):
+        raise RuntimeError("R17 system Python version could not be attested")
+    python_version = version.stdout.strip()
+    if tuple(map(int, python_version.split("."))) < (3, 10):
+        raise RuntimeError("R17 requires Python 3.10 or newer")
+    return python_version
+
+
 def preflight(task: RepositoryTask, root: Path) -> tuple[Path, dict[str, object]]:
+    r17_python_version: str | None = None
+    if task.hidden_expected_json is not None:
+        _verify_r17_python_command_parity()
+        r17_python_version = _attest_r17_system_python_version()
     baseline = root / "baseline"
     reference = root / "reference"
     fetch_pinned(baseline, task, task.base_sha)
     fetch_pinned(reference, task, task.reference_fix_sha)
-    preflight_values = {
-        value
-        for tree in (baseline, reference)
-        for value in snapshot_files(tree).values()
-    }
-    if "SYMLINK" in preflight_values:
-        raise RuntimeError("upstream checkout contains a symlink; refusing model trial")
-    if {"SPECIAL", "UNREADABLE"}.intersection(preflight_values):
-        raise RuntimeError("upstream checkout has special or unreadable files")
     for tree in (baseline, reference):
+        if task.runtime is not None:
+            _assert_safe_source_tree(tree)
         visible = tree / task.visible_script
         if visible.exists() or visible.is_symlink():
             raise RuntimeError(
                 "upstream checkout collides with visible evaluation test"
             )
+    runtime_receipt: dict[str, object] | None = None
+    if task.runtime is not None:
+        receipts = [
+            materialize_task_runtime(tree, task.runtime)
+            for tree in (baseline, reference)
+        ]
+        if receipts[0] != receipts[1]:
+            raise RuntimeError("baseline and reference runtime overlays differ")
+        runtime_receipt = receipts[0]
+    for tree in (baseline, reference):
+        visible = tree / task.visible_script
         visible.write_text(task.visible_source, encoding="utf-8")
+    base_before = snapshot_files(baseline)
+    reference_before = snapshot_files(reference)
+    preflight_values = set(base_before.values()) | set(reference_before.values())
+    if "SYMLINK" in preflight_values:
+        raise RuntimeError("upstream checkout contains a symlink; refusing model trial")
+    if {"SPECIAL", "UNREADABLE"}.intersection(preflight_values):
+        raise RuntimeError("upstream checkout has special or unreadable files")
+    upstream_changed_paths = sorted(
+        path
+        for path in base_before.keys() | reference_before.keys()
+        if base_before.get(path) != reference_before.get(path)
+    )
+    if (
+        task.expected_reference_paths is not None
+        and set(upstream_changed_paths) != task.expected_reference_paths
+    ):
+        raise RuntimeError(
+            "pinned reference source paths differ from the task manifest"
+        )
     base_score = check_oracles(baseline, task)
     reference_score = check_oracles(reference, task)
-    if base_score["correct"] or not reference_score["correct"]:
+    base_visible_red = base_score["visible_oracle_exit"] != 0
+    base_hidden_red = base_score["hidden_oracle_exit"] != 0
+    reference_both_green = (
+        reference_score["visible_oracle_exit"] == 0
+        and reference_score["hidden_oracle_exit"] == 0
+        and reference_score["correct"] is True
+    )
+    # Existing R1–R16 tasks only require the original to fail at least one
+    # oracle; R17's candidate-visible probe and parent-only checker require
+    # both original oracles to be red before any comparative trial.
+    historical_reproduced = (
+        base_visible_red and base_hidden_red and reference_both_green
+        if task.hidden_expected_json is not None
+        else not base_score["correct"] and bool(reference_score["correct"])
+    )
+    if not historical_reproduced:
         raise RuntimeError(
             "upstream historical regression is not independently reproducible"
         )
     base_files = snapshot_files(baseline)
     reference_files = snapshot_files(reference)
-    if any(
-        content_identity(base_files.get(path))
-        == content_identity(reference_files.get(path))
+    if base_files != base_before or reference_files != reference_before:
+        raise RuntimeError("preflight oracle changed a pinned source tree")
+    unchanged_editable = {
+        path
         for path in task.editable
+        if content_identity(base_files.get(path))
+        == content_identity(reference_files.get(path))
+    }
+    if not task.editable.difference(unchanged_editable) or (
+        task.require_all_editable_changed and unchanged_editable
     ):
-        raise RuntimeError("reference fix does not modify all required source files")
+        raise RuntimeError("reference fix does not modify required source files")
     added = sorted(
         path
         for path in task.editable
@@ -2315,7 +3395,7 @@ def preflight(task: RepositoryTask, root: Path) -> tuple[Path, dict[str, object]
         and path in reference_files
         and content_identity(base_files[path]) != content_identity(reference_files[path])
     )
-    return baseline, {
+    receipt: dict[str, object] = {
         "base_visible_exit": base_score["visible_oracle_exit"],
         "base_hidden_exit": base_score["hidden_oracle_exit"],
         "reference_visible_exit": reference_score["visible_oracle_exit"],
@@ -2324,6 +3404,46 @@ def preflight(task: RepositoryTask, root: Path) -> tuple[Path, dict[str, object]
         "reference_removed_paths": removed,
         "reference_modified_paths": modified,
     }
+    if task.hidden_expected_json is not None:
+        receipt.update(
+            {
+                "visible_oracle_sha256": hashlib.sha256(
+                    task.visible_source.encode()
+                ).hexdigest(),
+                "hidden_oracle_sha256": hidden_oracle_sha256(task),
+                "hidden_probe_sha256": hashlib.sha256(
+                    task.hidden_source.encode()
+                ).hexdigest(),
+                "hidden_oracle_classification": hidden_oracle_classification(task),
+                "system_python_version": r17_python_version,
+                "system_python_executable": "/usr/bin/python3",
+            }
+        )
+    if task.expected_reference_paths is not None:
+        receipt.update(
+            {
+                "upstream_changed_paths": upstream_changed_paths,
+                "base_editable_sha256": {
+                    path: content_identity(base_files.get(path))
+                    for path in sorted(task.editable)
+                },
+                "reference_editable_sha256": {
+                    path: content_identity(reference_files.get(path))
+                    for path in sorted(task.editable)
+                },
+            }
+        )
+    if runtime_receipt is not None:
+        receipt.update(
+            {
+                "base_sha": task.base_sha,
+                "reference_fix_sha": task.reference_fix_sha,
+                "upstream_pr": task.upstream_pr,
+                "license": task.license,
+                "runtime_overlay": runtime_receipt,
+            }
+        )
+    return baseline, receipt
 
 
 def remove_reference_checkout(root: Path) -> None:
@@ -2443,6 +3563,11 @@ def run_task(
         # Preserve link types instead of following upstream links into any
         # filesystem paths outside the pinned source checkout.
         shutil.copytree(baseline, workspace, symlinks=True)
+        if task.runtime is not None:
+            runtime_receipt = preflight_receipt.get("runtime_overlay")
+            if not isinstance(runtime_receipt, dict):
+                raise RuntimeError("preflight omitted the required runtime receipt")
+            verify_task_runtime(workspace, task.runtime, runtime_receipt)
         original = snapshot_files(workspace)
         validate_editable_paths(original, task.editable, preflight_receipt)
         _stage_chatgpt_access_only(home, account, timeout=timeout)
@@ -2545,7 +3670,12 @@ def run_task(
         cli_seconds = round(time.monotonic() - cli_started, 2)
 
         updated = snapshot_files(workspace)
-        protected, changed = check_edits(original, updated, task.editable)
+        protected, changed = check_edits(
+            original,
+            updated,
+            task.editable,
+            require_all_editable_changed=task.require_all_editable_changed,
+        )
         oracle = check_oracles(workspace, task)
         store = SessionStore(db / "sessions.db")
         aggregated = collect_coding_session_receipts(store, workspace)
@@ -2567,6 +3697,8 @@ def run_task(
         result: dict[str, object] = {
             "task": task_name,
             "source": task.source,
+            "upstream_pr": task.upstream_pr,
+            "license": task.license,
             "base_sha": task.base_sha,
             "reference_fix_sha": task.reference_fix_sha,
             "task_prompt_sha256": hashlib.sha256(task.prompt.encode()).hexdigest(),
@@ -2574,9 +3706,11 @@ def run_task(
             "visible_oracle_sha256": hashlib.sha256(
                 task.visible_source.encode()
             ).hexdigest(),
-            "hidden_oracle_sha256": hashlib.sha256(
+            "hidden_oracle_sha256": hidden_oracle_sha256(task),
+            "hidden_probe_sha256": hashlib.sha256(
                 task.hidden_source.encode()
             ).hexdigest(),
+            "hidden_oracle_classification": hidden_oracle_classification(task),
             "fair_prompt": fair_prompt,
             "preflight": preflight_receipt,
             "ash_head": subprocess.check_output(

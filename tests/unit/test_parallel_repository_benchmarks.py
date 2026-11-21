@@ -24,7 +24,12 @@ from parallel_repository_benchmarks import (  # noqa: E402
     run_pair,
 )
 import parallel_repository_benchmarks as batch_runner  # noqa: E402
-from repository_benchmark import TASKS, shared_user_prompt  # noqa: E402
+from repository_benchmark import (  # noqa: E402
+    TASKS,
+    hidden_oracle_classification,
+    hidden_oracle_sha256,
+    shared_user_prompt,
+)
 
 
 def _emit_receipt(task_name: str, evidence: Path, *, outage: bool = False) -> None:
@@ -42,7 +47,7 @@ def _emit_receipt(task_name: str, evidence: Path, *, outage: bool = False) -> No
             shared_user_prompt(task).encode()
         ).hexdigest(),
         "visible_oracle_sha256": hashlib.sha256(task.visible_source.encode()).hexdigest(),
-        "hidden_oracle_sha256": hashlib.sha256(task.hidden_source.encode()).hexdigest(),
+        "hidden_oracle_sha256": hidden_oracle_sha256(task),
     }
     if evidence.name == "ash":
         (evidence / "result.json").write_text(json.dumps({
@@ -130,6 +135,8 @@ def test_pair_alternates_order_and_validates_external_receipts(
     assert report["ash_pass"] is True
     assert report["codex_pass"] is True
     assert report["timing_available"] is True
+    assert report["fully_controlled"] is False
+    assert report["comparison_scope"] == "operational_qualified"
     assert report["ash_cli_seconds"] == 25.0
     assert report["codex_cli_seconds"] == 30.0
     assert (tmp_path / f"h11-chunk-footer-r{rep:02d}/summary.json").is_file()
@@ -144,6 +151,30 @@ def test_pair_excludes_provider_outage_from_valid_comparisons(tmp_path: Path) ->
     assert report["comparison_verified"] is False
     assert report["reason"] == "provider_outage_or_parity_unverified"
     assert report["runner_exit_codes"] == {"ash": 0, "codex": 1}
+
+
+def test_r17_synthetic_pair_uses_the_standard_grade_path(tmp_path: Path) -> None:
+    task = "pytest-mixed-indirect-fixture-precedence"
+    seen: list[str] = []
+
+    def fake_invoke(argv: list[str], evidence: Path) -> int:
+        seen.append(evidence.name)
+        assert task in argv
+        _emit_receipt(task, evidence)
+        return 0
+
+    report = run_pair(task, 1, tmp_path, 170, 32768, invoke=fake_invoke)
+    assert seen == ["ash", "codex"]
+    assert report["comparison_verified"] is True
+    assert report["fully_controlled"] is False
+    assert report["comparison_scope"] == "operational_qualified"
+    assert report["hidden_oracle_classification"] == hidden_oracle_classification(
+        TASKS[task]
+    )
+    assert report["comparison_caveats"]
+    assert report["ash_pass"] is True
+    assert report["codex_pass"] is True
+    assert (tmp_path / f"{task}-r01/summary.json").is_file()
 
 
 def test_two_scenarios_execute_concurrently_with_separate_evidence(
