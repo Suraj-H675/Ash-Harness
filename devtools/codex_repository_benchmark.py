@@ -12,6 +12,7 @@ import contextlib
 import hashlib
 import json
 import os
+import platform
 import re
 import shlex
 import shutil
@@ -20,6 +21,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import tomllib
 import time
 from pathlib import Path
 from typing import Any, Iterator
@@ -41,24 +43,208 @@ from coding_benchmark import _chatgpt_tmpfs_root
 
 
 MAX_EVENT_BYTES = 32 * 1024 * 1024
+SEALED_PERMISSION_PROFILE = "ash-benchmark-sealed"
+_MANAGED_REQUIREMENTS = Path("/etc/codex/requirements.toml")
+_LOCAL_ATTESTATION = (
+    Path.home() / ".local/state/ash-benchmarks/codex-sealed-profile-attestation.json"
+)
+_REQUIRED_TOOL_OBSERVATIONS = {
+    "host_evaluator": "BLOCKED",
+    "isolated_codex_home_sentinel": "BLOCKED",
+    "network_socket": "BLOCKED",
+    "outside_fake_auth": "BLOCKED",
+    "outside_grader": "BLOCKED",
+    "symlink_escape": "BLOCKED",
+    "visible_test": "PASS",
+    "workspace_read": "ALLOWED",
+    "workspace_write": "ALLOWED",
+}
 _TERMINAL_EVENTS = {"turn.completed", "turn.failed", "turn.cancelled"}
 _SHELLS = frozenset({"bash", "zsh", "sh"})
 
 
+def _read_sealed_metadata(path: Path, *, owner: int, mode: int) -> bytes:
+    """Never follow links or trust other users' editable security metadata."""
+    info = path.lstat()
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != owner:
+        raise RuntimeError("Sealed comparator security metadata has unsafe ownership")
+    if stat.S_IMODE(info.st_mode) != mode or info.st_size > 16 * 1024:
+        raise RuntimeError("Sealed comparator security metadata has unsafe mode/size")
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    with os.fdopen(descriptor, "rb") as stream:
+        opened = os.fstat(stream.fileno())
+        if (opened.st_dev, opened.st_ino) != (info.st_dev, info.st_ino):
+            raise RuntimeError("Sealed comparator metadata changed during open")
+        return stream.read(16 * 1024 + 1)
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def _require_sealed_comparator_profile() -> None:
-    """Stop real model dispatch until its filesystem isolation is proven."""
-    # The current native launcher uses legacy workspace-write permissions.
-    # On the trusted host those permissions can open host-side evaluator code
-    # containing hidden oracles, unrelated source and credential-like files.
-    # Workspace-only copying and network blocking do not fix that read leak.
-    # A future implementation must demonstrate *launcher-enforced* isolation
-    # of both task source and parent-only files before removing this guard.
-    raise RuntimeError(
-        "Plain Codex model trials are disabled: the current workspace-write "
-        "launcher can read host-side hidden graders, reference solutions, "
-        "and credential files. Use --preflight-only until strict model-tool "
-        "filesystem isolation is independently verified."
-    )
+    """Fail closed unless Linux, managed profile and live-tool proof still match.
+
+    The owner-approved one-shot real Luna tool smoke is retained as private
+    machine-local state, not committed to Git or treated as universal proof.
+    Any native binary, policy, architecture, or attestation change blocks
+    further model execution until independently re-attested.
+    """
+    if sys.platform != "linux" or platform.machine() != "x86_64":
+        raise RuntimeError(
+            "Sealed plain-Codex model trials need Linux x86_64 attestation"
+        )
+    try:
+        local_directory = _LOCAL_ATTESTATION.parent
+        owner = os.getuid()
+        directory_stat = local_directory.lstat()
+        if not stat.S_ISDIR(directory_stat.st_mode) or (
+            directory_stat.st_uid != owner
+            or stat.S_IMODE(directory_stat.st_mode) != 0o700
+        ):
+            raise RuntimeError("Sealed comparator attestation directory is not private")
+        attestation = json.loads(
+            _read_sealed_metadata(_LOCAL_ATTESTATION, owner=owner, mode=0o600)
+        )
+        policy_data = _read_sealed_metadata(_MANAGED_REQUIREMENTS, owner=0, mode=0o644)
+        policy = tomllib.loads(policy_data.decode("utf-8"))
+        binary = _native_codex_binary()
+        release_root = Path.home() / ".codex/packages/standalone/releases"
+        profile = policy["permissions"][SEALED_PERMISSION_PROFILE]
+        filesystem = profile["filesystem"]
+        expected_fs = {
+            ":root": "deny",
+            ":minimal": "read",
+            ":tmpdir": "deny",
+            ":slash_tmp": "deny",
+            str(release_root): "read",
+        }
+        valid = (
+            isinstance(attestation, dict)
+            and attestation.get("schema") == 1
+            and attestation.get("platform") == "linux"
+            and attestation.get("machine") == "x86_64"
+            and attestation.get("profile") == SEALED_PERMISSION_PROFILE
+            and attestation.get("independent_live_tool_smoke") is True
+            and attestation.get("live_shell_tool_count") == 1
+            and attestation.get("required_observations") == _REQUIRED_TOOL_OBSERVATIONS
+            and attestation.get("managed_policy_sha256")
+            == hashlib.sha256(policy_data).hexdigest()
+            and attestation.get("native_binary_sha256") == _sha256_file(binary)
+            and policy["allowed_permission_profiles"].get(SEALED_PERMISSION_PROFILE)
+            is True
+            and profile.get("extends") == ":workspace"
+            and filesystem == expected_fs
+            and profile["network"].get("enabled") is False
+            and binary.is_relative_to(release_root)
+        )
+        if not valid:
+            raise RuntimeError(
+                "Sealed comparator managed policy / live-tool proof drifted"
+            )
+    except (OSError, ValueError, KeyError, TypeError, UnicodeError) as error:
+        raise RuntimeError(
+            "Sealed comparator profile unavailable or not independently attested"
+        ) from error
+
+
+_SEALED_SANDBOX_PROBE = r"""
+from pathlib import Path
+import socket, sys, tempfile
+
+parent_sentinel, auth_sentinel, evaluator = map(Path, sys.argv[1:4])
+def blocked(path):
+    try:
+        with path.open("rb") as stream:
+            stream.read(1)
+    except OSError:
+        return True
+    return False
+
+assert all(blocked(p) for p in (parent_sentinel, auth_sentinel, evaluator))
+with tempfile.NamedTemporaryFile(prefix="ash-sealed-write-", dir=Path.cwd()) as item:
+    item.write(b"sandbox write check")
+    item.flush()
+    item.seek(0)
+    assert item.read() == b"sandbox write check"
+try:
+    sock = socket.socket()
+except OSError:
+    pass
+else:
+    sock.close()
+    raise AssertionError("sandbox socket creation unexpectedly allowed")
+print("ASH_SEALED_NO_MODEL_PROBE_OK")
+"""
+
+
+def _probe_effective_sealed_sandbox(
+    executable: Path, workspace: Path, scratch: Path, codex_home: Path
+) -> None:
+    """Independently enforce real file-open/write/socket restrictions per run."""
+    if workspace.is_symlink() or not workspace.resolve().is_relative_to(
+        scratch.resolve()
+    ):
+        raise RuntimeError("Sealed comparator workspace is outside isolated scratch")
+    outside = scratch / ".ash-sealed-parent-sentinel"
+    private = codex_home / ".ash-sealed-auth-sentinel"
+    paths = (outside, private)
+    try:
+        for path in paths:
+            descriptor = os.open(
+                path,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+            )
+            with os.fdopen(descriptor, "wb") as stream:
+                stream.write(b"synthetic-security-probe-only")
+        command = [
+            str(executable),
+            "sandbox",
+            "--include-managed-config",
+            "-P",
+            SEALED_PERMISSION_PROFILE,
+            "-C",
+            str(workspace),
+            "-c",
+            f'default_permissions="{SEALED_PERMISSION_PROFILE}"',
+            "/usr/bin/python3",
+            "-I",
+            "-B",
+            "-S",
+            "-c",
+            _SEALED_SANDBOX_PROBE,
+            str(outside),
+            str(private),
+            str(Path(__file__).resolve()),
+        ]
+        outcome = subprocess.run(
+            command,
+            cwd=workspace,
+            env=_codex_env(scratch, codex_home),
+            capture_output=True,
+            text=True,
+            timeout=12,
+            check=False,
+        )
+        if (
+            outcome.returncode != 0
+            or outcome.stdout.strip() != "ASH_SEALED_NO_MODEL_PROBE_OK"
+        ):
+            raise RuntimeError(
+                "Sealed comparator no-model sandbox read/write/network probe failed"
+            )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise RuntimeError("Sealed comparator sandbox probe unavailable") from error
+    finally:
+        for path in paths:
+            # Only our own exclusive, ordinary sentinel files are ever removed.
+            if path.is_file() and not path.is_symlink():
+                path.unlink()
 
 
 def _exact_test_command(command: str, expected: str) -> bool:
@@ -241,6 +427,49 @@ def _stop_child(child: subprocess.Popen[bytes]) -> None:
     child.wait(timeout=5)
 
 
+def _sealed_codex_argv(
+    executable: Path,
+    workspace: Path,
+    *,
+    model: str,
+    effort: str,
+    context_tokens: int,
+) -> list[str]:
+    """Prepare a plain native Codex invocation without legacy sandbox overrides.
+
+    Constructing argv cannot authorize inference: caller must verify the
+    private live-tool attestation, effective per-run isolation, and explicit
+    operator opt-in before dispatch.
+    """
+    return [
+        str(executable),
+        "exec",
+        "--ignore-user-config",
+        "--ignore-rules",
+        "--ephemeral",
+        "--json",
+        "--color",
+        "never",
+        "-C",
+        str(workspace),
+        "-m",
+        model,
+        "-c",
+        f'default_permissions="{SEALED_PERMISSION_PROFILE}"',
+        "-c",
+        f'model_reasoning_effort="{effort}"',
+        "-c",
+        f"model_context_window={context_tokens}",
+        "-c",
+        'approval_policy="never"',
+        "-c",
+        "features.skip_host_skill_discovery=true",
+        "-c",
+        "features.skill_search=false",
+        "-",
+    ]
+
+
 def _run_codex(
     workspace: Path,
     evidence: Path,
@@ -254,37 +483,16 @@ def _run_codex(
 ) -> dict[str, Any]:
     _require_sealed_comparator_profile()
     executable = _native_codex_binary()
-    argv = [
-        str(executable),
-        "exec",
-        "--ignore-user-config",
-        "--ignore-rules",
-        "--ephemeral",
-        "--json",
-        "--color",
-        "never",
-        "-C",
-        str(workspace),
-        "-m",
-        model,
-        "-s",
-        "workspace-write",
-        "-c",
-        f'model_reasoning_effort="{effort}"',
-        "-c",
-        f"model_context_window={context_tokens}",
-        "-c",
-        'approval_policy="never"',
-        "-c",
-        "sandbox_workspace_write.network_access=false",
-        "-c",
-        "features.skip_host_skill_discovery=true",
-        "-c",
-        "features.skill_search=false",
-        "-",
-    ]
+    argv = _sealed_codex_argv(
+        executable,
+        workspace,
+        model=model,
+        effort=effort,
+        context_tokens=context_tokens,
+    )
     timed_out = False
     with _isolated_codex_profile() as codex_home:
+        _probe_effective_sealed_sandbox(executable, workspace, scratch, codex_home)
         with (
             (evidence / "codex.jsonl").open("wb") as stdout,
             (evidence / "codex.stderr").open("wb") as stderr,
@@ -317,7 +525,11 @@ def _run_codex(
         "codex_model": model,
         "codex_reasoning_effort": effort,
         "context_tokens_requested": context_tokens,
-        "sandbox": "workspace-write",
+        "sandbox": SEALED_PERMISSION_PROFILE,
+        "permissions_profile_requested": SEALED_PERMISSION_PROFILE,
+        "permissions_profile_independently_verified": True,
+        "native_live_tool_smoke_fingerprint_verified": True,
+        "no_model_sandbox_probe_verified": True,
         "approval_policy": "never",
         "network_access_requested": False,
         "ephemeral": True,
@@ -341,8 +553,16 @@ def run_task(
     timeout: int,
     preflight_only: bool = False,
     context_tokens: int = 32768,
+    authorize_model_trial: bool = False,
 ) -> dict[str, Any]:
     """Isolate source, run Codex once at most, and score outside the checkout."""
+    if not preflight_only:
+        if not authorize_model_trial:
+            raise RuntimeError(
+                "Plain Codex model trials require explicit operator authorization"
+            )
+        if (model, effort) != ("gpt-6-luna", "xhigh"):
+            raise RuntimeError("Plain Codex model trials require GPT-6 Luna xhigh")
     task = TASKS[name]
     with tempfile.TemporaryDirectory(prefix="ash-codex-repo-") as temp:
         scratch = Path(temp)
@@ -438,7 +658,9 @@ def run_task(
             "model_requested": model,
             "reasoning_effort_requested": effort,
             "context_tokens_requested": context_tokens,
-            "sandbox": "workspace-write",
+            # A simulated invocation may not report an actual sandbox. Never
+            # manufacture an effective-permission attestation from argv alone.
+            "sandbox": invocation.get("sandbox", "unverified"),
             "shell_command_policy_enforced": False,
             "host_skill_discovery_disabled_requested": True,
             "skill_stack_isolated_verified": False,
@@ -448,7 +670,18 @@ def run_task(
             "memory_backed_auth_copy_cleaned": invocation[
                 "memory_backed_auth_copy_cleaned"
             ],
-            "network_block_independently_verified": False,
+            # Do not treat a requested profile or a mock receipt as proof.
+            # These booleans become true only after the live-tool fingerprint
+            # and separate managed sandbox probe were independently checked.
+            "permissions_profile_independently_verified": bool(
+                invocation.get("permissions_profile_independently_verified", False)
+            ),
+            "native_live_tool_smoke_fingerprint_verified": bool(
+                invocation.get("native_live_tool_smoke_fingerprint_verified", False)
+            ),
+            "network_block_independently_verified": bool(
+                invocation.get("no_model_sandbox_probe_verified", False)
+            ),
             "passed": passed,
             "protected_files_unchanged": protected,
             "required_source_changed": changed,
@@ -490,6 +723,11 @@ def main() -> int:
     parser.add_argument("--context-tokens", type=int, default=32768)
     parser.add_argument("--evidence-dir", type=Path, required=True)
     parser.add_argument("--preflight-only", action="store_true")
+    parser.add_argument(
+        "--authorize-model-trial",
+        action="store_true",
+        help="Explicitly opt into one model-using comparison after owner approval",
+    )
     args = parser.parse_args()
     if not re.fullmatch(r"[a-z0-9][a-z0-9._-]*", args.model):
         parser.error("model must be an explicit simple model ID")
@@ -498,6 +736,12 @@ def main() -> int:
     if not 8192 <= args.context_tokens <= 65536:
         parser.error("context window must be between 8192 and 65536 tokens")
     if not args.preflight_only:
+        if not args.authorize_model_trial:
+            parser.error(
+                "Paid plain-Codex model trials require --authorize-model-trial"
+            )
+        if (args.model, args.reasoning_effort) != ("gpt-6-luna", "xhigh"):
+            parser.error("Matched plain-Codex comparison requires gpt-6-luna xhigh")
         try:
             _require_sealed_comparator_profile()
         except RuntimeError as error:
@@ -522,6 +766,7 @@ def main() -> int:
             timeout=args.timeout,
             preflight_only=args.preflight_only,
             context_tokens=args.context_tokens,
+            authorize_model_trial=args.authorize_model_trial,
         )
     finally:
         os.umask(previous_umask)

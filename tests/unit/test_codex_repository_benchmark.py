@@ -20,12 +20,44 @@ from codex_repository_benchmark import (  # noqa: E402
     _exact_test_command,
     _isolated_codex_profile,
     _native_codex_binary,
+    _sealed_codex_argv,
+    SEALED_PERMISSION_PROFILE,
     run_task,
     summarize_codex_events,
 )
 import codex_repository_benchmark as runner  # noqa: E402
 import repository_benchmark as ash_runner  # noqa: E402
 from repository_benchmark import RepositoryTask, shared_user_prompt  # noqa: E402
+
+
+def test_sealed_plain_codex_argv_has_managed_profile_without_legacy_override(
+    tmp_path: Path,
+) -> None:
+    """Preparing a command must not silently restore the broad host-read mode."""
+    argv = _sealed_codex_argv(
+        Path("/trusted/native/codex"),
+        tmp_path,
+        model="gpt-6-luna",
+        effort="xhigh",
+        context_tokens=32768,
+    )
+    assert argv[:2] == ["/trusted/native/codex", "exec"]
+    assert "--ignore-user-config" in argv
+    assert "--ignore-rules" in argv
+    assert "--ephemeral" in argv
+    assert "-s" not in argv and "--sandbox" not in argv
+    assert "workspace-write" not in argv
+    assert "danger-full-access" not in argv
+    assert "sandbox_workspace_write.network_access=false" not in argv
+    assert f'default_permissions="{SEALED_PERMISSION_PROFILE}"' in argv
+    assert 'approval_policy="never"' in argv
+    assert 'model_reasoning_effort="xhigh"' in argv
+    assert "model_context_window=32768" in argv
+    assert "features.skip_host_skill_discovery=true" in argv
+    assert "features.skill_search=false" in argv
+    assert argv[-1] == "-"
+    assert argv[argv.index("-C") + 1] == str(tmp_path)
+    assert argv[argv.index("-m") + 1] == "gpt-6-luna"
 
 
 @pytest.mark.parametrize(
@@ -111,15 +143,24 @@ def test_codex_routing_outage_is_not_counted_as_coding_failure(
     tmp_path: Path,
 ) -> None:
     path = tmp_path / "codex.jsonl"
-    path.write_text("".join(json.dumps(event) + "\n" for event in [
-        {"type": "thread.started", "thread_id": "test"},
-        {"type": "turn.started"},
-        {"type": "error", "message": "workspace routing discovery timed out"},
-        {"type": "item.completed", "item": {
-            "type": "error", "text": "PRIVATE-AUTH-DATA",
-        }},
-        {"type": "error", "message": "workspace routing discovery failed"},
-    ]))
+    path.write_text(
+        "".join(
+            json.dumps(event) + "\n"
+            for event in [
+                {"type": "thread.started", "thread_id": "test"},
+                {"type": "turn.started"},
+                {"type": "error", "message": "workspace routing discovery timed out"},
+                {
+                    "type": "item.completed",
+                    "item": {
+                        "type": "error",
+                        "text": "PRIVATE-AUTH-DATA",
+                    },
+                },
+                {"type": "error", "message": "workspace routing discovery failed"},
+            ]
+        )
+    )
     result = summarize_codex_events(path, "python3 -B qa_visible.py")
     assert result["infrastructure_unavailable"] is True
     assert result["shell_command_count"] == 0
@@ -130,13 +171,23 @@ def test_codex_routing_error_after_work_does_not_invalidate_trial(
     tmp_path: Path,
 ) -> None:
     path = tmp_path / "codex.jsonl"
-    path.write_text("".join(json.dumps(event) + "\n" for event in [
-        {"type": "error", "message": "workspace routing discovery failed"},
-        {"type": "item.completed", "item": {
-            "type": "command_execution", "command": "pwd", "exit_code": 0,
-            "status": "completed",
-        }},
-    ]))
+    path.write_text(
+        "".join(
+            json.dumps(event) + "\n"
+            for event in [
+                {"type": "error", "message": "workspace routing discovery failed"},
+                {
+                    "type": "item.completed",
+                    "item": {
+                        "type": "command_execution",
+                        "command": "pwd",
+                        "exit_code": 0,
+                        "status": "completed",
+                    },
+                },
+            ]
+        )
+    )
     result = summarize_codex_events(path, "python3 -B qa_visible.py")
     assert result["infrastructure_unavailable"] is False
     assert result["shell_command_count"] == 1
@@ -243,7 +294,10 @@ def test_unsealed_plain_codex_model_dispatch_fails_before_host_or_auth_access(
     monkeypatch.setattr(runner, "_native_codex_binary", unexpected_call)
     monkeypatch.setattr(runner, "_isolated_codex_profile", unexpected_call)
     monkeypatch.setattr(runner.subprocess, "Popen", unexpected_call)
-    with pytest.raises(RuntimeError, match="host-side hidden graders"):
+    private = tmp_path / "attestation"
+    private.mkdir(mode=0o700)
+    monkeypatch.setattr(runner, "_LOCAL_ATTESTATION", private / "absent.json")
+    with pytest.raises(RuntimeError, match="not independently attested"):
         runner._run_codex(
             tmp_path / "task-workspace",
             tmp_path / "evidence",
@@ -256,22 +310,31 @@ def test_unsealed_plain_codex_model_dispatch_fails_before_host_or_auth_access(
 
 
 def test_unsealed_plain_codex_cli_refuses_before_making_evidence(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     evidence = tmp_path / "should-not-exist"
-    monkeypatch.setattr(sys, "argv", [
-        "codex_repository_benchmark.py", "--task", "h11-chunk-footer",
-        "--evidence-dir", str(evidence),
-    ])
     monkeypatch.setattr(
-        runner, "_native_codex_binary",
+        sys,
+        "argv",
+        [
+            "codex_repository_benchmark.py",
+            "--task",
+            "h11-chunk-footer",
+            "--evidence-dir",
+            str(evidence),
+        ],
+    )
+    monkeypatch.setattr(
+        runner,
+        "_native_codex_binary",
         lambda: pytest.fail("unsealed CLI attempted native model setup"),
     )
     with pytest.raises(SystemExit) as exit_info:
         runner.main()
     assert exit_info.value.code == 2
-    assert "host-side hidden graders" in capsys.readouterr().err
+    assert "require --authorize-model-trial" in capsys.readouterr().err
     assert not evidence.exists()
 
 
@@ -311,9 +374,10 @@ def test_codex_timeout_terminates_process_group_without_leaking_keys(
         isolated.mkdir()
         yield isolated
 
-    # This simulated child exercises process-group cleanup, not model-trial
-    # authorization. Production dispatch remains blocked by the separate gate.
+    # This simulated child exercises process-group cleanup, not actual model
+    # authorization or sandbox isolation. Security checks are stubbed only here.
     monkeypatch.setattr(runner, "_require_sealed_comparator_profile", lambda: None)
+    monkeypatch.setattr(runner, "_probe_effective_sealed_sandbox", lambda *_args: None)
     monkeypatch.setattr(
         runner, "_native_codex_binary", lambda: Path("/usr/bin/codex-real")
     )
@@ -342,7 +406,8 @@ def test_codex_timeout_terminates_process_group_without_leaking_keys(
     assert "features.skip_host_skill_discovery=true" in child_args
     assert "features.skill_search=false" in child_args
     assert "model_context_window=32768" in child_args
-    assert "workspace-write" in child_args
+    assert 'default_permissions="ash-benchmark-sealed"' in child_args
+    assert "-s" not in child_args and "--sandbox" not in child_args
     assert "PRIVATE-SENTINEL" not in repr(child_env)
     assert child_env["CODEX_HOME"] == str(tmp_path / "isolated-codex-home")
     assert child_args[0] == "/usr/bin/codex-real"
@@ -436,6 +501,7 @@ def test_scoring_rejects_modified_oracle_and_cleans_scratch(
         model="gpt-6-luna",
         effort="xhigh",
         timeout=170,
+        authorize_model_trial=True,  # mock executor only; no model call
     )
     assert result["passed"] is not tamper_visible
     assert result["protected_files_unchanged"] is not tamper_visible
@@ -540,6 +606,7 @@ def test_codex_scoring_accepts_new_editable_source_modules(
         model="gpt-6-luna",
         effort="xhigh",
         timeout=170,
+        authorize_model_trial=True,  # mock executor only; no model call
     )
     assert result["passed"] is True
     assert result["protected_files_unchanged"] is True
@@ -591,9 +658,7 @@ def test_r17_codex_fake_grade_accepts_one_semantic_source_repair(
             for path in workspace.rglob("*")
             if path.is_file()
         )
-        (workspace / "src/_pytest/fixtures.py").write_text(
-            "repaired", encoding="utf-8"
-        )
+        (workspace / "src/_pytest/fixtures.py").write_text("repaired", encoding="utf-8")
         events = [
             {
                 "type": "item.completed",
@@ -640,6 +705,7 @@ def test_r17_codex_fake_grade_accepts_one_semantic_source_repair(
         model="gpt-6-luna",
         effort="xhigh",
         timeout=30,
+        authorize_model_trial=True,  # mock executor only; no model call
     )
     assert result["passed"] is True
     assert result["required_source_changed"] is True
@@ -650,9 +716,229 @@ def test_r17_codex_fake_grade_accepts_one_semantic_source_repair(
     manifest = json.loads((evidence / "manifest.json").read_text())
     assert manifest["license"] == "MIT"
     assert manifest["hidden_oracle_sha256"] == runner.hidden_oracle_sha256(task)
-    assert manifest["hidden_probe_sha256"] == hashlib.sha256(
-        task.hidden_source.encode()
-    ).hexdigest()
+    assert (
+        manifest["hidden_probe_sha256"]
+        == hashlib.sha256(task.hidden_source.encode()).hexdigest()
+    )
     assert manifest["hidden_oracle_classification"] == (
         "arm-sealed-authored-parent-checker; not an independent holdout"
     )
+
+
+def test_no_paid_trial_without_explicit_approval_before_preflight(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        runner,
+        "preflight",
+        lambda *_args: pytest.fail("unauthorized trial ran preflight"),
+    )
+    with pytest.raises(RuntimeError, match="explicit operator authorization"):
+        runner.run_task(
+            "h11-chunk-footer",
+            evidence=tmp_path / "evidence",
+            model="gpt-6-luna",
+            effort="xhigh",
+            timeout=40,
+        )
+    with pytest.raises(RuntimeError, match="GPT-6 Luna xhigh"):
+        runner.run_task(
+            "h11-chunk-footer",
+            evidence=tmp_path / "evidence",
+            model="gpt-6-something",
+            effort="xhigh",
+            timeout=40,
+            authorize_model_trial=True,
+        )
+
+
+def test_sealed_metadata_rejects_symlinks_and_mode_changes(tmp_path: Path) -> None:
+    metadata = tmp_path / "attestation.json"
+    metadata.write_text('"synthetic"')
+    metadata.chmod(0o600)
+    assert runner._read_sealed_metadata(
+        metadata, owner=metadata.stat().st_uid, mode=0o600
+    )
+    alias = tmp_path / "alias.json"
+    alias.symlink_to(metadata)
+    with pytest.raises(RuntimeError, match="unsafe ownership"):
+        runner._read_sealed_metadata(alias, owner=metadata.stat().st_uid, mode=0o600)
+    metadata.chmod(0o644)
+    with pytest.raises(RuntimeError, match="unsafe mode"):
+        runner._read_sealed_metadata(metadata, owner=metadata.stat().st_uid, mode=0o600)
+
+
+def test_sealed_profile_requires_matching_attestation_and_managed_policy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import platform
+
+    user = tmp_path / "user"
+    attest_dir = user / ".local/state/ash-benchmarks"
+    attest_dir.mkdir(parents=True, mode=0o700)
+    attest_file = attest_dir / "codex-sealed-profile-attestation.json"
+    binary = user / ".codex/packages/standalone/releases/version/bin/codex"
+    binary.parent.mkdir(parents=True)
+    binary.write_bytes(b"\x7fELFfake")
+    release_root = user / ".codex/packages/standalone/releases"
+    managed = tmp_path / "requirements.toml"
+    lines = [
+        "[allowed_permission_profiles]",
+        '"ash-benchmark-sealed" = true',
+        "[permissions.ash-benchmark-sealed]",
+        'extends = ":workspace"',
+        "[permissions.ash-benchmark-sealed.filesystem]",
+        '":root" = "deny"',
+        '":minimal" = "read"',
+        '":tmpdir" = "deny"',
+        '":slash_tmp" = "deny"',
+        f'"{release_root}" = "read"',
+        "[permissions.ash-benchmark-sealed.network]",
+        "enabled = false",
+    ]
+    raw = ("\n".join(lines) + "\n").encode()
+    profile = {
+        "schema": 1,
+        "platform": "linux",
+        "machine": "x86_64",
+        "profile": runner.SEALED_PERMISSION_PROFILE,
+        "independent_live_tool_smoke": True,
+        "live_shell_tool_count": 1,
+        "required_observations": runner._REQUIRED_TOOL_OBSERVATIONS,
+        "managed_policy_sha256": hashlib.sha256(raw).hexdigest(),
+        "native_binary_sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
+    }
+    attest_file.write_text(json.dumps(profile))
+    attest_file.chmod(0o600)
+    actual_reader = runner._read_sealed_metadata
+
+    def read(path: Path, *, owner: int, mode: int) -> bytes:
+        if path == managed:
+            assert (owner, mode) == (0, 0o644)
+            return raw
+        return actual_reader(path, owner=owner, mode=mode)
+
+    monkeypatch.setattr(runner, "_LOCAL_ATTESTATION", attest_file)
+    monkeypatch.setattr(runner, "_MANAGED_REQUIREMENTS", managed)
+    monkeypatch.setattr(runner, "_read_sealed_metadata", read)
+    monkeypatch.setattr(runner, "_native_codex_binary", lambda: binary)
+    monkeypatch.setattr(
+        runner, "_sha256_file", lambda _binary: profile["native_binary_sha256"]
+    )
+    monkeypatch.setattr(runner.Path, "home", lambda: user)
+    monkeypatch.setattr(runner.sys, "platform", "linux")
+    monkeypatch.setattr(platform, "machine", lambda: "x86_64")
+    runner._require_sealed_comparator_profile()
+
+    profile["required_observations"] = dict(profile["required_observations"])
+    profile["required_observations"]["outside_grader"] = "ALLOWED"
+    attest_file.write_text(json.dumps(profile))
+    with pytest.raises(RuntimeError, match="proof drifted"):
+        runner._require_sealed_comparator_profile()
+    profile["required_observations"]["outside_grader"] = "BLOCKED"
+    attest_file.write_text(json.dumps(profile))
+
+    def bad_read(path: Path, *, owner: int, mode: int) -> bytes:
+        if path == managed:
+            return raw + b"\n# policy changed"
+        return actual_reader(path, owner=owner, mode=mode)
+
+    monkeypatch.setattr(runner, "_read_sealed_metadata", bad_read)
+    with pytest.raises(RuntimeError, match="proof drifted"):
+        runner._require_sealed_comparator_profile()
+    monkeypatch.setattr(runner.sys, "platform", "darwin")
+    with pytest.raises(RuntimeError, match="Linux x86_64"):
+        runner._require_sealed_comparator_profile()
+
+
+def test_sealed_no_model_probe_checks_actual_command_and_cleans_sentinels(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    scratch = tmp_path / "scratch"
+    workspace = scratch / "workspace"
+    auth_home = tmp_path / "private-auth"
+    workspace.mkdir(parents=True)
+    auth_home.mkdir()
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append((command, kwargs))
+        assert command[1:7] == [
+            "sandbox",
+            "--include-managed-config",
+            "-P",
+            "ash-benchmark-sealed",
+            "-C",
+            str(workspace),
+        ]
+        assert command[-3] == str(scratch / ".ash-sealed-parent-sentinel")
+        assert command[-2] == str(auth_home / ".ash-sealed-auth-sentinel")
+        assert command[-1].endswith("devtools/codex_repository_benchmark.py")
+        assert (scratch / ".ash-sealed-parent-sentinel").is_file()
+        assert (auth_home / ".ash-sealed-auth-sentinel").is_file()
+        assert kwargs["env"]["CODEX_HOME"] == str(auth_home)
+        return subprocess.CompletedProcess(
+            command, 0, "ASH_SEALED_NO_MODEL_PROBE_OK\n", ""
+        )
+
+    monkeypatch.setattr(runner.subprocess, "run", fake_run)
+    runner._probe_effective_sealed_sandbox(
+        Path("/trusted/codex"), workspace, scratch, auth_home
+    )
+    assert len(calls) == 1
+    assert not (scratch / ".ash-sealed-parent-sentinel").exists()
+    assert not (auth_home / ".ash-sealed-auth-sentinel").exists()
+
+    def wrong_result(command, **kwargs):
+        return subprocess.CompletedProcess(command, 0, "UNVERIFIED", "")
+
+    monkeypatch.setattr(runner.subprocess, "run", wrong_result)
+    with pytest.raises(RuntimeError, match="probe failed"):
+        runner._probe_effective_sealed_sandbox(
+            Path("/trusted/codex"), workspace, scratch, auth_home
+        )
+    assert not (scratch / ".ash-sealed-parent-sentinel").exists()
+    assert not (auth_home / ".ash-sealed-auth-sentinel").exists()
+
+
+def test_explicit_opt_in_passes_one_trial_authorization_without_model(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    evidence = tmp_path / "evidence"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "codex_repository_benchmark.py",
+            "--task",
+            "pytest-mro-marker-precedence",
+            "--model",
+            "gpt-6-luna",
+            "--reasoning-effort",
+            "xhigh",
+            "--evidence-dir",
+            str(evidence),
+            "--authorize-model-trial",
+        ],
+    )
+    monkeypatch.setattr(runner, "_require_sealed_comparator_profile", lambda: None)
+    monkeypatch.setattr(
+        runner, "_native_codex_binary", lambda: Path("/mock/native/codex")
+    )
+    monkeypatch.setattr(runner, "_chatgpt_tmpfs_root", lambda: tmp_path)
+    monkeypatch.setattr(runner.shutil, "which", lambda name: f"/usr/bin/{name}")
+    invoked = []
+
+    def fake_run(task, *, evidence, **kwargs):
+        invoked.append((task, evidence, kwargs))
+        return {"task": task, "passed": True, "preflight": {}, "ran_model": False}
+
+    monkeypatch.setattr(runner, "run_task", fake_run)
+    assert runner.main() == 0
+    assert evidence.is_dir()
+    assert len(invoked) == 1
+    assert invoked[0][0] == "pytest-mro-marker-precedence"
+    assert invoked[0][2]["authorize_model_trial"] is True
+    assert invoked[0][2]["preflight_only"] is False
+    assert invoked[0][2]["model"] == "gpt-6-luna"
+    assert invoked[0][2]["effort"] == "xhigh"
