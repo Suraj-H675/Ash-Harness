@@ -2197,6 +2197,16 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                         flush=True,
                     )
                     continue
+                maximum = max(
+                    1,
+                    int(
+                        getattr(
+                            loop,
+                            "_last_context_maximum",
+                            config.max_context_tokens - config.max_completion_tokens,
+                        )
+                    ),
+                )
                 budget = _render_context_budget(loop._last_context_budget)
                 budget_suffix = f"\n{budget}" if budget else ""
                 diagnostics: dict[str, Any] = {}
@@ -2210,7 +2220,8 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                         diagnostics = {}
                 rendered_diagnostics = _render_context_diagnostics(diagnostics)
                 print(
-                    f"Context: summary={'yes' if has_summary else 'no'}\n"
+                    f"Context: ~{loop._last_context_tokens}/{maximum} input tokens; "
+                    f"summary={'yes' if has_summary else 'no'}\n"
                     f"{rendered_diagnostics}{budget_suffix}",
                     flush=True,
                 )

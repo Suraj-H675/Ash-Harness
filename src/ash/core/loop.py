@@ -2171,7 +2171,8 @@ class AshLoop:
 
     def _emit_event(self, payload: dict[str, Any]) -> None:
         event = self._envelope_event(payload)
-        self.ui.emit_event(event)
+        if self.ui is not None:
+            self.ui.emit_event(event)
         if self._event_observer is not None and not self._event_observer_failed:
             try:
                 self._event_observer.on_event(_observer_event_projection(event))

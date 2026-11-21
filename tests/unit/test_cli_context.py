@@ -388,7 +388,7 @@ async def test_context_command_reads_current_session_events_after_session_switch
     context_positions = [
         position
         for position in range(len(rendered))
-        if rendered.startswith("Context: summary=", position)
+        if rendered.startswith("Context: ~", position)
     ]
     assert len(context_positions) == 2
     first_view = rendered[context_positions[0] : context_positions[1]]

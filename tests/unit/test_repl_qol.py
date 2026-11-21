@@ -848,6 +848,9 @@ async def test_context_command_uses_effective_runtime_ceiling(
     output = capsys.readouterr().out
     assert "Context: ~0/1024 input tokens" in output
     assert "Context: ~0/3584 input tokens" not in output
+    assert "Last recorded request assembly: unavailable" in output
+    assert "Last dispatched request attempt: unavailable" in output
+    assert "Last persisted turn cumulative usage: unavailable" in output
 
 
 @pytest.mark.asyncio
