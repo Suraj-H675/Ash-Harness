@@ -232,6 +232,49 @@ def test_native_codex_resolver_accepts_stock_binary_without_custom_alias(
     assert _native_codex_binary() == native
 
 
+def test_unsealed_plain_codex_model_dispatch_fails_before_host_or_auth_access(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A real model launch must never proceed under the broad host-read profile."""
+
+    def unexpected_call(*_args: object, **_kwargs: object) -> None:
+        pytest.fail("unsealed dispatch reached native binary, profile, or process")
+
+    monkeypatch.setattr(runner, "_native_codex_binary", unexpected_call)
+    monkeypatch.setattr(runner, "_isolated_codex_profile", unexpected_call)
+    monkeypatch.setattr(runner.subprocess, "Popen", unexpected_call)
+    with pytest.raises(RuntimeError, match="host-side hidden graders"):
+        runner._run_codex(
+            tmp_path / "task-workspace",
+            tmp_path / "evidence",
+            model="gpt-6-luna",
+            effort="xhigh",
+            timeout=40,
+            prompt="ordinary benchmark repair",
+            scratch=tmp_path,
+        )
+
+
+def test_unsealed_plain_codex_cli_refuses_before_making_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    evidence = tmp_path / "should-not-exist"
+    monkeypatch.setattr(sys, "argv", [
+        "codex_repository_benchmark.py", "--task", "h11-chunk-footer",
+        "--evidence-dir", str(evidence),
+    ])
+    monkeypatch.setattr(
+        runner, "_native_codex_binary",
+        lambda: pytest.fail("unsealed CLI attempted native model setup"),
+    )
+    with pytest.raises(SystemExit) as exit_info:
+        runner.main()
+    assert exit_info.value.code == 2
+    assert "host-side hidden graders" in capsys.readouterr().err
+    assert not evidence.exists()
+
+
 def test_codex_timeout_terminates_process_group_without_leaking_keys(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -268,6 +311,9 @@ def test_codex_timeout_terminates_process_group_without_leaking_keys(
         isolated.mkdir()
         yield isolated
 
+    # This simulated child exercises process-group cleanup, not model-trial
+    # authorization. Production dispatch remains blocked by the separate gate.
+    monkeypatch.setattr(runner, "_require_sealed_comparator_profile", lambda: None)
     monkeypatch.setattr(
         runner, "_native_codex_binary", lambda: Path("/usr/bin/codex-real")
     )

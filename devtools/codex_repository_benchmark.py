@@ -45,6 +45,22 @@ _TERMINAL_EVENTS = {"turn.completed", "turn.failed", "turn.cancelled"}
 _SHELLS = frozenset({"bash", "zsh", "sh"})
 
 
+def _require_sealed_comparator_profile() -> None:
+    """Stop real model dispatch until its filesystem isolation is proven."""
+    # The current native launcher uses legacy workspace-write permissions.
+    # On the trusted host those permissions can open host-side evaluator code
+    # containing hidden oracles, unrelated source and credential-like files.
+    # Workspace-only copying and network blocking do not fix that read leak.
+    # A future implementation must demonstrate *launcher-enforced* isolation
+    # of both task source and parent-only files before removing this guard.
+    raise RuntimeError(
+        "Plain Codex model trials are disabled: the current workspace-write "
+        "launcher can read host-side hidden graders, reference solutions, "
+        "and credential files. Use --preflight-only until strict model-tool "
+        "filesystem isolation is independently verified."
+    )
+
+
 def _exact_test_command(command: str, expected: str) -> bool:
     """Do not mistake a shell compound command containing the test for it."""
     try:
@@ -236,6 +252,7 @@ def _run_codex(
     scratch: Path,
     context_tokens: int = 32768,
 ) -> dict[str, Any]:
+    _require_sealed_comparator_profile()
     executable = _native_codex_binary()
     argv = [
         str(executable),
@@ -481,6 +498,10 @@ def main() -> int:
     if not 8192 <= args.context_tokens <= 65536:
         parser.error("context window must be between 8192 and 65536 tokens")
     if not args.preflight_only:
+        try:
+            _require_sealed_comparator_profile()
+        except RuntimeError as error:
+            parser.error(str(error))
         try:
             _native_codex_binary()
             _chatgpt_tmpfs_root()
