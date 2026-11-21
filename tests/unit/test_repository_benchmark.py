@@ -293,6 +293,18 @@ def test_headless_error_category_refuses_untrusted_or_large_output(
             "https://github.com/pytest-dev/pytest.git",
             {"src/_pytest/fixtures.py", "src/_pytest/python.py"},
         ),
+        (
+            "pytest-mro-marker-precedence",
+            "https://github.com/pytest-dev/pytest.git",
+            {
+                "src/_pytest/compat.py",
+                "src/_pytest/fixtures.py",
+                "src/_pytest/mark/structures.py",
+                "src/_pytest/nodes.py",
+                "src/_pytest/python.py",
+                "src/_pytest/warnings.py",
+            },
+        ),
     ],
 )
 def test_upstream_tasks_are_pinned_and_oracles_sealed(
@@ -306,7 +318,12 @@ def test_upstream_tasks_are_pinned_and_oracles_sealed(
     assert task.editable == editable
     assert task.visible_script == "qa_visible.py"
     assert task.visible_script not in task.editable
-    assert task.command_grant == "python3 -B qa_visible.py"
+    expected_command = (
+        "/usr/bin/python3 -B qa_visible.py"
+        if task_id == "pytest-mro-marker-precedence"
+        else "python3 -B qa_visible.py"
+    )
+    assert task.command_grant == expected_command
     assert task.hidden_source != task.visible_source
     assert task.hidden_source not in task.prompt
     compile(task.visible_source, task.visible_script, "exec")
@@ -408,6 +425,110 @@ def test_pytest_r17_provenance_scope_and_runtime_contract() -> None:
         assert "pytest-dev/pytest/pull/13976" not in model_input
     compile(task.visible_source, task.visible_script, "exec")
     compile(task.hidden_source, "<r17-sealed-oracle>", "exec")
+
+
+def test_pytest_mro_marker_provenance_scope_and_model_inputs() -> None:
+    task = bench.TASKS["pytest-mro-marker-precedence"]
+    assert task.source == "pytest-dev/pytest"
+    assert task.base_sha == "6665a79fb9a6553ce4e1be5574c21a9e3b769eec"
+    assert task.reference_fix_sha == "9255aa01e48f47be636987293471a5b102d78c26"
+    assert task.upstream_pr == "https://github.com/pytest-dev/pytest/pull/14630"
+    assert task.license == "MIT"
+    assert task.require_all_editable_changed is False
+    assert task.require_both_oracles_red_green is True
+    assert task.hidden_expected_json is None
+    assert task.command_grant == "/usr/bin/python3 -B qa_visible.py"
+    assert task.editable == frozenset(
+        {
+            "src/_pytest/compat.py",
+            "src/_pytest/fixtures.py",
+            "src/_pytest/mark/structures.py",
+            "src/_pytest/nodes.py",
+            "src/_pytest/python.py",
+            "src/_pytest/warnings.py",
+        }
+    )
+    assert task.expected_reference_paths == frozenset(
+        {
+            "AUTHORS",
+            "changelog/10406.bugfix.rst",
+            "changelog/14329.bugfix.rst",
+            "changelog/14630.improvement.rst",
+            "doc/en/how-to/capture-warnings.rst",
+            "src/_pytest/compat.py",
+            "src/_pytest/fixtures.py",
+            "src/_pytest/mark/structures.py",
+            "src/_pytest/nodes.py",
+            "src/_pytest/python.py",
+            "src/_pytest/warnings.py",
+            "testing/test_mark.py",
+            "testing/test_skipping.py",
+            "testing/test_warnings.py",
+        }
+    )
+    assert task.editable < task.expected_reference_paths
+    assert task.runtime is bench.PYTEST_MRO_MARKER_RUNTIME
+    assert task.runtime.packages == bench.PYTEST_R17_RUNTIME.packages
+    assert task.runtime.trusted_overlay_sha256 == (
+        bench.PYTEST_R17_RUNTIME.trusted_overlay_sha256
+    )
+    assert task.runtime.generated_files[0][0] == "src/_pytest/_version.py"
+    assert b'__version__ = version = "9.2.0.dev0"' in task.runtime.generated_files[0][1]
+    assert b'__version__ = version = "9.1.0.dev0"' in (
+        bench.PYTEST_R17_RUNTIME.generated_files[0][1]
+    )
+    assert hashlib.sha256(task.runtime.generated_files[0][1]).hexdigest() == (
+        "28ad86e114ac1647616fba69090c6af3a4c12729214da7e86402a1f2f8324754"
+    )
+    assert bench.hidden_oracle_classification(task) == (
+        "arm-sealed-authored-inline-oracle"
+    )
+    assert bench.hidden_oracle_sha256(task) == hashlib.sha256(
+        task.hidden_source.encode()
+    ).hexdigest()
+    for model_input in (
+        task.prompt,
+        bench.shared_user_prompt(task),
+        task.visible_source,
+    ):
+        assert task.hidden_source not in model_input
+        assert task.reference_fix_sha not in model_input
+        assert "pytest-dev/pytest/pull/14630" not in model_input
+        assert "test_plugin_marker_keeps_mro_order" not in model_input
+        assert "test_inherited_fixture_and_parametrize_order" not in model_input
+        assert "marker warning" not in model_input
+    assert task.hidden_source not in task.visible_source
+    compile(task.visible_source, task.visible_script, "exec")
+    compile(task.hidden_source, "<pytest-mro-marker-hidden>", "exec")
+
+
+def test_pytest_mro_task_protects_each_nonproduction_reference_path() -> None:
+    task = bench.TASKS["pytest-mro-marker-precedence"]
+    assert task.expected_reference_paths is not None
+    editable_path = sorted(task.editable)[0]
+
+    original = {editable_path: "production before", **{
+        path: "protected original"
+        for path in task.expected_reference_paths - task.editable
+    }}
+    editable_only = dict(original)
+    editable_only[editable_path] = "production after"
+    assert bench.check_edits(
+        original,
+        editable_only,
+        task.editable,
+        require_all_editable_changed=task.require_all_editable_changed,
+    ) == (True, True)
+
+    for protected_path in task.expected_reference_paths - task.editable:
+        tampered = dict(editable_only)
+        tampered[protected_path] = "protected tamper"
+        assert bench.check_edits(
+            original,
+            tampered,
+            task.editable,
+            require_all_editable_changed=task.require_all_editable_changed,
+        ) == (False, True), protected_path
 
 
 @pytest.mark.parametrize("task_id", tuple(bench.TASKS))
@@ -739,6 +860,36 @@ def test_r17_hidden_oracle_is_run_in_memory_and_never_written(
     assert calls == [(task.visible_script, None), (None, task.hidden_source)]
 
 
+def test_pytest_mro_hidden_oracle_runs_in_memory_only(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task = bench.TASKS["pytest-mro-marker-precedence"]
+    (tmp_path / task.visible_script).write_text(
+        task.visible_source, encoding="utf-8"
+    )
+    calls: list[tuple[str | None, str | None]] = []
+
+    def fake_oracle(
+        workspace: Path, script: str | None = None, *, code: str | None = None
+    ) -> subprocess.CompletedProcess[str]:
+        assert workspace == tmp_path
+        calls.append((script, code))
+        assert sorted(path.name for path in workspace.iterdir()) == [
+            task.visible_script
+        ]
+        return subprocess.CompletedProcess([], 0, "oracle passed", "")
+
+    monkeypatch.setattr(bench, "oracle_python", fake_oracle)
+    result = bench.check_oracles(tmp_path, task)
+
+    assert result["correct"] is True
+    assert calls == [(task.visible_script, None), (None, task.hidden_source)]
+    assert task.hidden_source not in (tmp_path / task.visible_script).read_text(
+        encoding="utf-8"
+    )
+
+
 def test_r17_parent_expectations_are_absent_from_candidate_process_surfaces(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -892,6 +1043,39 @@ def test_r17_runtime_overlay_is_lock_verified_deterministic_and_ignored_neutral(
     (baseline / ".benchmark_runtime/site/stray.so").write_bytes(b"not executable")
     with pytest.raises(RuntimeError, match="unexpected file set"):
         bench.verify_task_runtime(baseline, task.runtime, baseline_receipt)
+
+
+def test_pytest_mro_runtime_reuses_locked_overlay_with_pinned_generated_version(
+    tmp_path: Path,
+) -> None:
+    task = bench.TASKS["pytest-mro-marker-precedence"]
+    baseline = tmp_path / "baseline"
+    reference = tmp_path / "reference"
+    _git_ignored_pytest_tree(baseline)
+    _git_ignored_pytest_tree(reference)
+
+    baseline_receipt = bench.materialize_task_runtime(baseline, task.runtime)
+    reference_receipt = bench.materialize_task_runtime(reference, task.runtime)
+
+    assert baseline_receipt == reference_receipt
+    assert baseline_receipt["overlay_sha256"] == (
+        bench.PYTEST_R17_RUNTIME.trusted_overlay_sha256
+    )
+    assert baseline_receipt["generated_files"] == {
+        "src/_pytest/_version.py": (
+            "28ad86e114ac1647616fba69090c6af3a4c12729214da7e86402a1f2f8324754"
+        )
+    }
+    assert task.runtime is not bench.PYTEST_R17_RUNTIME
+    assert task.runtime.packages == bench.PYTEST_R17_RUNTIME.packages
+    assert task.runtime.generated_files[0][1] != (
+        bench.PYTEST_R17_RUNTIME.generated_files[0][1]
+    )
+    for tree in (baseline, reference):
+        version_file = tree / "src/_pytest/_version.py"
+        assert "9.2.0.dev0" in version_file.read_text(encoding="utf-8")
+        assert "9.1.0.dev0" not in version_file.read_text(encoding="utf-8")
+        bench.verify_task_runtime(tree, task.runtime, baseline_receipt)
 
 
 def test_r17_runtime_refuses_package_symlinks_and_special_files(
@@ -1445,6 +1629,95 @@ def test_preflight_requires_red_base_and_green_upstream_fix(
     (tmp_path / "linked").mkdir()
     with pytest.raises(RuntimeError, match="contains a symlink"):
         bench.preflight(task, tmp_path / "linked")
+
+
+@pytest.mark.parametrize(
+    ("base_status", "reference_status", "accepted"),
+    [
+        ((1, 0), (0, 0), False),
+        ((0, 1), (0, 0), False),
+        ((1, 1), (0, 1), False),
+        ((1, 1), (1, 0), False),
+        ((1, 1), (0, 0), True),
+    ],
+)
+def test_strict_task_requires_both_oracles_red_and_green(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    base_status: tuple[int, int],
+    reference_status: tuple[int, int],
+    accepted: bool,
+) -> None:
+    task = replace(
+        bench.TASKS["pytest-mro-marker-precedence"],
+        editable=frozenset({"src/_pytest/nodes.py"}),
+        runtime=None,
+        expected_reference_paths=None,
+    )
+    assert task.hidden_expected_json is None
+    monkeypatch.setattr(bench, "_verify_r17_python_command_parity", lambda: None)
+    monkeypatch.setattr(bench, "_attest_r17_system_python_version", lambda: "3.14.10")
+
+    def fake_fetch(destination: Path, _task: object, sha: str) -> None:
+        destination.mkdir()
+        source = destination / "src/_pytest/nodes.py"
+        source.parent.mkdir(parents=True)
+        source.write_text(sha, encoding="utf-8")
+
+    def fake_grade(workspace: Path, _task: object) -> dict[str, object]:
+        visible, hidden = (
+            base_status if workspace.name == "baseline" else reference_status
+        )
+        return {
+            "correct": visible == 0 and hidden == 0,
+            "visible_oracle_exit": visible,
+            "hidden_oracle_exit": hidden,
+        }
+
+    monkeypatch.setattr(bench, "fetch_pinned", fake_fetch)
+    monkeypatch.setattr(bench, "check_oracles", fake_grade)
+    if not accepted:
+        with pytest.raises(RuntimeError, match="not independently reproducible"):
+            bench.preflight(task, tmp_path)
+        return
+
+    _baseline, proof = bench.preflight(task, tmp_path)
+    assert proof["base_visible_exit"] == 1
+    assert proof["base_hidden_exit"] == 1
+    assert proof["reference_visible_exit"] == 0
+    assert proof["reference_hidden_exit"] == 0
+    assert proof["system_python_version"] == "3.14.10"
+    assert proof["system_python_executable"] == "/usr/bin/python3"
+    assert proof["hidden_oracle_classification"] == (
+        "arm-sealed-authored-inline-oracle"
+    )
+
+
+def test_pytest_mro_preflight_refuses_symlinks_before_oracles(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task = bench.TASKS["pytest-mro-marker-precedence"]
+    monkeypatch.setattr(bench, "_verify_r17_python_command_parity", lambda: None)
+    monkeypatch.setattr(bench, "_attest_r17_system_python_version", lambda: "3.14.10")
+    oracle_calls = 0
+
+    def fake_fetch(destination: Path, _task: object, sha: str) -> None:
+        destination.mkdir()
+        source = destination / "src/_pytest/nodes.py"
+        source.parent.mkdir(parents=True)
+        source.write_text(sha, encoding="utf-8")
+        (destination / "unsafe-link").symlink_to("missing-target")
+
+    def unexpected_oracle(workspace: Path, _task: object) -> dict[str, object]:
+        nonlocal oracle_calls
+        oracle_calls += 1
+        pytest.fail("preflight must reject symlinks before running oracles")
+
+    monkeypatch.setattr(bench, "fetch_pinned", fake_fetch)
+    monkeypatch.setattr(bench, "check_oracles", unexpected_oracle)
+    with pytest.raises(RuntimeError, match="contains a symlink"):
+        bench.preflight(task, tmp_path)
+    assert oracle_calls == 0
 
 
 def test_preflight_accepts_reference_added_source_modules(

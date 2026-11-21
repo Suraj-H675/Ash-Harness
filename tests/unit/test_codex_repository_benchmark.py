@@ -24,6 +24,7 @@ from codex_repository_benchmark import (  # noqa: E402
     summarize_codex_events,
 )
 import codex_repository_benchmark as runner  # noqa: E402
+import repository_benchmark as ash_runner  # noqa: E402
 from repository_benchmark import RepositoryTask, shared_user_prompt  # noqa: E402
 
 
@@ -53,6 +54,28 @@ def test_plain_codex_uses_identical_neutral_prompt_as_ash() -> None:
     assert "run_command" not in prompt
     assert "Use poteto-mode" not in prompt
     assert "Read-only source inspection commands" in prompt
+
+
+def test_pytest_mro_task_uses_shared_identity_prompt_and_scoring() -> None:
+    task = runner.TASKS["pytest-mro-marker-precedence"]
+    assert runner.TASKS is ash_runner.TASKS
+    assert runner.preflight is ash_runner.preflight
+    assert runner.check_oracles is ash_runner.check_oracles
+    assert runner.check_edits is ash_runner.check_edits
+    assert runner.shared_user_prompt is ash_runner.shared_user_prompt
+    assert task.command_grant == "/usr/bin/python3 -B qa_visible.py"
+    assert _exact_test_command(task.command_grant, task.command_grant)
+    assert not _exact_test_command(
+        task.command_grant + " && echo forged", task.command_grant
+    )
+    assert shared_user_prompt(task) == ash_runner.shared_user_prompt(task)
+    assert shared_user_prompt(task) == task.prompt.replace(
+        "with run_command", "using the available command tool"
+    ).replace(
+        "No other commands are authorized.",
+        "Read-only source inspection commands are allowed. "
+        "Do not run other tests or shell commands that modify files.",
+    )
 
 
 def test_event_summary_records_only_metadata_not_model_content(tmp_path: Path) -> None:

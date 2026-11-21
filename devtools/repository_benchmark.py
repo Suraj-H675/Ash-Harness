@@ -23,7 +23,7 @@ import sys
 import sysconfig
 import tempfile
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 import tomllib
 
@@ -1685,6 +1685,7 @@ class RepositoryTask:
     license: str | None = None
     require_all_editable_changed: bool = True
     expected_reference_paths: frozenset[str] | None = None
+    require_both_oracles_red_green: bool = False
 
 
 @dataclass(frozen=True)
@@ -1734,6 +1735,20 @@ PYTEST_R17_RUNTIME = PythonSourceRuntime(
     ),
     trusted_overlay_sha256=(
         "06f72d92dfa1f1bc0b9b1863ec21b5deee01cdc5f721f6ae148ae225a4bc0db7"
+    ),
+)
+
+
+PYTEST_MRO_MARKER_RUNTIME = replace(
+    PYTEST_R17_RUNTIME,
+    generated_files=(
+        (
+            "src/_pytest/_version.py",
+            b'"""Disposable offline benchmark equivalent of setuptools_scm generated metadata."""\n'
+            b'__version__ = version = "9.2.0.dev0"\n'
+            b'__version_tuple__ = version_tuple = (9, 2, 0, "dev0")\n'
+            b"__commit_id__ = commit_id = None\n",
+        ),
     ),
 )
 
@@ -2039,6 +2054,310 @@ with tempfile.TemporaryDirectory(prefix="pytest-r17-probe-") as temporary:
         "unknown_output": unknown_output[-4000:],
     }, sort_keys=True))
 '''
+
+PYTEST_MRO_MARKER_VISIBLE = r'''from __future__ import annotations
+
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+
+
+VISIBLE_CASES = r"""
+import pytest
+
+pytestmark = [
+    pytest.mark.priority("module-first"),
+    pytest.mark.priority("module-second"),
+]
+
+@pytest.mark.priority("root")
+@pytest.mark.ancestry("root")
+class Root:
+    pass
+
+@pytest.mark.priority("left-inner")
+@pytest.mark.priority("left-outer")
+@pytest.mark.ancestry("left")
+class Left(Root):
+    pass
+
+@pytest.mark.priority("right")
+@pytest.mark.ancestry("right")
+class Right(Root):
+    pass
+
+@pytest.mark.priority("leaf-inner")
+@pytest.mark.priority("leaf-outer")
+@pytest.mark.ancestry("leaf")
+class TestLeaf(Left, Right):
+    @pytest.mark.priority("function-inner")
+    @pytest.mark.priority("function-outer")
+    def test_marker_priority(self, request):
+        priority = [mark.args[0] for mark in request.node.iter_markers("priority")]
+        assert priority == [
+            "function-outer", "function-inner",
+            "leaf-outer", "leaf-inner",
+            "left-outer", "left-inner", "right", "root",
+            "module-first", "module-second",
+        ], repr(priority)
+        assert request.node.get_closest_marker("priority").args == ("function-outer",)
+        assert [mark.args[0] for mark in request.node.iter_markers("ancestry")] == [
+            "leaf", "left", "right", "root",
+        ]
+        assert request.node.get_closest_marker("ancestry").args == ("leaf",)
+
+@pytest.mark.priority("single-class")
+class TestSingle:
+    @pytest.mark.priority("single-function")
+    def test_single_class_order(self, request):
+        assert [mark.args[0] for mark in request.node.iter_markers("priority")] == [
+            "single-function", "single-class", "module-first", "module-second",
+        ]
+
+def test_unmarked_case_keeps_module_marks(request):
+    assert [mark.args[0] for mark in request.node.iter_markers("priority")] == [
+        "module-first", "module-second",
+    ]
+"""
+
+PYTEST_INI = """[pytest]
+markers =
+    priority(value): marker scope and order
+    ancestry(value): class hierarchy order
+"""
+
+CHILD = r"""
+from importlib import import_module
+from pathlib import Path
+import sys
+
+source, overlay, test_file, config_file = map(Path, sys.argv[1:5])
+source = source.resolve()
+overlay = overlay.resolve()
+sys.path[:0] = [str(source), str(overlay)]
+import pytest
+if not Path(pytest.__file__).resolve().is_relative_to(source):
+    raise AssertionError("pytest did not import from the pinned source tree")
+if pytest.__version__ != "9.2.0.dev0":
+    raise AssertionError("pytest generated version metadata differs from the pin")
+if not (source / "_pytest" / "_version.py").is_file():
+    raise AssertionError("generated pytest version metadata is missing")
+for name in ("pluggy", "iniconfig", "pygments", "packaging"):
+    module = import_module(name)
+    if not Path(module.__file__).resolve().is_relative_to(overlay):
+        raise AssertionError(f"{name} did not import from the verified overlay")
+result = pytest.main([
+    "-q", "-p", "no:cacheprovider", "--noconftest", "-c", str(config_file), str(test_file)
+])
+sys.exit(int(result))
+"""
+
+if Path(sys.executable).resolve() != Path("/usr/bin/python3").resolve():
+    raise SystemExit("pytest marker evaluation requires /usr/bin/python3")
+if sys.version_info < (3, 10):
+    raise SystemExit("pytest marker evaluation requires Python 3.10 or newer")
+
+workspace = Path(__file__).resolve().parent
+source = workspace / "src"
+overlay = workspace / ".benchmark_runtime" / "site"
+with tempfile.TemporaryDirectory(prefix="pytest-mro-visible-") as temporary:
+    root = Path(temporary)
+    test_file = root / "test_markers.py"
+    config_file = root / "pytest.ini"
+    test_file.write_text(VISIBLE_CASES, encoding="utf-8")
+    config_file.write_text(PYTEST_INI, encoding="utf-8")
+    environment = {
+        "PATH": "/usr/bin:/bin",
+        "HOME": str(root),
+        "TMPDIR": str(root),
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1",
+        "PYTHONNOUSERSITE": "1",
+    }
+    completed = subprocess.run(
+        [
+            sys.executable, "-B", "-S", "-c", CHILD,
+            str(source), str(overlay), str(test_file), str(config_file),
+        ],
+        cwd=root,
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=8,
+        check=False,
+    )
+    output = completed.stdout + completed.stderr
+    if completed.returncode != 0 or "3 passed" not in output:
+        raise AssertionError(f"visible pytest marker cases failed: {output[-1600:]}")
+
+print("PYTEST_MRO_MARKER_VISIBLE_OK: 3 passed")
+'''
+
+
+PYTEST_MRO_MARKER_HIDDEN = r'''from __future__ import annotations
+
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+
+
+HIDDEN_CASES = r"""
+import warnings
+import pytest
+
+@pytest.fixture
+def root_setup(request):
+    request.config._marker_order.setdefault(request.node.nodeid, []).append("root")
+
+@pytest.fixture
+def leaf_setup(request):
+    request.config._marker_order.setdefault(request.node.nodeid, []).append("leaf")
+
+@pytest.mark.usefixtures("root_setup")
+@pytest.mark.parametrize("root_case", ("r0", "r1"), ids=("root0", "root1"))
+class ParameterBase:
+    pass
+
+@pytest.mark.usefixtures("leaf_setup")
+@pytest.mark.parametrize("leaf_case", ("l0", "l1"), ids=("leaf0", "leaf1"))
+class TestParameters(ParameterBase):
+    def test_inherited_fixture_and_parametrize_order(
+        self, root_case, leaf_case, request
+    ):
+        assert request.config._marker_order[request.node.nodeid] == ["root", "leaf"]
+        observed = [
+            (item.callspec.params["root_case"], item.callspec.params["leaf_case"])
+            for item in request.session.items
+            if item.name.split("[", 1)[0] == "test_inherited_fixture_and_parametrize_order"
+        ]
+        assert observed == [
+            ("r0", "l0"), ("r0", "l1"), ("r1", "l0"), ("r1", "l1")
+        ]
+
+@pytest.mark.filterwarnings("ignore:marker warning:UserWarning")
+class WarningBase:
+    pass
+
+@pytest.mark.filterwarnings("error:marker warning:UserWarning")
+class TestWarning(WarningBase):
+    def test_closest_warning_filter_wins(self):
+        with pytest.raises(UserWarning, match="marker warning"):
+            warnings.warn("marker warning", UserWarning)
+
+@pytest.mark.rank("root")
+class Root:
+    pass
+
+@pytest.mark.rank("left")
+class Left(Root):
+    pass
+
+@pytest.mark.rank("right")
+class Right(Root):
+    pass
+
+@pytest.mark.rank("leaf")
+class TestDynamic(Left, Right):
+    @pytest.mark.rank("function")
+    def test_plugin_marker_keeps_mro_order(self, request):
+        marks = [mark.args[0] for mark in request.node.iter_markers("rank")]
+        assert marks == ["function", "plugin", "leaf", "left", "right", "root"]
+        assert request.node.get_closest_marker("rank").args == ("function",)
+"""
+
+PYTEST_INI = """[pytest]
+markers =
+    rank(value): dynamic class marker order
+"""
+
+CHILD = r"""
+from importlib import import_module
+from pathlib import Path
+import sys
+
+source, overlay, test_file, config_file = map(Path, sys.argv[1:5])
+source = source.resolve()
+overlay = overlay.resolve()
+sys.path[:0] = [str(source), str(overlay)]
+import pytest
+if not Path(pytest.__file__).resolve().is_relative_to(source):
+    raise AssertionError("pytest did not import from the pinned source tree")
+if pytest.__version__ != "9.2.0.dev0":
+    raise AssertionError("pytest generated version metadata differs from the pin")
+if not (source / "_pytest" / "_version.py").is_file():
+    raise AssertionError("generated pytest version metadata is missing")
+for name in ("pluggy", "iniconfig", "pygments", "packaging"):
+    module = import_module(name)
+    if not Path(module.__file__).resolve().is_relative_to(overlay):
+        raise AssertionError(f"{name} did not import from the verified overlay")
+
+class MarkerPlugin:
+    @pytest.hookimpl
+    def pytest_configure(self, config):
+        config._marker_order = {}
+
+    @pytest.hookimpl
+    def pytest_collection_modifyitems(self, session, config, items):
+        for item in items:
+            if item.name != "test_plugin_marker_keeps_mro_order":
+                continue
+            class_node = item.parent
+            while class_node is not None and class_node.name != "TestDynamic":
+                class_node = class_node.parent
+            if class_node is None:
+                raise AssertionError("collected marker target is missing")
+            class_node.add_marker(pytest.mark.rank("plugin"), append=False)
+
+result = pytest.main([
+    "-q", "-p", "no:cacheprovider", "--noconftest", "-c", str(config_file), str(test_file)
+], plugins=[MarkerPlugin()])
+sys.exit(int(result))
+"""
+
+if Path(sys.executable).resolve() != Path("/usr/bin/python3").resolve():
+    raise SystemExit("pytest marker evaluation requires /usr/bin/python3")
+if sys.version_info < (3, 10):
+    raise SystemExit("pytest marker evaluation requires Python 3.10 or newer")
+
+workspace = Path.cwd()
+source = workspace / "src"
+overlay = workspace / ".benchmark_runtime" / "site"
+with tempfile.TemporaryDirectory(prefix="pytest-mro-hidden-") as temporary:
+    root = Path(temporary)
+    test_file = root / "test_marker_holdout.py"
+    config_file = root / "pytest.ini"
+    test_file.write_text(HIDDEN_CASES, encoding="utf-8")
+    config_file.write_text(PYTEST_INI, encoding="utf-8")
+    environment = {
+        "PATH": "/usr/bin:/bin",
+        "HOME": str(root),
+        "TMPDIR": str(root),
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1",
+        "PYTHONNOUSERSITE": "1",
+    }
+    completed = subprocess.run(
+        [
+            sys.executable, "-B", "-S", "-c", CHILD,
+            str(source), str(overlay), str(test_file), str(config_file),
+        ],
+        cwd=root,
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=8,
+        check=False,
+    )
+    output = completed.stdout + completed.stderr
+    if completed.returncode != 0:
+        raise AssertionError(f"hidden pytest marker cases failed: {output[-1600:]}")
+
+summary = next((line.strip() for line in output.splitlines() if " passed " in line), None)
+print("PYTEST_MRO_MARKER_HIDDEN_OK" + (f": {summary}" if summary else ""))
+'''
+
 
 PYTEST_MIXED_INDIRECT_HIDDEN_EXPECTED = json.dumps(
     {
@@ -2550,6 +2869,68 @@ TASKS = {
                 "testing/python/metafunc.py",
             }
         ),
+    ),
+    "pytest-mro-marker-precedence": RepositoryTask(
+        source="pytest-dev/pytest",
+        upstream="https://github.com/pytest-dev/pytest.git",
+        base_sha="6665a79fb9a6553ce4e1be5574c21a9e3b769eec",
+        reference_fix_sha="9255aa01e48f47be636987293471a5b102d78c26",
+        editable=frozenset(
+            {
+                "src/_pytest/compat.py",
+                "src/_pytest/fixtures.py",
+                "src/_pytest/mark/structures.py",
+                "src/_pytest/nodes.py",
+                "src/_pytest/python.py",
+                "src/_pytest/warnings.py",
+            }
+        ),
+        visible_script="qa_visible.py",
+        visible_source=PYTEST_MRO_MARKER_VISIBLE,
+        hidden_source=PYTEST_MRO_MARKER_HIDDEN,
+        command_grant="/usr/bin/python3 -B qa_visible.py",
+        prompt=(
+            "Repair marker precedence for inherited test classes in this "
+            "pinned pytest repository. For tests in a class hierarchy, "
+            "iter_markers() must list the closest class before its bases in "
+            "Python MRO order, and get_closest_marker() must return the "
+            "closest matching class marker when the test function has no "
+            "marker with that name. Preserve function, class, and module "
+            "priorities and stacked decorator order. Preserve base-first "
+            "behavior for inherited usefixtures and parametrize marks, "
+            "warning-filter precedence, and markers added by plugins during "
+            "collection. Inspect qa_visible.py and the relevant implementation. "
+            "Edit only these paths as needed: src/_pytest/compat.py, "
+            "src/_pytest/fixtures.py, src/_pytest/mark/structures.py, "
+            "src/_pytest/nodes.py, src/_pytest/python.py, and "
+            "src/_pytest/warnings.py. Run exactly "
+            "/usr/bin/python3 -B qa_visible.py with run_command. No other "
+            "commands are authorized. Do not modify tests, documentation, "
+            "changelogs, or metadata."
+        ),
+        runtime=PYTEST_MRO_MARKER_RUNTIME,
+        upstream_pr="https://github.com/pytest-dev/pytest/pull/14630",
+        license="MIT",
+        require_all_editable_changed=False,
+        expected_reference_paths=frozenset(
+            {
+                "AUTHORS",
+                "changelog/10406.bugfix.rst",
+                "changelog/14329.bugfix.rst",
+                "changelog/14630.improvement.rst",
+                "doc/en/how-to/capture-warnings.rst",
+                "src/_pytest/compat.py",
+                "src/_pytest/fixtures.py",
+                "src/_pytest/mark/structures.py",
+                "src/_pytest/nodes.py",
+                "src/_pytest/python.py",
+                "src/_pytest/warnings.py",
+                "testing/test_mark.py",
+                "testing/test_skipping.py",
+                "testing/test_warnings.py",
+            }
+        ),
+        require_both_oracles_red_green=True,
     ),
 }
 
@@ -3297,10 +3678,14 @@ def _attest_r17_system_python_version() -> str:
 
 
 def preflight(task: RepositoryTask, root: Path) -> tuple[Path, dict[str, object]]:
-    r17_python_version: str | None = None
-    if task.hidden_expected_json is not None:
+    strict_red_green = (
+        task.hidden_expected_json is not None
+        or task.require_both_oracles_red_green
+    )
+    system_python_version: str | None = None
+    if strict_red_green:
         _verify_r17_python_command_parity()
-        r17_python_version = _attest_r17_system_python_version()
+        system_python_version = _attest_r17_system_python_version()
     baseline = root / "baseline"
     reference = root / "reference"
     fetch_pinned(baseline, task, task.base_sha)
@@ -3354,11 +3739,10 @@ def preflight(task: RepositoryTask, root: Path) -> tuple[Path, dict[str, object]
         and reference_score["correct"] is True
     )
     # Existing R1–R16 tasks only require the original to fail at least one
-    # oracle; R17's candidate-visible probe and parent-only checker require
-    # both original oracles to be red before any comparative trial.
+    # oracle. R17 and tasks that opt in require both original oracles to be red.
     historical_reproduced = (
         base_visible_red and base_hidden_red and reference_both_green
-        if task.hidden_expected_json is not None
+        if strict_red_green
         else not base_score["correct"] and bool(reference_score["correct"])
     )
     if not historical_reproduced:
@@ -3405,7 +3789,7 @@ def preflight(task: RepositoryTask, root: Path) -> tuple[Path, dict[str, object]
         "reference_removed_paths": removed,
         "reference_modified_paths": modified,
     }
-    if task.hidden_expected_json is not None:
+    if strict_red_green:
         receipt.update(
             {
                 "visible_oracle_sha256": hashlib.sha256(
@@ -3416,7 +3800,7 @@ def preflight(task: RepositoryTask, root: Path) -> tuple[Path, dict[str, object]
                     task.hidden_source.encode()
                 ).hexdigest(),
                 "hidden_oracle_classification": hidden_oracle_classification(task),
-                "system_python_version": r17_python_version,
+                "system_python_version": system_python_version,
                 "system_python_executable": "/usr/bin/python3",
             }
         )
