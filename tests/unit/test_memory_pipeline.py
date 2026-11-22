@@ -27,6 +27,9 @@ def test_project_memory_injects_into_system_prompt(tmp_path: Path) -> None:
     )
     session_store.create_session.return_value = fake_session
     session_store.get_recent_session_summaries.return_value = []
+    # Model the real durable store's empty compaction policy/anchor result.
+    # The runtime must still inspect persisted anchors even if opt-in is off.
+    session_store.provider_server_compaction_state.return_value = (None, False)
 
     provider = MagicMock(spec=ProviderABC)
 

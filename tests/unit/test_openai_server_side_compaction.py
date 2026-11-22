@@ -120,6 +120,11 @@ async def test_user_config_opt_in_sends_and_replays_sdk_compaction_output(
         encoding="utf-8",
     )
     monkeypatch.setenv("OPENAI_API_KEY", "synthetic-test-key")
+    # Ash's environment override intentionally takes precedence over user
+    # config. Other tests may set legacy ASH_MODEL in the same pytest process.
+    monkeypatch.delenv("ASH_MODEL", raising=False)
+    monkeypatch.delenv("ASH_MODEL_NAME", raising=False)
+    monkeypatch.delenv("ASH_PROVIDER", raising=False)
 
     config = AshConfig.load(
         _ash_dir=user_config,
