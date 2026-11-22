@@ -299,6 +299,10 @@ class SearchTextArgs(BaseModel):
     glob: str | None = None
     fixed_strings: bool = False
     case_sensitive: bool = True
+    files_only: bool = Field(
+        False,
+        description="List one file:line per matching file (no source excerpts).",
+    )
     max_results: int = Field(DEFAULT_MAX_RESULTS, ge=1, le=HARD_MAX_RESULTS)
     context_lines: int = Field(
         0,
@@ -323,12 +327,21 @@ class SearchTextTool(BaseTool):
 
     def json_schema(self) -> dict[str, Any]:
         schema = super().json_schema()
-        for name in ("context_lines", "max_output_bytes"):
+        for name in ("context_lines", "max_output_bytes", "files_only"):
             schema["properties"][name].pop("default", None)
         return schema
 
     async def run(self, **kwargs: Any) -> ToolResult:
         args = SearchTextArgs(**kwargs)
+        if args.files_only and args.context_lines:
+            return ToolResult(
+                success=False,
+                output="",
+                error=(
+                    "files_only=true cannot be combined with context_lines; "
+                    "use normal search results to inspect nearby source."
+                ),
+            )
         try:
             root = self.safety_guard.validate_path(args.directory_path)
         except SafetyViolation as exc:
@@ -429,6 +442,13 @@ class SearchTextTool(BaseTool):
                         0.0,
                         regex_time_remaining - (monotonic() - started_at),
                     )
+                if match is not None and args.files_only:
+                    # The caller only wants a path and first location. Avoid
+                    # even constructing a potentially huge source excerpt.
+                    yield (line_number, "", True, False, 0)
+                    if not complete:
+                        return
+                    continue
                 preview_start = 0
                 if match is not None and match.start() > 0:
                     # A match late in a long line should be visible even when
@@ -548,6 +568,16 @@ class SearchTextTool(BaseTool):
                         line_number, text, matched, line_truncated, preview_start
                     ) in bounded_lines(handle):
                         if matched:
+                            if args.files_only:
+                                if match_count >= args.max_results:
+                                    match_limited = True
+                                    break
+                                if not append_result(f"{relative}:{line_number}"):
+                                    break
+                                match_count += 1
+                                # Move to the next file without consuming
+                                # more model context on repeated matches here.
+                                break
                             if match_count >= args.max_results:
                                 match_limited = True
                                 break
@@ -602,7 +632,8 @@ class SearchTextTool(BaseTool):
                 f"{capture_limit} bytes]"
             )
         elif match_limited:
-            output += f"{separator}[truncated after {args.max_results} matches]"
+            unit = "matching files" if args.files_only else "matches"
+            output += f"{separator}[truncated after {args.max_results} {unit}]"
         elif scan_truncated:
             output += (
                 f"{separator}[workspace scan truncated after "

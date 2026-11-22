@@ -360,6 +360,101 @@ async def test_search_text_returns_file_and_line(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_search_text_files_only_finds_broad_unique_files_without_repeated_lines(
+    tmp_path,
+) -> None:
+    (tmp_path / "alpha.py").write_text("header\n" + "needle\n" * 40)
+    (tmp_path / "beta.py").write_text("needle first\nneedle second\n")
+    (tmp_path / "gamma.py").write_text("header\nneedle here\n")
+    (tmp_path / "unrelated.py").write_text("not relevant\n")
+    tool = SearchTextTool(SafetyGuard(tmp_path))
+
+    # Existing mode spends the whole match limit on just one source file.
+    legacy = await tool.run(pattern="needle", fixed_strings=True, max_results=2)
+    assert legacy.success and legacy.truncated
+    assert legacy.output.count("alpha.py:") == 2
+    assert "beta.py" not in legacy.output
+
+    broad = await tool.run(
+        pattern="needle", fixed_strings=True, max_results=2, files_only=True
+    )
+    assert broad.success and broad.truncated
+    assert broad.output.splitlines() == [
+        "alpha.py:2",
+        "beta.py:1",
+        "[truncated after 2 matching files]",
+    ]
+    complete = await tool.run(
+        pattern="needle", fixed_strings=True, max_results=3, files_only=True
+    )
+    assert complete.success and not complete.truncated
+    assert complete.output.splitlines() == [
+        "alpha.py:2", "beta.py:1", "gamma.py:2",
+    ]
+    assert len(complete.output) < len(legacy.output)
+
+
+@pytest.mark.asyncio
+async def test_search_text_files_only_keeps_regex_case_glob_and_single_file_contract(
+    tmp_path,
+) -> None:
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "a.py").write_text("no match\nNeedle\nneedle again\n")
+    (tmp_path / "src" / "b.txt").write_text("needle\n")
+    (tmp_path / "src" / "c.py").write_text("NEEDLE\n")
+    tool = SearchTextTool(SafetyGuard(tmp_path))
+    scoped = await tool.run(
+        pattern="needle", directory_path="src", glob="**/*.py",
+        case_sensitive=False, files_only=True,
+    )
+    assert scoped.success and not scoped.truncated
+    assert scoped.output.splitlines() == ["src/a.py:2", "src/c.py:1"]
+    single = await tool.run(
+        pattern="n[e]+dle", directory_path="src/a.py", files_only=True,
+    )
+    assert single.success and not single.truncated
+    assert single.output == "src/a.py:3"
+    invalid = await tool.run(pattern="[", files_only=True)
+    assert invalid.success is False and (invalid.error or "").startswith("Invalid regex:")
+    conflict = await tool.run(
+        pattern="needle", files_only=True, context_lines=1,
+    )
+    assert conflict.success is False
+    assert "context_lines" in (conflict.error or "")
+
+
+@pytest.mark.asyncio
+async def test_search_text_files_only_preserves_scope_and_bytes_limit(
+    tmp_path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    for i in range(12):
+        (workspace / f"module_{i:02d}.py").write_text("needle\n")
+    outside = tmp_path / "secret.py"
+    outside.write_text("EXTERNAL_SECRET_NEEDLE\n")
+    tool = SearchTextTool(SafetyGuard(workspace))
+    refused = await tool.run(
+        pattern="EXTERNAL_SECRET_NEEDLE", directory_path="../secret.py",
+        files_only=True, fixed_strings=True,
+    )
+    assert refused.success is False
+    assert "outside project scope" in (refused.error or "")
+    assert refused.output == ""
+    # Identical existing search capture enforcement applies in file-only mode.
+    monkeypatch.setattr(search_module, "MAX_SEARCH_CAPTURE_BYTES", 45)
+    limited = await tool.run(
+        pattern="needle", files_only=True, fixed_strings=True,
+    )
+    assert limited.success and limited.truncated
+    assert limited.output.startswith("module_00.py:1\nmodule_01.py:1\n")
+    assert "module_00.py:1:needle" not in limited.output
+    assert "module_11.py:1" not in limited.output
+    assert "[search output capture truncated after 45 bytes]" in limited.output
+    assert "EXTERNAL_SECRET_NEEDLE" not in limited.output
+
+
+@pytest.mark.asyncio
 async def test_search_text_opt_in_context_merges_adjacent_match_windows(tmp_path) -> None:
     (tmp_path / "app.py").write_text(
         "header\nbefore\nneedle first\nbetween\nneedle second\nafter\ntail\n"
@@ -588,10 +683,13 @@ async def test_search_text_accepts_a_single_file_path(tmp_path) -> None:
     assert excluded.output == ""
 
 
-@pytest.mark.parametrize("context_lines", [0, 2])
+@pytest.mark.parametrize(
+    ("context_lines", "files_only"),
+    [(0, False), (2, False), (0, True)],
+)
 @pytest.mark.asyncio
 async def test_search_text_single_file_preserves_scoped_read_protection(
-    tmp_path, monkeypatch: pytest.MonkeyPatch, context_lines: int
+    tmp_path, monkeypatch: pytest.MonkeyPatch, context_lines: int, files_only: bool,
 ) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
@@ -614,6 +712,7 @@ async def test_search_text_single_file_preserves_scoped_read_protection(
     result = await SearchTextTool(SafetyGuard(workspace)).run(
         pattern="PRIVATE_NEEDLE", directory_path="app.py",
         fixed_strings=True, context_lines=context_lines,
+        files_only=files_only,
     )
 
     assert result.success is True
@@ -1247,8 +1346,9 @@ async def test_narrow_source_search_skips_nested_generated_but_explicit_root_can
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("files_only", [False, True])
 async def test_coding_loop_narrow_source_discovery_avoids_generated_cache(
-    tmp_path: Path,
+    tmp_path: Path, files_only: bool,
 ) -> None:
     """Real agent search results keep source discovery reliable without retries."""
     import io
@@ -1283,10 +1383,16 @@ async def test_coding_loop_narrow_source_discovery_avoids_generated_cache(
             if self.requests == 1:
                 call = {"id": "find-marker", "name": "search_text", "arguments": {
                     "pattern": "real_source_marker", "fixed_strings": True,
-                    "directory_path": "src",
+                    "directory_path": "src", "files_only": files_only,
                 }}
             elif self.requests == 2:
-                assert "src/app.py:1:real_source_marker" in history
+                expected = (
+                    "src/app.py:1" if files_only
+                    else "src/app.py:1:real_source_marker"
+                )
+                assert expected in history
+                if files_only:
+                    assert "src/app.py:1:real_source_marker" not in history
                 assert "skipped generated directories: __pycache__" in history
                 assert "workspace search incomplete" not in history
                 assert "shadow.py" not in history
