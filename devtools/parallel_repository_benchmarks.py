@@ -185,6 +185,19 @@ def run_pair(
             ),
             ash_pass=comparison["ash"]["scored_pass"],
             codex_pass=comparison["codex"]["scored_pass"],
+            # Preserve the evidence that a graded repair can be correct yet
+            # fail the complete task (e.g. a timeout after a green test).
+            # Missing receipts above never manufacture an engine outcome.
+            engine_outcomes={
+                engine: {
+                    field: comparison[engine][field]
+                    for field in (
+                        "correct_source", "visible_test_executed",
+                        "cli_complete", "timed_out", "scored_pass",
+                    )
+                }
+                for engine in ("ash", "codex")
+            },
             ash_cli_seconds=comparison["ash"]["cli_seconds"],
             codex_cli_seconds=comparison["codex"]["cli_seconds"],
             timing_available=evaluation["matching_cli_timing_available"],

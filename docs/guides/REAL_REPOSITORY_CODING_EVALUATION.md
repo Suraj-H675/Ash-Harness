@@ -230,6 +230,18 @@ PYTHONPATH=src .venv/bin/python devtools/parallel_repository_benchmarks.py \
   --evidence-root /var/tmp/ash-approved-paired-new-evidence
 ~~~
 
+Each pair's `summary.json` (also included as a result in `batch.json`)
+preserves existing
+`ash_pass` and `codex_pass` as **full-task** grades. The additive
+`engine_outcomes` section separately records each candidate's independently
+graded source correctness, whether the exact required visible test ran,
+whether the CLI turn completed, and whether a timeout was actually recorded.
+A correct repair with a green oracle but an unfinished/timed-out turn remains
+**a failed full task**, not a win. A missing or malformed timeout field is
+`null`, not invented as `false`; unverified/incomplete receipts do not claim
+engine outcomes. `comparison_verified` verifies comparability of the recorded
+inputs and provenance, not that either coding task succeeded.
+
 The flag authorizes **every Ash and Codex model run in the selected batch**
 (up to six pairs), not merely one child. Never reuse it without a fresh
 correspondingly scoped owner approval. Missing authorization fails without

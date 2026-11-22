@@ -84,6 +84,8 @@ def test_comparison_separates_correct_code_from_terminal_completion(
     assert report["codex"]["correct_source"] is True
     assert report["codex"]["cli_complete"] is False
     assert report["codex"]["scored_pass"] is False
+    assert report["ash"]["timed_out"] is False
+    assert report["codex"]["timed_out"] is True
     assert report["evaluation"]["fully_controlled"] is False
     assert report["evaluation"]["same_upstream_revision_pins"] is True
     assert report["evaluation"]["identical_oracle_provenance_verified"] is False
@@ -121,6 +123,26 @@ def test_comparison_discloses_unmatched_ash_turn_token_cap(
     assert evaluation["ash_unbounded_turn_configured"] is unbounded
     assert evaluation["asymmetric_ash_turn_token_cap"] is asymmetric
     assert evaluation["matched_context_and_turn_limits"] is False
+
+
+def test_comparison_does_not_invent_missing_or_malformed_timeout_receipts(
+    tmp_path: Path,
+) -> None:
+    ash, codex = _evidence(tmp_path)
+    left = ash / "result.json"
+    right = codex / "grade.json"
+    ash_data = json.loads(left.read_text())
+    codex_data = json.loads(right.read_text())
+    ash_data.pop("timed_out")
+    codex_data["timed_out"] = "false"
+    left.write_text(json.dumps(ash_data))
+    right.write_text(json.dumps(codex_data))
+
+    report = comparison.compare(ash, codex)
+    assert report["ash"]["timed_out"] is None
+    assert report["codex"]["timed_out"] is None
+    assert report["codex"]["correct_source"] is True
+    assert report["codex"]["scored_pass"] is False
 
 
 def test_comparison_does_not_conflate_cli_and_grading_timing(

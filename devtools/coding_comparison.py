@@ -34,6 +34,12 @@ def _numeric(data: dict[str, Any], key: str) -> float | None:
     return None
 
 
+def _recorded_bool(data: dict[str, Any], key: str) -> bool | None:
+    """Distinguish a genuine recorded false from missing/invalid evidence."""
+    value = data.get(key)
+    return value if type(value) is bool else None
+
+
 def compare(ash_dir: Path, codex_dir: Path) -> dict[str, Any]:
     """Return content-free results and explicit comparability limitations."""
     ash = _load_json(ash_dir / "result.json")
@@ -152,6 +158,7 @@ def compare(ash_dir: Path, codex_dir: Path) -> dict[str, Any]:
             "correct_source": ash_source_correct,
             "visible_test_executed": ash.get("required_tools_succeeded") is True,
             "cli_complete": ash.get("exit_code") == 0 and ash.get("timed_out") is False,
+            "timed_out": _recorded_bool(ash, "timed_out"),
             "scored_pass": ash.get("passed") is True,
             "elapsed_seconds": _numeric(ash, "elapsed_seconds"),
             "cli_seconds": ash_cli_seconds,
@@ -163,6 +170,7 @@ def compare(ash_dir: Path, codex_dir: Path) -> dict[str, Any]:
             "cli_complete": codex.get("exit_code") == 0
             and codex.get("timed_out") is False
             and "turn.completed" in codex.get("terminal_events", []),
+            "timed_out": _recorded_bool(codex, "timed_out"),
             "scored_pass": codex.get("passed") is True,
             "elapsed_seconds": codex_elapsed,
             "cli_seconds": codex_cli_seconds,

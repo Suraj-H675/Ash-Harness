@@ -290,12 +290,79 @@ def test_pair_alternates_order_and_validates_external_receipts(
     assert report["comparison_verified"] is True
     assert report["ash_pass"] is True
     assert report["codex_pass"] is True
+    assert report["engine_outcomes"] == {
+        "ash": {
+            "correct_source": True,
+            "visible_test_executed": True,
+            "cli_complete": True,
+            "timed_out": False,
+            "scored_pass": True,
+        },
+        "codex": {
+            "correct_source": True,
+            "visible_test_executed": True,
+            "cli_complete": True,
+            "timed_out": False,
+            "scored_pass": True,
+        },
+    }
     assert report["timing_available"] is True
     assert report["fully_controlled"] is False
     assert report["comparison_scope"] == "operational_qualified"
     assert report["ash_cli_seconds"] == 25.0
     assert report["codex_cli_seconds"] == 30.0
     assert (tmp_path / f"h11-chunk-footer-r{rep:02d}/summary.json").is_file()
+
+
+def test_pair_preserves_correct_code_and_test_but_failed_completion(
+    tmp_path: Path,
+) -> None:
+    """Reproduce R18 grading distinction without inference or private receipts."""
+    task = "pytest-mro-marker-precedence"
+
+    def fake_invoke(_argv: list[str], evidence: Path) -> int:
+        _emit_receipt(task, evidence)
+        filename = "result.json" if evidence.name == "ash" else "grade.json"
+        path = evidence / filename
+        receipt = json.loads(path.read_text())
+        receipt["passed"] = False
+        receipt["exit_code"] = 1 if evidence.name == "ash" else -15
+        receipt["timed_out"] = evidence.name == "codex"
+        if evidence.name == "ash":
+            receipt["oracle"]["correct"] = False
+            receipt["required_sources_changed"] = False
+            receipt["required_tools_succeeded"] = False
+        else:
+            receipt["terminal_events"] = []
+        path.write_text(json.dumps(receipt))
+        return 1
+
+    report = run_pair(
+        task, 1, tmp_path, 300, 32768,
+        invoke=fake_invoke, authorize_model_trial=True,
+    )
+    assert report["comparison_verified"] is True
+    assert report["fully_controlled"] is False
+    assert report["ash_pass"] is report["codex_pass"] is False
+    assert report["engine_outcomes"] == {
+        "ash": {
+            "correct_source": False,
+            "visible_test_executed": False,
+            "cli_complete": False,
+            "timed_out": False,
+            "scored_pass": False,
+        },
+        "codex": {
+            "correct_source": True,
+            "visible_test_executed": True,
+            "cli_complete": False,
+            "timed_out": True,
+            "scored_pass": False,
+        },
+    }
+    stored = json.loads((tmp_path / f"{task}-r01/summary.json").read_text())
+    assert stored["engine_outcomes"] == report["engine_outcomes"]
+    assert stored["comparison_verified"] is True
 
 
 def test_pair_excludes_provider_outage_from_valid_comparisons(tmp_path: Path) -> None:
@@ -363,6 +430,7 @@ def test_two_scenarios_execute_concurrently_with_separate_evidence(
         ["ash", "codex"], ["codex", "ash"],
     ]
     assert all(not pair["comparison_verified"] for pair in report["results"])
+    assert all("engine_outcomes" not in pair for pair in report["results"])
     assert report["uncontended_latency_mode"] is False
     assert "do not use elapsed times" in report["latency_note"]
     assert (root.stat().st_mode & 0o777) == 0o700
