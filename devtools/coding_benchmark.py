@@ -35,7 +35,10 @@ from evaluation_files import UNSAFE_ENTRIES, content_identity, snapshot_workspac
 
 
 REPO = Path(__file__).resolve().parents[1]
-PYTHON = REPO / ".venv/bin/python"
+# The runner already executes under a Python able to import Ash. Reuse that
+# interpreter in benchmark children rather than assuming every isolated Git
+# worktree has a duplicate .venv; child PYTHONPATH still pins REPO/src.
+PYTHON = Path(sys.executable)
 PRESERVED = b"Preserve this unrelated file.\n"
 CALC = b"def add(a, b):\n    return a - b\n"
 CALC_TEST = b"from calc import add\nassert add(2, 3) == 5\n"
@@ -999,7 +1002,7 @@ def main() -> int:
     # Invalid free-model requests must fail consistently on macOS CI too;
     # actual execution still requires Bubblewrap before any provider traffic.
     if not PYTHON.is_file():
-        parser.error(f"repository virtual environment missing: {PYTHON}")
+        parser.error(f"benchmark Python interpreter unavailable: {PYTHON}")
     if not shutil.which("bwrap"):
         parser.error("Bubblewrap is required to safely execute model-written code")
     if args.chatgpt_model:

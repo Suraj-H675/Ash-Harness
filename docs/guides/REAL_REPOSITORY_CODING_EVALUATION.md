@@ -14,6 +14,9 @@ The operator-run entry point is `devtools/repository_benchmark.py`. It
 requires Linux, Bubblewrap, Git, the checked-out Ash development environment,
 and an existing, authorized ChatGPT-plan registration with enough access-token
 lifetime for the chosen trial. Model IDs are confirmed in the account catalog.
+The runner uses the interpreter with which it was launched, rather than
+requiring a second `.venv` in every isolated worktree; the evaluated checkout's
+`src` remains selected through the explicit `PYTHONPATH=src` source overlay.
 
 ## Task provenance
 

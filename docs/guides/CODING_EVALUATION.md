@@ -33,7 +33,12 @@ source boundaries without putting the later upstream fix in the model's checkout
 
 ## Prerequisites
 
-- An Ash development environment (`.venv` with Python 3.12–3.14).
+- An Ash development interpreter (Python 3.12–3.14 with locked project
+  dependencies), typically `.venv/bin/python`. For an isolated Git worktree,
+  invoke the benchmark with the absolute path to a prepared interpreter and
+  set `PYTHONPATH` to that worktree's `src` directory; no duplicate
+  worktree-local `.venv` is required. The benchmark uses its launching
+  interpreter and records the exact executable path in its evidence.
 - Linux with working Bubblewrap. The independent code oracle executes model-
   authored Python inside a read-only, networkless sandbox; it never executes
   that code unsandboxed.

@@ -41,6 +41,72 @@ oracle_python = _benchmark.oracle_python
 summarize_operational_events = _benchmark.summarize_operational_events
 
 
+def test_benchmark_runner_in_isolated_worktree_uses_launch_interpreter(
+    tmp_path: Path,
+) -> None:
+    """A standalone evaluator need not install a duplicate venv per worktree."""
+    cloned_tools = tmp_path / "devtools"
+    cloned_tools.mkdir()
+    shutil.copyfile(_benchmark_path, cloned_tools / "coding_benchmark.py")
+    assert not (tmp_path / ".venv").exists()
+
+    env = {
+        "PATH": os.defpath,
+        "HOME": str(tmp_path),
+        "PYTHONNOUSERSITE": "1",
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "PYTHONPATH": os.pathsep.join(
+            (str(cloned_tools), str(_devtools), str(_benchmark.REPO / "src"))
+        ),
+    }
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from coding_benchmark import REPO, PYTHON; print(REPO); print(PYTHON)",
+        ],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines() == [str(tmp_path), sys.executable]
+    assert not (tmp_path / ".venv").exists()
+
+
+def test_benchmark_rejects_missing_launch_interpreter_before_model_traffic(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    missing = tmp_path / "unavailable-python"
+    evidence = tmp_path / "uncreated-evidence"
+    monkeypatch.setattr(_benchmark, "PYTHON", missing)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "FAKE-ONLY-NO-INFERENCE")
+
+    def unexpected_network(*args: object, **kwargs: object) -> None:
+        pytest.fail("model network must not be reached with invalid Python")
+
+    monkeypatch.setattr(_benchmark.urllib.request, "urlopen", unexpected_network)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "coding_benchmark.py", "--task", "event-log",
+            "--openrouter-free-model", "cohere/north-mini-code:free",
+            "--evidence-dir", str(evidence),
+        ],
+    )
+    with pytest.raises(SystemExit) as raised:
+        _benchmark.main()
+    assert raised.value.code == 2
+    assert "benchmark Python interpreter unavailable" in capsys.readouterr().err
+    assert not evidence.exists()
+
+
 def _free_model_catalog() -> dict[str, object]:
     return {
         "data": [
@@ -123,7 +189,9 @@ def test_chatgpt_trial_keeps_credentials_out_of_evidence_and_process_arguments(
     def inspect_launch(argv: list[str], **kwargs: object) -> None:
         from ash.providers.openai_chatgpt_auth import ChatGPTCredentialStore
 
+        assert argv[:3] == [str(_benchmark.PYTHON), "-m", "ash"]
         env = kwargs["env"]
+        assert env["PYTHONPATH"] == str(_benchmark.REPO / "src")
         assert isinstance(env, dict)
         home = Path(env["HOME"])
         assert home.parent == memory_root
@@ -437,8 +505,10 @@ def test_free_openrouter_trial_keeps_key_in_child_environment_not_config_or_argv
         return subprocess.CompletedProcess([], 0, stdout="", stderr="")
 
     def inspect_launch(argv: list[str], **kwargs: object) -> None:
+        assert argv[:3] == [str(_benchmark.PYTHON), "-m", "ash"]
         env = kwargs["env"]
         assert isinstance(env, dict)
+        assert env["PYTHONPATH"] == str(_benchmark.REPO / "src")
         assert env["ASH_MODEL"] == "openrouter/cohere/north-mini-code:free"
         assert env["OPENROUTER_API_KEY"] == secret
         assert env["ASH_MAX_TURN_ITERATIONS"] == "16"
