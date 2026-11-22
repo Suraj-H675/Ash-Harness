@@ -183,13 +183,31 @@ print("ASH_SEALED_NO_MODEL_PROBE_OK")
 
 
 def _probe_effective_sealed_sandbox(
-    executable: Path, workspace: Path, scratch: Path, codex_home: Path
+    executable: Path,
+    workspace: Path,
+    scratch: Path,
+    codex_home: Path,
+    *,
+    sandbox_tmp: Path,
 ) -> None:
     """Independently enforce real file-open/write/socket restrictions per run."""
     if workspace.is_symlink() or not workspace.resolve().is_relative_to(
         scratch.resolve()
     ):
         raise RuntimeError("Sealed comparator workspace is outside isolated scratch")
+    # Bubblewrap uses TMPDIR while preparing the sandbox. Scratch/tmp is
+    # intentionally outside the workspace and thus denied for sandbox writes.
+    # Use a private, ephemeral directory INSIDE the already-writable workspace.
+    if (
+        sandbox_tmp.is_symlink()
+        or not sandbox_tmp.is_dir()
+        or sandbox_tmp.parent.resolve() != workspace.resolve()
+        or stat.S_IMODE(sandbox_tmp.stat().st_mode) != 0o700
+    ):
+        raise RuntimeError(
+            "Sealed comparator sandbox temporary directory must be private "
+            "and directly inside the isolated workspace"
+        )
     outside = scratch / ".ash-sealed-parent-sentinel"
     private = codex_home / ".ash-sealed-auth-sentinel"
     paths = (outside, private)
@@ -225,7 +243,7 @@ def _probe_effective_sealed_sandbox(
         outcome = subprocess.run(
             command,
             cwd=workspace,
-            env=_codex_env(scratch, codex_home),
+            env=_codex_env(scratch, codex_home, sandbox_tmp=sandbox_tmp),
             capture_output=True,
             text=True,
             timeout=12,
@@ -387,7 +405,9 @@ def _isolated_codex_profile(
         yield codex_home
 
 
-def _codex_env(scratch: Path, codex_home: Path) -> dict[str, str]:
+def _codex_env(
+    scratch: Path, codex_home: Path, *, sandbox_tmp: Path
+) -> dict[str, str]:
     """Fully separate HOME/XDG paths and block inherited overlay/plugins."""
     for name in ("home", "xdg-config", "xdg-data", "xdg-cache", "runtime"):
         (scratch / name).mkdir(mode=0o700, exist_ok=True)
@@ -406,7 +426,7 @@ def _codex_env(scratch: Path, codex_home: Path) -> dict[str, str]:
         "GIT_CONFIG_NOSYSTEM": "1",
         "GIT_TERMINAL_PROMPT": "0",
         "PYTHONDONTWRITEBYTECODE": "1",
-        "TMPDIR": str(scratch / "tmp"),
+        "TMPDIR": str(sandbox_tmp),
     }
 
 
@@ -490,9 +510,22 @@ def _run_codex(
         effort=effort,
         context_tokens=context_tokens,
     )
+    if (
+        workspace.is_symlink()
+        or not workspace.is_dir()
+        or not workspace.resolve().is_relative_to(scratch.resolve())
+    ):
+        raise RuntimeError("Sealed comparator workspace is outside isolated scratch")
     timed_out = False
-    with _isolated_codex_profile() as codex_home:
-        _probe_effective_sealed_sandbox(executable, workspace, scratch, codex_home)
+    with contextlib.ExitStack() as resources:
+        # An unpredictable mode-0700 scratch directory dies before grading.
+        sandbox_tmp = Path(resources.enter_context(
+            tempfile.TemporaryDirectory(prefix=".ash-codex-tmp-", dir=workspace)
+        ))
+        codex_home = resources.enter_context(_isolated_codex_profile())
+        _probe_effective_sealed_sandbox(
+            executable, workspace, scratch, codex_home, sandbox_tmp=sandbox_tmp
+        )
         with (
             (evidence / "codex.jsonl").open("wb") as stdout,
             (evidence / "codex.stderr").open("wb") as stderr,
@@ -503,7 +536,7 @@ def _run_codex(
             child = subprocess.Popen(
                 argv,
                 cwd=workspace,
-                env=_codex_env(scratch, codex_home),
+                env=_codex_env(scratch, codex_home, sandbox_tmp=sandbox_tmp),
                 stdin=subprocess.PIPE,
                 stdout=stdout,
                 stderr=stderr,

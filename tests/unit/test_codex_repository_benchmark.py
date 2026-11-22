@@ -201,8 +201,12 @@ def test_codex_env_does_not_inherit_api_credentials(
     monkeypatch.setenv("GITHUB_TOKEN", "PRIVATE-GITHUB-TOKEN")
     isolated = tmp_path / "isolated-codex"
     isolated.mkdir()
-    env = _codex_env(tmp_path, isolated)
-    assert env["TMPDIR"] == str(tmp_path / "tmp")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    private_tmp = workspace / ".ash-private-tmp"
+    private_tmp.mkdir(mode=0o700)
+    env = _codex_env(tmp_path, isolated, sandbox_tmp=private_tmp)
+    assert env["TMPDIR"] == str(private_tmp)
     assert env["CODEX_HOME"] == str(isolated)
     assert env["HOME"] == str(tmp_path / "home")
     assert env["XDG_CONFIG_HOME"] == str(tmp_path / "xdg-config")
@@ -390,7 +394,9 @@ def test_codex_timeout_terminates_process_group_without_leaking_keys(
     # This simulated child exercises process-group cleanup, not actual model
     # authorization or sandbox isolation. Security checks are stubbed only here.
     monkeypatch.setattr(runner, "_require_sealed_comparator_profile", lambda: None)
-    monkeypatch.setattr(runner, "_probe_effective_sealed_sandbox", lambda *_args: None)
+    monkeypatch.setattr(
+        runner, "_probe_effective_sealed_sandbox", lambda *_args, **_kwargs: None
+    )
     monkeypatch.setattr(
         runner, "_native_codex_binary", lambda: Path("/usr/bin/codex-real")
     )
@@ -423,6 +429,9 @@ def test_codex_timeout_terminates_process_group_without_leaking_keys(
     assert "-s" not in child_args and "--sandbox" not in child_args
     assert "PRIVATE-SENTINEL" not in repr(child_env)
     assert child_env["CODEX_HOME"] == str(tmp_path / "isolated-codex-home")
+    assert Path(child_env["TMPDIR"]).parent == tmp_path
+    assert Path(child_env["TMPDIR"]).name.startswith(".ash-codex-tmp-")
+    assert not Path(child_env["TMPDIR"]).exists(), "temporary workspace scratch leaked"
     assert child_args[0] == "/usr/bin/codex-real"
 
 
@@ -872,6 +881,8 @@ def test_sealed_no_model_probe_checks_actual_command_and_cleans_sentinels(
     auth_home = tmp_path / "private-auth"
     workspace.mkdir(parents=True)
     auth_home.mkdir()
+    sandbox_tmp = workspace / ".ash-private-tmp"
+    sandbox_tmp.mkdir(mode=0o700)
     calls = []
 
     def fake_run(command, **kwargs):
@@ -890,13 +901,15 @@ def test_sealed_no_model_probe_checks_actual_command_and_cleans_sentinels(
         assert (scratch / ".ash-sealed-parent-sentinel").is_file()
         assert (auth_home / ".ash-sealed-auth-sentinel").is_file()
         assert kwargs["env"]["CODEX_HOME"] == str(auth_home)
+        assert kwargs["env"]["TMPDIR"] == str(sandbox_tmp)
         return subprocess.CompletedProcess(
             command, 0, "ASH_SEALED_NO_MODEL_PROBE_OK\n", ""
         )
 
     monkeypatch.setattr(runner.subprocess, "run", fake_run)
     runner._probe_effective_sealed_sandbox(
-        Path("/trusted/codex"), workspace, scratch, auth_home
+        Path("/trusted/codex"), workspace, scratch, auth_home,
+        sandbox_tmp=sandbox_tmp,
     )
     assert len(calls) == 1
     assert not (scratch / ".ash-sealed-parent-sentinel").exists()
@@ -908,10 +921,35 @@ def test_sealed_no_model_probe_checks_actual_command_and_cleans_sentinels(
     monkeypatch.setattr(runner.subprocess, "run", wrong_result)
     with pytest.raises(RuntimeError, match="probe failed"):
         runner._probe_effective_sealed_sandbox(
-            Path("/trusted/codex"), workspace, scratch, auth_home
+            Path("/trusted/codex"), workspace, scratch, auth_home,
+            sandbox_tmp=sandbox_tmp,
         )
     assert not (scratch / ".ash-sealed-parent-sentinel").exists()
     assert not (auth_home / ".ash-sealed-auth-sentinel").exists()
+
+
+def test_sealed_probe_refuses_tmp_outside_workspace_before_native_dispatch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    scratch = tmp_path / "scratch"
+    workspace = scratch / "workspace"
+    workspace.mkdir(parents=True)
+    private_home = scratch / "codex-home"
+    private_home.mkdir()
+    outside_tmp = scratch / "tmp"
+    outside_tmp.mkdir()
+
+    def no_native_dispatch(*_args: object, **_kwargs: object) -> None:
+        pytest.fail("out-of-workspace TMPDIR must not reach native sandbox")
+
+    monkeypatch.setattr(runner.subprocess, "run", no_native_dispatch)
+    with pytest.raises(RuntimeError, match="sandbox temporary directory"):
+        runner._probe_effective_sealed_sandbox(
+            Path("/trusted/native/codex"), workspace, scratch, private_home,
+            sandbox_tmp=outside_tmp,
+        )
+    assert not (scratch / ".ash-sealed-parent-sentinel").exists()
+    assert not (private_home / ".ash-sealed-auth-sentinel").exists()
 
 
 def test_explicit_opt_in_passes_one_trial_authorization_without_model(
