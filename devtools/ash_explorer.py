@@ -1909,11 +1909,26 @@ def _valid_search_text_schema(schema: object) -> bool:
         "max_results",
     }
     bounded_fields = {"context_lines", "max_output_bytes"}
+    # Older Ash releases offered the legacy schema or the bounded search
+    # schema. The optional file-discovery mode extends only the bounded shape;
+    # keep rejecting any other property combination or a forged expansion.
     if not isinstance(properties, dict) or set(properties) not in (
         legacy_fields,
         legacy_fields | bounded_fields,
+        legacy_fields | bounded_fields | {"files_only"},
     ):
         return False
+    if "files_only" in properties:
+        file_only_schema = properties["files_only"]
+        if (
+            not isinstance(file_only_schema, dict)
+            or file_only_schema.get("type") != "boolean"
+            or (
+                "default" in file_only_schema
+                and file_only_schema["default"] is not False
+            )
+        ):
+            return False
     expected_types = {
         "pattern": "string",
         "directory_path": "string",

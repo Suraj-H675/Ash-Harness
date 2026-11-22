@@ -259,6 +259,8 @@ def test_search_discovery_requires_successfully_offered_exact_schema(
     # compact defaults), not Pydantic's unmodified argument-model schema.
     schema = SearchTextTool(SafetyGuard(tmp_path)).json_schema()
     assert schema["properties"]["context_lines"]["maximum"] == 10
+    assert schema["properties"]["files_only"]["type"] == "boolean"
+    assert "default" not in schema["properties"]["files_only"]
     request = {
         "tools": [
             {
@@ -302,12 +304,25 @@ def test_search_discovery_requires_successfully_offered_exact_schema(
     )
     # A model cannot legitimize widened or partially advertised limits merely
     # by repeating its forged schema in both the offer and discovery result.
-    for tamper in ("widen", "drop", "widen_context"):
+    for tamper in (
+        "widen", "drop", "widen_context", "bad_files_only_type",
+        "enabled_files_only_default", "files_only_without_bounded_fields",
+        "extra_field",
+    ):
         forged = json.loads(json.dumps(schema))
         if tamper == "widen":
             forged["properties"]["max_output_bytes"]["maximum"] = 20_000_000
         elif tamper == "widen_context":
             forged["properties"]["context_lines"]["maximum"] = 11
+        elif tamper == "bad_files_only_type":
+            forged["properties"]["files_only"]["type"] = "string"
+        elif tamper == "enabled_files_only_default":
+            forged["properties"]["files_only"]["default"] = True
+        elif tamper == "files_only_without_bounded_fields":
+            del forged["properties"]["context_lines"]
+            del forged["properties"]["max_output_bytes"]
+        elif tamper == "extra_field":
+            forged["properties"]["unreviewed_tool_option"] = {"type": "boolean"}
         else:
             del forged["properties"]["context_lines"]
         forged_request = {
