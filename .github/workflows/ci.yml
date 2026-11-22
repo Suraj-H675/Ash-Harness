@@ -224,6 +224,71 @@ jobs:
           "$RUNNER_TEMP/ash-smoke/bin/python" tests/packaging/smoke_minimal_install.py
           "$RUNNER_TEMP/ash-smoke/bin/python" tests/packaging/smoke_crew_install.py
 
+  installed-upgrade-parity:
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          version: "0.12.17"
+          enable-cache: true
+          python-version: "3.12"
+      - run: uv sync --locked --group dev
+      - name: Build candidate wheel from a fresh sdist
+        shell: bash
+        run: |
+          uv build --sdist --out-dir dist --clear
+          sdist="$(printf '%s\n' dist/*.tar.gz)"
+          uv build --wheel "$sdist" --out-dir dist
+      - name: Fetch and verify the immutable v0.5.1 wheel
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/ash-upgrade"
+          old_wheel="$RUNNER_TEMP/ash-upgrade/ash_ai-0.5.1-py3-none-any.whl"
+          curl --fail --location --silent --show-error \
+            --retry 3 --retry-all-errors --retry-delay 2 \
+            --connect-timeout 10 --max-time 60 \
+            "https://github.com/Suraj-H675/Ash-Harness/releases/download/ash-v0.5.1/ash_ai-0.5.1-py3-none-any.whl" \
+            --output "$old_wheel"
+          python - "$old_wheel" <<'PY'
+          import hashlib
+          import pathlib
+          import sys
+
+          wheel = pathlib.Path(sys.argv[1])
+          expected = pathlib.Path(
+              "tests/packaging/public-v0.5.1-wheel.sha256"
+          ).read_text(encoding="ascii").strip()
+          actual = hashlib.sha256(wheel.read_bytes()).hexdigest()
+          if actual != expected:
+              raise SystemExit(f"public wheel digest mismatch: {actual}")
+          print(f"verified public wheel sha256={actual}")
+          PY
+      - name: Install the published CLI into a clean Python 3.12 environment
+        shell: bash
+        run: |
+          uv venv .upgrade-venv --python 3.12
+          uv pip install --python .upgrade-venv/bin/python \
+            "$RUNNER_TEMP/ash-upgrade/ash_ai-0.5.1-py3-none-any.whl"
+      - name: Upgrade the installed CLI and resume its session
+        env:
+          ASH_FIRST_USE_WHEEL_PYTHON: ${{ github.workspace }}/.upgrade-venv/bin/python
+          ASH_FIRST_USE_OLD_WHEEL: ${{ runner.temp }}/ash-upgrade/ash_ai-0.5.1-py3-none-any.whl
+          ASH_FIRST_USE_UPGRADE_WHEEL: ${{ github.workspace }}/dist/ash_ai-0.5.1-py3-none-any.whl
+          ASH_FIRST_USE_UPGRADE_UV: uv
+          UV_OFFLINE: "1"
+        run: >-
+          uv run --locked pytest -s -q
+          tests/e2e/test_cli_terminal_fallbacks.py::test_fresh_cli_setup_reaches_approved_edit_test_and_safe_resume
+          --timeout=120 --timeout-method=thread
+
   minimum-dependencies:
     runs-on: ubuntu-latest
     steps:
@@ -431,6 +496,7 @@ jobs:
       - test
       - macos-explorer-e2e
       - artifact-install-smoke
+      - installed-upgrade-parity
       - minimum-dependencies
       - browser-e2e
       - docker-sandbox-e2e
