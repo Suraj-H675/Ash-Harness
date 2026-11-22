@@ -222,6 +222,10 @@ def _report_cli_error(
 
 def _config_overrides_from_args(args: argparse.Namespace) -> dict[str, Any]:
     overrides: dict[str, Any] = {}
+    if getattr(args, "openai_server_side_compaction", None) is not None:
+        overrides["openai_server_side_compaction"] = (
+            args.openai_server_side_compaction
+        )
     if (
         getattr(args, "mode", None) is not None
         and getattr(args, "command", "") != "diff-mode"

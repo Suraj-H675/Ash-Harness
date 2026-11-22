@@ -150,6 +150,10 @@ class ProviderRegistry:
     ) -> ProviderABC:
         """Build one configured provider without ambient credential fallback."""
 
+        if getattr(config, "openai_server_side_compaction", False):
+            raise ValueError(
+                "server-side compaction is unavailable for coworker provider routes"
+            )
         if not getattr(config, "_coworker_runtime_blocked", False):
             raise ValueError("coworker provider requires an explicit profile config")
         profile_environment = getattr(
@@ -247,6 +251,30 @@ class ProviderRegistry:
 
     def build(self, config: "AshConfig") -> ProviderABC:
         fallback_models = list(config.fallback_models)
+        if getattr(config, "openai_server_side_compaction", False):
+            provider_name, model_name = parse_model_string(config.model)
+            if fallback_models:
+                raise ValueError(
+                    "OpenAI server-side compaction does not support provider fallback"
+                )
+            if provider_name != "openai" or config.openai_auth_mode != "api_key":
+                raise ValueError(
+                    "OpenAI server-side compaction requires a first-party API-key "
+                    "Responses model"
+                )
+            if not openai_uses_responses_api(model_name):
+                raise ValueError(
+                    "OpenAI server-side compaction requires a supported first-party "
+                    "Responses model"
+                )
+            if (
+                _configured_api_key_envs(config, provider_name)
+                or _configured_api_key_helper(config, provider_name) is not None
+            ):
+                raise ValueError(
+                    "OpenAI server-side compaction does not support credential pools "
+                    "or helpers"
+                )
         if fallback_models:
             from ash.providers.failover import FailoverProvider
 
@@ -498,6 +526,16 @@ def _build_openai(
         api_key_override=api_key_override,
         environ=environment,
     )
+    if getattr(config, "openai_server_side_compaction", False) and not (
+        connection.uses_default_base_url
+        and openai_uses_responses_api(model_name)
+        and api_key_override is None
+        and environment is None
+    ):
+        raise ValueError(
+            "OpenAI server-side compaction requires the default first-party "
+            "API-key Responses endpoint"
+        )
     if connection.uses_default_base_url and openai_uses_responses_api(model_name):
         from ash.providers.openai_responses import OpenAIResponsesProvider
 
@@ -512,6 +550,8 @@ def _build_openai(
             cache_key=prompt_cache_key(config),
             retention=config.prompt_cache_retention,
         )
+        if getattr(config, "openai_server_side_compaction", False):
+            provider.enable_server_side_compaction()
         return provider
 
     from ash.providers.openai import OpenAIProvider

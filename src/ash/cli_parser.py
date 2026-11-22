@@ -1591,6 +1591,15 @@ def configure_parser(parser: argparse.ArgumentParser, version: str) -> None:
         ),
     )
     parser.add_argument(
+        "--openai-server-side-compaction",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Opt in to first-party OpenAI Responses server-side context management; "
+            "the user config setting is off by default."
+        ),
+    )
+    parser.add_argument(
         "--turn-time-budget",
         type=int,
         default=None,

@@ -8925,15 +8925,39 @@ async def test_switch_model_rejects_durable_opaque_replay_state_without_mutation
     # Persist the historical assistant state without adding it to the current
     # resident window: switching must consult durable history, not just RAM.
     store.save_message(session.session_id, opaque)
+    server_checkpoint = Message(
+        role="assistant",
+        content="Provider checkpoint output",
+        timestamp=datetime.now(timezone.utc),
+        metadata={
+            "provider_state": [
+                {
+                    "type": "responses_server_compaction_output",
+                    "output": [
+                        {
+                            "type": "compaction",
+                            "id": "cmp-1",
+                            "encrypted_content": "opaque-provider-checkpoint",
+                        }
+                    ],
+                }
+            ],
+        },
+    )
+    store.save_message(session.session_id, server_checkpoint)
 
     for next_route in ("openai/other-model", "anthropic/other-provider"):
-        with pytest.raises(RuntimeError, match="/restart-context"):
+        with pytest.raises(RuntimeError, match="/restart-context") as failure:
             loop.switch_model(next_route)
+        assert "opaque-provider-checkpoint" not in str(failure.value)
         assert loop.provider is original_provider
         assert loop._config is config
         assert session.model == original
         assert store.session_model(session.session_id) == original
-        assert store.load_session(session.session_id).messages == [opaque]
+        assert store.load_session(session.session_id).messages == [
+            opaque,
+            server_checkpoint,
+        ]
 
     await loop.aclose()
 

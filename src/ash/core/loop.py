@@ -3913,6 +3913,11 @@ class AshLoop:
             if self.current_session is not None:
                 await self._recover_current_session_before_turn()
             await self._negotiate_provider_capabilities()
+            self._validate_provider_server_compaction_policy(
+                self.current_session.session_id
+                if self.current_session is not None
+                else None
+            )
             if (
                 _metadata_has_image_blocks(user_metadata)
                 and not _provider_capabilities(self.provider).vision
@@ -4720,6 +4725,15 @@ class AshLoop:
                             )
                         }
                         if replay_credential_profile is not None
+                        else {}
+                    ),
+                    **(
+                        {
+                            "provider_server_compaction_policy": (
+                                model_completion.provider_context_policy
+                            )
+                        }
+                        if model_completion.provider_context_policy is not None
                         else {}
                     ),
                 },
@@ -5680,6 +5694,9 @@ class AshLoop:
             prepared_input = None
             request_messages = messages
             context_id = None
+        server_compaction_policy = (
+            self._validate_provider_server_compaction_policy(session_id)
+        )
         canonical_messages = normalize_messages(request_messages)
         has_replay = any(
             message.get("provider_state") for message in canonical_messages
@@ -6460,6 +6477,7 @@ class AshLoop:
             stop_reason=terminal_stop_reason,
             reasoning_blocks=reasoning_blocks,
             provider_state=provider_state,
+            provider_context_policy=server_compaction_policy,
         )
 
     def _handle_event(
@@ -8069,6 +8087,104 @@ class AshLoop:
             provider_max_output_tokens=capabilities.max_output_tokens,
         )
 
+    def _provider_server_compaction_policy(self) -> dict[str, Any] | None:
+        """Resolve the strict request threshold and route binding for this session."""
+
+        enabled = bool(
+            self._config is not None
+            and getattr(self._config, "openai_server_side_compaction", False)
+        )
+        provider_enabled = bool(
+            getattr(self.provider, "server_side_compaction_enabled", False)
+        )
+        if enabled != provider_enabled:
+            raise RuntimeError(
+                "OpenAI server-side compaction config does not match the active "
+                "provider route; rebuild the runtime before continuing."
+            )
+        if not enabled:
+            return None
+        if self._config is None:
+            raise RuntimeError(
+                "OpenAI server-side compaction requires a configured durable runtime"
+            )
+        budget = self._resolve_request_token_budget()
+        if budget is None or budget.input_limit < 2:
+            raise RuntimeError(
+                "OpenAI server-side compaction requires at least two usable input "
+                "tokens"
+            )
+        threshold = math.floor(
+            budget.input_limit * self._config.context_compaction_threshold
+        )
+        threshold = max(1, min(budget.input_limit - 1, threshold))
+        configure_threshold = getattr(
+            self.provider, "configure_server_side_compaction_threshold", None
+        )
+        if not callable(configure_threshold):
+            raise RuntimeError(
+                "The active provider cannot configure server-side compaction safely"
+            )
+        configure_threshold(threshold)
+        credential_binding = getattr(
+            self.provider, "server_side_compaction_route_binding", None
+        )
+        if not isinstance(credential_binding, str) or len(credential_binding) != 64:
+            raise RuntimeError(
+                "The active provider has no verified server-compaction route identity"
+            )
+        route_material = (
+            credential_binding
+            + "\0"
+            + self._config._active_profile_name
+            + "\0"
+            + os.path.abspath(str(self._config.db_directory.expanduser()))
+        )
+        route_binding = hashlib.sha256(route_material.encode("utf-8")).hexdigest()
+        capabilities = _provider_capabilities(self.provider)
+        return {
+            "version": 1,
+            "configured_model": self._config.model,
+            "owner": self.active_model_id,
+            "route_binding": route_binding,
+            "combined_limit": budget.combined_limit,
+            "input_limit": budget.input_limit,
+            "response_limit": budget.response_limit,
+            "configured_context_limit": self._config.max_context_tokens,
+            "configured_response_limit": self._config.max_completion_tokens,
+            "provider_context_window": capabilities.context_window,
+            "provider_input_cap": capabilities.max_input_tokens,
+            "provider_output_cap": capabilities.max_output_tokens,
+            "threshold_fraction": self._config.context_compaction_threshold,
+            "compact_threshold": threshold,
+        }
+
+    def _validate_provider_server_compaction_policy(
+        self,
+        session_id: str | None,
+    ) -> dict[str, Any] | None:
+        policy = self._provider_server_compaction_policy()
+        if session_id is None:
+            if policy is not None:
+                raise RuntimeError(
+                    "OpenAI server-side compaction requires a durable session identity"
+                )
+            return None
+        stored_policy, has_anchor = self.session_store.provider_server_compaction_state(
+            session_id
+        )
+        if has_anchor and stored_policy is None:
+            raise RuntimeError(
+                "Session server-compaction state has no verified policy; start a "
+                "new context before continuing."
+            )
+        if stored_policy is not None and stored_policy != policy:
+            raise RuntimeError(
+                "OpenAI server-compaction route, credentials, or context limits "
+                "changed; start a new context before continuing."
+            )
+        return policy
+
     def _provider_history_messages(
         self,
         session: Session,
@@ -8090,7 +8206,19 @@ class AshLoop:
             tool_result_images is not None
             and _provider_capabilities(self.provider).vision
         )
-        for message in session.messages:
+        history_start = 0
+        if getattr(self.provider, "server_side_compaction_enabled", False):
+            for index in range(len(session.messages) - 1, -1, -1):
+                message = session.messages[index]
+                state = message.metadata.get("provider_state")
+                if message.role == "assistant" and isinstance(state, list) and any(
+                    isinstance(item, dict)
+                    and item.get("type") == "responses_server_compaction_output"
+                    for item in state
+                ):
+                    history_start = index
+                    break
+        for message in session.messages[history_start:]:
             if message is self._active_turn_user_message:
                 active_turn_seen = True
             item: dict[str, Any] = {

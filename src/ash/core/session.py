@@ -5558,6 +5558,72 @@ class SessionStore:
 
         return self.provider_replay_state_identity(session_id)[0]
 
+    def provider_server_compaction_state(
+        self,
+        session_id: str,
+    ) -> tuple[dict[str, Any] | None, bool]:
+        """Read and validate the durable server-compaction policy and anchors."""
+
+        policy: dict[str, Any] | None = None
+        has_anchor = False
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                "SELECT metadata_json FROM messages "
+                "WHERE session_id = ? AND role = 'assistant' ORDER BY message_id",
+                (session_id,),
+            ).fetchall()
+        for row in rows:
+            try:
+                metadata = json.loads(row["metadata_json"] or "{}")
+            except (TypeError, ValueError) as exc:
+                raise _invalid_stored_data_error(self.db_path) from exc
+            if not isinstance(metadata, dict):
+                raise _invalid_stored_data_error(self.db_path)
+            raw_state = metadata.get("provider_state")
+            if isinstance(raw_state, list):
+                has_anchor = has_anchor or any(
+                    isinstance(item, dict)
+                    and item.get("type") == "responses_server_compaction_output"
+                    for item in raw_state
+                )
+                if has_anchor:
+                    from ash.providers.messages import CanonicalMessage
+
+                    try:
+                        CanonicalMessage.model_validate(
+                            {
+                                "role": "assistant",
+                                "content": "",
+                                "provider_state": raw_state,
+                            }
+                        )
+                    except (TypeError, ValueError):
+                        raise _invalid_stored_data_error(self.db_path) from None
+            raw_policy = metadata.get("provider_server_compaction_policy")
+            if raw_policy is None:
+                continue
+            if not isinstance(raw_policy, dict):
+                raise _invalid_stored_data_error(self.db_path)
+            try:
+                encoded = json.dumps(
+                    raw_policy,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    allow_nan=False,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            except (TypeError, ValueError, UnicodeEncodeError) as exc:
+                raise _invalid_stored_data_error(self.db_path) from exc
+            if len(encoded) > 4096:
+                raise _invalid_stored_data_error(self.db_path)
+            if policy is not None and raw_policy != policy:
+                raise RuntimeError(
+                    "Session contains conflicting OpenAI server-compaction "
+                    "policies; start a new context before continuing."
+                )
+            policy = raw_policy
+        return policy, has_anchor
+
     def save_runtime_events(self, events: list[dict[str, Any]]) -> int:
         """Append a batch of canonical events, ignoring replayed event IDs."""
 

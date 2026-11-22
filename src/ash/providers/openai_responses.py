@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import json
+import os
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any, AsyncGenerator
 
@@ -119,8 +122,37 @@ def prepare_openai_responses_input(
             for state_item in message.get("provider_state") or []:
                 if state_item["type"] == "responses_compacted_input":
                     items.extend(state_item["output"])
+                elif state_item["type"] == "responses_server_compaction_output":
+                    checkpoint_output = state_item["output"]
+                    anchor_index = max(
+                        index
+                        for index, entry in enumerate(checkpoint_output)
+                        if entry.get("type") == "compaction"
+                    )
+                    for checkpoint_item in checkpoint_output[anchor_index:]:
+                        if checkpoint_item.get("type") == "compaction":
+                            # Server output has an output-only `created_by`.
+                            # Retain it durably, but omit it from provider input.
+                            items.append(
+                                {
+                                    key: value
+                                    for key, value in checkpoint_item.items()
+                                    if key != "created_by"
+                                }
+                            )
+                        else:
+                            items.append(checkpoint_item)
                 else:
                     items.append(dict(state_item))
+            if any(
+                state_item["type"]
+                in {"responses_compacted_input", "responses_server_compaction_output"}
+                for state_item in message.get("provider_state") or []
+            ):
+                # The stored provider output is the canonical replay of this
+                # assistant response. Its Ash text/tool representation remains
+                # durable for audit, but must not be appended a second time.
+                continue
             if content:
                 if not isinstance(content, str):
                     raise ValueError("assistant Responses replay content must be text")
@@ -163,6 +195,124 @@ def prepare_openai_responses_input(
     return "\n\n".join(instructions), items
 
 
+def _response_output_item_payload(item: Any) -> dict[str, Any]:
+    if isinstance(item, Mapping):
+        payload = dict(item)
+    else:
+        dump = getattr(item, "model_dump", None)
+        if not callable(dump):
+            raise ValueError("Responses output item is not a typed object")
+        payload = dump(mode="json", exclude_none=True)
+    if not isinstance(payload, dict):
+        raise ValueError("Responses output item is not an object")
+    try:
+        encoded = json.dumps(
+            payload,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    except (TypeError, ValueError, UnicodeEncodeError, OverflowError):
+        raise ValueError("Responses output item is not bounded JSON") from None
+    if len(encoded) > MAX_PROVIDER_STATE_BYTES:
+        raise ValueError("Responses output item exceeds the replay bound")
+    return payload
+
+
+def _validate_server_compaction_output(
+    output: Any,
+    *,
+    streamed_items: Sequence[dict[str, Any]],
+    streamed_text: Mapping[tuple[int, int], str],
+    tool_calls: Sequence[CanonicalToolCall],
+) -> list[dict[str, Any]]:
+    if not isinstance(output, list) or not output:
+        raise ValueError("server-side compaction output is invalid")
+    try:
+        payload = [_response_output_item_payload(item) for item in output]
+        if payload != list(streamed_items):
+            raise ValueError("completed output differs from streamed output")
+        anchor_indices = [
+            index
+            for index, item in enumerate(payload)
+            if item.get("type") == "compaction"
+        ]
+        if not anchor_indices:
+            raise ValueError("server-side compaction output has no anchor")
+        expected_text: dict[tuple[int, int], str] = {}
+        for output_index, item in enumerate(payload):
+            if item.get("type") != "message":
+                continue
+            content = item.get("content")
+            if not isinstance(content, list):
+                raise ValueError("server-side Responses message content is invalid")
+            for content_index, block in enumerate(content):
+                if not isinstance(block, dict):
+                    raise ValueError("server-side Responses text block is invalid")
+                block_type = block.get("type")
+                if block_type == "output_text":
+                    expected_text[(output_index, content_index)] = block["text"]
+                elif block_type == "refusal":
+                    expected_text[(output_index, content_index)] = block["refusal"]
+        if dict(streamed_text) != expected_text:
+            raise ValueError("completed text differs from streamed text")
+        anchor_index = anchor_indices[-1]
+        anchor = payload[anchor_index]
+        if not isinstance(anchor.get("id"), str) or not anchor["id"]:
+            raise ValueError("server-side compaction anchor has no identifier")
+        suffix_calls = [
+            item
+            for item in payload[anchor_index:]
+            if item.get("type") == "function_call"
+        ]
+        if len(suffix_calls) != len(tool_calls):
+            raise ValueError("server-side compaction would orphan a tool call")
+        for item, call in zip(suffix_calls, tool_calls, strict=True):
+            if (
+                item.get("call_id") != call.call_id
+                or item.get("name") != call.name
+                or strict_json_loads(str(item.get("arguments", "")))
+                != call.arguments
+            ):
+                raise ValueError("server-side compaction tool replay is inconsistent")
+        state = [{"type": "responses_server_compaction_output", "output": payload}]
+        from ash.providers.messages import CanonicalMessage
+
+        validated = CanonicalMessage.model_validate(
+            {"role": "assistant", "content": "", "provider_state": state}
+        )
+        return validated.provider_state or []
+    except (TypeError, ValueError, KeyError, UnicodeError, OverflowError):
+        raise RuntimeError(
+            "OpenAI returned a malformed or unsafe server-side compaction checkpoint"
+        ) from None
+
+
+async def _server_compaction_stream_events(stream: Any) -> AsyncGenerator[Any, None]:
+    """Hide SDK parser and transport details for opaque-state requests."""
+
+    try:
+        iterator = stream.__aiter__()
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        raise ProviderIncompleteStreamError(
+            "OpenAI Responses server-side compaction stream failed before completion"
+        ) from None
+    while True:
+        try:
+            event = await iterator.__anext__()
+        except StopAsyncIteration:
+            return
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            raise ProviderIncompleteStreamError(
+                "OpenAI Responses server-side compaction stream failed before completion"
+            ) from None
+        yield event
+
+
 def _reasoning_replay_item(item: Any) -> dict[str, Any]:
     if getattr(item, "type", None) != "reasoning":
         raise ValueError("provider replay state item is not reasoning")
@@ -202,6 +352,7 @@ async def stream_openai_responses(
     error_label: str = "OpenAI Responses",
     error_secrets: Sequence[str] = (),
     terminal_error_factory: Callable[[str], ProviderTerminalError] = ProviderTerminalError,
+    capture_server_side_compaction: bool = False,
 ) -> AsyncGenerator[StreamChunk, None]:
     """Stream one stateless Responses request into Ash's canonical chunks."""
 
@@ -230,17 +381,83 @@ async def stream_openai_responses(
     completed = False
     provider_state: list[dict[str, Any]] = []
     tool_calls: list[CanonicalToolCall] = []
+    streamed_output: list[dict[str, Any]] = []
+    streamed_output_bytes = 0
+    streamed_text: dict[tuple[int, int], str] = {}
+    streamed_text_bytes = 0
+    output_capture_failed = False
+    compaction_item_seen = False
     async with managed_async_stream(stream, label='OpenAI Responses') as managed_stream:
-        async for event in managed_stream:
+        event_stream = (
+            _server_compaction_stream_events(managed_stream)
+            if capture_server_side_compaction
+            else managed_stream
+        )
+        async for event in event_stream:
             event_type = str(getattr(event, "type", "") or "")
             if event_type in {"response.output_text.delta", "response.refusal.delta"}:
                 delta = str(getattr(event, "delta", "") or "")
                 if delta:
+                    if capture_server_side_compaction:
+                        output_index = getattr(event, "output_index", None)
+                        content_index = getattr(event, "content_index", None)
+                        if (
+                            type(output_index) is not int
+                            or output_index < 0
+                            or type(content_index) is not int
+                            or content_index < 0
+                        ):
+                            output_capture_failed = True
+                        elif not output_capture_failed:
+                            key = (output_index, content_index)
+                            try:
+                                delta_bytes = len(delta.encode("utf-8"))
+                            except UnicodeEncodeError:
+                                output_capture_failed = True
+                            else:
+                                if streamed_text_bytes + delta_bytes > MAX_PROVIDER_STATE_BYTES:
+                                    output_capture_failed = True
+                                else:
+                                    streamed_text[key] = streamed_text.get(key, "") + delta
+                                    streamed_text_bytes += delta_bytes
                     yield StreamChunk(content=delta, model=model_name)
                 continue
             if event_type == "response.output_item.done":
                 item = getattr(event, "item", None)
                 item_type = str(getattr(item, "type", "") or "")
+                if capture_server_side_compaction:
+                    output_index = getattr(event, "output_index", None)
+                    try:
+                        payload = _response_output_item_payload(item)
+                        encoded_size = len(
+                            json.dumps(
+                                payload,
+                                ensure_ascii=False,
+                                allow_nan=False,
+                                separators=(",", ":"),
+                            ).encode("utf-8")
+                        )
+                    except (TypeError, ValueError, UnicodeError, OverflowError):
+                        output_capture_failed = True
+                    else:
+                        if (
+                            type(output_index) is not int
+                            or output_index != len(streamed_output)
+                            or len(streamed_output) >= MAX_OPENAI_RESPONSE_STATE_ITEMS
+                            or streamed_output_bytes + encoded_size
+                            > MAX_PROVIDER_STATE_BYTES
+                        ):
+                            output_capture_failed = True
+                        elif not output_capture_failed:
+                            streamed_output.append(payload)
+                            streamed_output_bytes += encoded_size
+                    if item_type == "compaction":
+                        compaction_item_seen = True
+                        if output_capture_failed:
+                            raise RuntimeError(
+                                "OpenAI server-side compaction output exceeded its "
+                                "verified replay bounds"
+                            ) from None
                 if item_type == "reasoning":
                     if len(provider_state) >= MAX_OPENAI_RESPONSE_STATE_ITEMS:
                         raise RuntimeError("OpenAI returned too many reasoning replay items")
@@ -272,10 +489,18 @@ async def stream_openai_responses(
                     )
                 continue
             if event_type == "response.failed":
+                if capture_server_side_compaction:
+                    raise ProviderTerminalError(
+                        "OpenAI Responses server-side compaction request failed"
+                    )
                 error = getattr(getattr(event, "response", None), "error", None)
                 code = str(getattr(error, "code", "") or "error")
                 raise terminal_error_factory(code)
             if event_type == "response.incomplete":
+                if capture_server_side_compaction:
+                    raise ProviderTerminalError(
+                        "OpenAI Responses server-side compaction stream was incomplete"
+                    )
                 details = getattr(
                     getattr(event, "response", None),
                     "incomplete_details",
@@ -284,10 +509,37 @@ async def stream_openai_responses(
                 reason = str(getattr(details, "reason", "") or "incomplete")
                 raise ProviderTerminalError(reason)
             if event_type == "error":
+                if capture_server_side_compaction:
+                    raise ProviderTerminalError(
+                        "OpenAI Responses server-side compaction request failed"
+                    )
                 code = str(getattr(event, "code", "") or "error")
                 raise terminal_error_factory(code)
             if event_type == "response.completed":
                 response = getattr(event, "response", None)
+                if capture_server_side_compaction:
+                    response_output = getattr(response, "output", None)
+                    response_has_compaction = isinstance(response_output, list) and any(
+                        str(getattr(item, "type", "") or "") == "compaction"
+                        for item in response_output
+                    )
+                    if response_has_compaction and output_capture_failed:
+                        raise RuntimeError(
+                            "OpenAI server-side compaction output exceeded its "
+                            "verified replay bounds"
+                        ) from None
+                    if response_has_compaction != compaction_item_seen:
+                        raise RuntimeError(
+                            "OpenAI completed output did not match its streamed "
+                            "compaction items"
+                        ) from None
+                    if compaction_item_seen:
+                        provider_state = _validate_server_compaction_output(
+                            response_output,
+                            streamed_items=streamed_output,
+                            streamed_text=streamed_text,
+                            tool_calls=tool_calls,
+                        )
                 usage = getattr(response, "usage", None)
                 input_details = getattr(usage, "input_tokens_details", None)
                 yield StreamChunk(
@@ -401,10 +653,43 @@ class OpenAIResponsesProvider(ProviderABC):
         self._prompt_cache_enabled = False
         self._prompt_cache_key = ""
         self._prompt_cache_retention = "memory"
+        self._server_side_compaction_enabled = False
+        self._server_side_compaction_threshold: int | None = None
 
     @property
     def model_name(self) -> str:
         return self._model_name
+
+    @property
+    def server_side_compaction_enabled(self) -> bool:
+        return self._server_side_compaction_enabled
+
+    @property
+    def server_side_compaction_route_binding(self) -> str:
+        if not self._server_side_compaction_enabled:
+            raise RuntimeError("server-side compaction is not enabled on this route")
+        route_values = "\0".join(
+            (
+                self._api_key,
+                os.environ.get("OPENAI_ORG_ID", ""),
+                os.environ.get("OPENAI_PROJECT_ID", ""),
+            )
+        )
+        return hashlib.sha256(route_values.encode("utf-8")).hexdigest()
+
+    def enable_server_side_compaction(self) -> None:
+        if self._base_url is not None:
+            raise ValueError(
+                "server-side compaction requires the first-party default endpoint"
+            )
+        self._server_side_compaction_enabled = True
+
+    def configure_server_side_compaction_threshold(self, threshold: int) -> None:
+        if not self._server_side_compaction_enabled:
+            raise RuntimeError("server-side compaction is not enabled on this route")
+        if type(threshold) is not int or threshold < 1:
+            raise ValueError("server-side compaction threshold must be positive")
+        self._server_side_compaction_threshold = threshold
 
     def count_tokens(self, text: str) -> int:
         return self._token_counter.count(text)
@@ -494,6 +779,15 @@ class OpenAIResponsesProvider(ProviderABC):
             request_options["reasoning"] = {
                 "effort": self.configured_reasoning_effort
             }
+        if self._server_side_compaction_enabled:
+            threshold = self._server_side_compaction_threshold
+            if threshold is None:
+                raise RuntimeError(
+                    "server-side compaction has no resolved request threshold"
+                )
+            request_options["context_management"] = [
+                {"type": "compaction", "compact_threshold": threshold}
+            ]
 
         client = self._resolve_client()
         async for chunk in stream_openai_responses(
@@ -504,6 +798,7 @@ class OpenAIResponsesProvider(ProviderABC):
             request_options=request_options,
             error_label="OpenAI API Responses",
             error_secrets=(self._api_key,),
+            capture_server_side_compaction=self._server_side_compaction_enabled,
         ):
             yield chunk
 

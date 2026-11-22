@@ -265,6 +265,13 @@ class CanonicalMessage(BaseModel):
                 )
             for item in self.provider_state:
                 _validate_provider_state_item(item)
+            if any(
+                item.get("type") == "responses_server_compaction_output"
+                for item in self.provider_state
+            ) and len(self.provider_state) != 1:
+                raise ValueError(
+                    "server-side Responses output must be the only provider state item"
+                )
             try:
                 encoded = json.dumps(
                     self.provider_state,
@@ -340,11 +347,40 @@ def _validate_provider_state_item(item: Any) -> None:
             raise ValueError("native Responses checkpoint must end in compaction")
         _validate_provider_state_item(output[-1])
         return
+    if item.get("type") == "responses_server_compaction_output":
+        if set(item) != {"type", "output"}:
+            raise ValueError("server-side Responses checkpoint has unsupported fields")
+        output = item["output"]
+        if (
+            not isinstance(output, list)
+            or not 1 <= len(output) <= MAX_PROVIDER_STATE_ITEMS
+            or not all(isinstance(entry, dict) for entry in output)
+        ):
+            raise ValueError("server-side Responses output is invalid")
+        if not any(entry.get("type") == "compaction" for entry in output):
+            raise ValueError("server-side Responses output has no compaction anchor")
+        for entry in output:
+            kind = entry.get("type")
+            if kind == "compaction":
+                _validate_provider_state_item(entry)
+                if not isinstance(entry.get("id"), str) or not entry["id"]:
+                    raise ValueError(
+                        "server-side Responses compaction anchor requires an id"
+                    )
+            elif kind == "reasoning":
+                _validate_provider_reasoning_state(entry)
+            elif kind == "message":
+                _validate_responses_output_message(entry)
+            elif kind == "function_call":
+                _validate_responses_output_function_call(entry)
+            else:
+                raise ValueError("server-side Responses output item is unsupported")
+        return
     if item.get("type") == "reasoning":
         _validate_provider_reasoning_state(item)
         return
     if item.get("type") == "compaction":
-        if set(item) - {"type", "id", "encrypted_content"}:
+        if set(item) - {"type", "id", "encrypted_content", "created_by"}:
             raise ValueError("provider compaction item contains unsupported fields")
         encrypted = item.get("encrypted_content")
         item_id = item.get("id")
@@ -357,11 +393,100 @@ def _validate_provider_state_item(item: Any) -> None:
             ))
         ):
             raise ValueError("provider compaction item is invalid")
+        created_by = item.get("created_by")
+        if created_by is not None and created_by != "auto":
+            raise ValueError("provider compaction item has an invalid owner")
         return
     if item.get("type") == "sealed_provider_state":
         _validate_sealed_provider_state(item)
         return
     raise ValueError("provider_state item type is unsupported")
+
+
+def _validate_responses_output_message(item: dict[str, Any]) -> None:
+    allowed = {"type", "id", "role", "status", "content", "phase"}
+    if set(item) - allowed or item.get("role") != "assistant":
+        raise ValueError("server-side Responses message item is unsupported")
+    if item.get("phase") is not None and item["phase"] not in {
+        "commentary", "final_answer"
+    }:
+        raise ValueError("server-side Responses message phase is unsupported")
+    item_id = item.get("id")
+    if item_id is not None and (
+        not isinstance(item_id, str) or not item_id or len(item_id) > 1024
+    ):
+        raise ValueError("server-side Responses message item has an invalid id")
+    status = item.get("status")
+    if status is not None and status != "completed":
+        raise ValueError("server-side Responses message item has an invalid status")
+    content = item.get("content")
+    if not isinstance(content, list) or len(content) > MAX_CANONICAL_CONTENT_BLOCKS:
+        raise ValueError("server-side Responses message content is invalid")
+    for block in content:
+        if not isinstance(block, dict) or block.get("type") not in {
+            "output_text",
+            "refusal",
+        }:
+            raise ValueError("server-side Responses message content is unsupported")
+        block_type = block["type"]
+        allowed_block_fields = (
+            {"type", "text", "annotations", "logprobs"}
+            if block_type == "output_text"
+            else {"type", "refusal"}
+        )
+        if set(block) - allowed_block_fields:
+            raise ValueError("server-side Responses text block is unsupported")
+        text = block.get("text" if block_type == "output_text" else "refusal")
+        if not isinstance(text, str):
+            raise ValueError("server-side Responses text block is invalid")
+        try:
+            size = len(text.encode("utf-8"))
+        except UnicodeEncodeError as exc:
+            raise ValueError("server-side Responses text must be valid UTF-8") from exc
+        if size > MAX_CANONICAL_CONTENT_BYTES:
+            raise ValueError("server-side Responses text block is too large")
+        if block_type == "output_text":
+            annotations = block.get("annotations", [])
+            if not isinstance(annotations, list) or len(annotations) > 256:
+                raise ValueError("server-side Responses annotations are invalid")
+            for annotation in annotations:
+                if not isinstance(annotation, dict) or annotation.get("type") not in {
+                    "url_citation",
+                    "file_citation",
+                }:
+                    raise ValueError("server-side Responses annotation is unsupported")
+                if len(annotation) > 8 or any(
+                    not isinstance(key, str)
+                    or not isinstance(value, (str, int, float, bool, type(None)))
+                    for key, value in annotation.items()
+                ):
+                    raise ValueError("server-side Responses annotation is malformed")
+            logprobs = block.get("logprobs", [])
+            if logprobs not in (None, []):
+                raise ValueError("server-side Responses log probabilities are unsupported")
+
+
+def _validate_responses_output_function_call(item: dict[str, Any]) -> None:
+    if set(item) - {"type", "id", "call_id", "name", "arguments", "status"}:
+        raise ValueError("server-side Responses function call is unsupported")
+    item_id = item.get("id")
+    if item_id is not None and (
+        not isinstance(item_id, str) or not item_id or len(item_id) > 1024
+    ):
+        raise ValueError("server-side Responses function call has an invalid id")
+    status = item.get("status")
+    if status is not None and status != "completed":
+        raise ValueError("server-side Responses function call has an invalid status")
+    try:
+        CanonicalToolCall.model_validate(
+            {
+                "call_id": item.get("call_id"),
+                "name": item.get("name"),
+                "arguments": item.get("arguments"),
+            }
+        )
+    except (TypeError, ValueError):
+        raise ValueError("server-side Responses function call is malformed") from None
 
 
 def _validate_provider_reasoning_state(item: dict[str, Any]) -> None:

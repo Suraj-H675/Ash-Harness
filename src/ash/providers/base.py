@@ -273,6 +273,7 @@ class CompletionOutcome(BaseModel):
         max_length=MAX_PROVIDER_REASONING_BLOCKS_PER_CHUNK,
     )
     provider_state: list[dict[str, Any]] = Field(default_factory=list, max_length=64)
+    provider_context_policy: dict[str, Any] | None = None
 
     @field_validator("provider_state", mode="before")
     @classmethod

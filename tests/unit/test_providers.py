@@ -1340,6 +1340,7 @@ async def test_openai_responses_provider_uses_native_tools_and_normalizes_cache_
     request = client.responses.kwargs
     assert request["store"] is False
     assert request["stream"] is True
+    assert "context_management" not in request
     assert request["max_output_tokens"] == 4096
     assert request["prompt_cache_key"] == "ash-project-test"
     assert request["prompt_cache_options"] == {"mode": "implicit", "ttl": "30m"}

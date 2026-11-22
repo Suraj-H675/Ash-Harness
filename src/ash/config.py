@@ -506,6 +506,7 @@ class AshConfig(BaseSettings):
 
     _config_sources: dict[str, tuple[str, str]] = PrivateAttr(default_factory=dict)
     _config_diagnostics: list[str] = PrivateAttr(default_factory=list)
+    _active_profile_name: str = PrivateAttr(default=DEFAULT_PROFILE)
     _coworker_runtime_blocked: bool = PrivateAttr(default=False)
     _coworker_provider_environment: dict[str, str] = PrivateAttr(
         default_factory=dict
@@ -1092,6 +1093,13 @@ class AshConfig(BaseSettings):
         description=(
             "User-owned authentication route for first-party OpenAI models: "
             "api_key or chatgpt. Project configuration cannot set this field."
+        ),
+    )
+    openai_server_side_compaction: bool = Field(
+        False,
+        description=(
+            "Opt in to first-party OpenAI Responses server-side context management. "
+            "Project configuration cannot enable this provider behavior."
         ),
     )
 
@@ -2256,6 +2264,7 @@ class AshConfig(BaseSettings):
             os.environ["ASH_MODEL"] = str(env_values["model"])
         config._config_sources = sources
         config._config_diagnostics = diagnostics
+        config._active_profile_name = active_profile
         config._record_derived_sources()
         config._coworker_runtime_blocked = _validation_only
         if _validation_only:
@@ -2312,6 +2321,7 @@ class AshConfig(BaseSettings):
         )
         updated = type(self).model_validate(payload, context=validation_context)
         updated._coworker_runtime_blocked = self._coworker_runtime_blocked
+        updated._active_profile_name = self._active_profile_name
         updated._config_sources = dict(self._config_sources)
         updated._config_sources.update(
             {
