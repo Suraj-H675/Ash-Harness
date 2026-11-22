@@ -2200,6 +2200,80 @@ def test_context_restart_accepts_only_reconciled_interrupted_turn(
     assert store.interrupted_recovery_reports(source.session_id)[0]["status"] == "interrupted"
 
 
+def test_automatic_context_restart_accepts_successful_tool_discovery(
+    tmp_path: Path,
+) -> None:
+    from ash.core.checkpoints import recover_interrupted_turns
+    from ash.safety.guard import SafetyGuard
+
+    store = SessionStore(tmp_path / "tool-discovery-context-restart.db")
+    source = store.create_session(
+        str(tmp_path), model="openai/gpt-6-luna", permission_mode="plan"
+    )
+    store.start_turn(source.session_id, "turn-discovery", "Inspect source navigation")
+    store.save_message(
+        source.session_id,
+        Message(
+            role="assistant",
+            content="",
+            timestamp=datetime.now(timezone.utc),
+            metadata={"provider_state": [{
+                "type": "reasoning",
+                "id": "search-tools-replay",
+                "summary": [],
+                "status": "completed",
+                "encrypted_content": "opaque-search-tools-state",
+            }]},
+        ),
+    )
+    store.save_tool_call(
+        source.session_id,
+        ToolCallRecord(
+            call_id="discover-read-files",
+            tool_name="search_tools",
+            arguments={"query": "read source definitions", "limit": 1},
+            approved=True,
+            dispatched=True,
+            executed=True,
+            success=True,
+            result='{"tools": [{"name": "read_files"}]}',
+            error=None,
+            timestamp=datetime.now(timezone.utc),
+        ),
+        turn_id="turn-discovery",
+    )
+    store.interrupt_turn("turn-discovery")
+    recovery = recover_interrupted_turns(
+        store,
+        SafetyGuard(project_root=tmp_path),
+        source.session_id,
+        include_quiescent_interrupted=True,
+    )
+    assert recovery.interrupted_turns == 1
+    assert not recovery.needs_attention
+
+    parent_before = store.load_session(source.session_id)
+    child = store.restart_context_session(
+        source.session_id,
+        expected_project_path=tmp_path,
+        user_handoff="Continue inspecting source navigation in a fresh context",
+        automatic=True,
+    )
+
+    assert child.parent_session_id == source.session_id
+    assert child.fork_message_count == 0
+    assert child.tool_calls == []
+    assert len(child.messages) == 1
+    assert "Continue inspecting source navigation" in child.messages[0].content
+    assert "not imported or authorized for replay" in child.messages[0].content.lower()
+    assert "opaque-search-tools-state" not in repr(child)
+    parent_after = store.load_session(source.session_id)
+    assert parent_before.messages == parent_after.messages
+    assert parent_before.tool_calls == parent_after.tool_calls
+    assert store.verify_audit_log(source.session_id) == []
+    assert store.verify_audit_log(child.session_id) == []
+
+
 def test_context_restart_rejects_recovered_ambiguous_external_action(
     tmp_path: Path,
 ) -> None:

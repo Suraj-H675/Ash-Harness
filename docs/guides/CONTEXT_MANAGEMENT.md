@@ -374,7 +374,8 @@ tool results, approvals or tool dispatches. Automatic continuation is
 **refused** if the previous turn dispatched any shell command or other
 external tool, even when its result is known, or if it has ambiguous actions,
 unfinished edits or unverified external tasks. Only known-successful local
-read/search and direct workspace edit tools may precede an automatic handoff.
+read/search tools, including `search_tools` catalog discovery, and direct
+workspace edit tools may precede an automatic handoff.
 While this option is active, the built-in `replace_file_content` tool also
 preflights an approved edit **before** tool dispatch, tool hooks or middleware.
 If the exact replacement is already invalid, Ash records a rejection without
