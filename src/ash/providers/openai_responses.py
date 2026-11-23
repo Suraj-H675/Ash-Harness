@@ -27,7 +27,11 @@ from ash.providers.messages import (
     MessageInput,
     normalize_messages,
 )
-from ash.providers.openai import _api_key_replay_identity, _owned_openai_http_client
+from ash.providers.openai import (
+    _api_key_replay_identity,
+    _owned_openai_http_client,
+    _sdk_replay_transport_scope,
+)
 from ash.providers.readiness import (
     normalize_provider_base_url,
     redact_provider_error,
@@ -662,13 +666,22 @@ class OpenAIResponsesProvider(ProviderABC):
     def model_name(self) -> str:
         return self._model_name
 
-    def replay_credential_identity(self) -> ProviderReplayCredentialIdentity:
-        """Return the exact API key used by this provider, in memory only."""
+    def replay_credential_identity(self) -> ProviderReplayCredentialIdentity | None:
+        """Bind to the SDK's effective, cached endpoint and tenant selection."""
 
+        if not self._owns_client:
+            return None
+        client_scope = _sdk_replay_transport_scope(
+            self._resolve_client(), provider_family=self.provider_family
+        )
+        if client_scope is None:
+            return None
+        base_url, organization, project = client_scope
         return _api_key_replay_identity(
             self._api_key,
             provider_family=self.provider_family,
-            base_url=self._base_url,
+            base_url=base_url,
+            extra_scope=(organization, project),
         )
 
     @property

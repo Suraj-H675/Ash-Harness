@@ -5919,11 +5919,28 @@ class AshLoop:
                             identity = await resolve_provider_replay_identity(
                                 self.provider
                             )
-                            verify_provider_replay_identity(
-                                identity,
-                                provider_family=self.provider.provider_family,
-                                model_name=self.provider.model_name,
+                            resolved_family = getattr(
+                                self.provider, "provider_family", None
                             )
+                            provider_model_name = getattr(
+                                self.provider, "model_name", None
+                            )
+                            if (
+                                isinstance(resolved_family, str)
+                                and resolved_family
+                                and isinstance(provider_model_name, str)
+                                and provider_model_name
+                            ):
+                                verify_provider_replay_identity(
+                                    identity,
+                                    provider_family=resolved_family,
+                                    model_name=provider_model_name,
+                                )
+                            elif replay_bindings:
+                                # Lightweight legacy provider adapters may not
+                                # declare a family. They can perform stateless
+                                # requests but cannot claim opaque replay.
+                                raise ProviderReplayAffinityError
                             active_provider_stream = self.provider.stream_chat(
                                 canonical_messages,
                                 tools=openai_tools,

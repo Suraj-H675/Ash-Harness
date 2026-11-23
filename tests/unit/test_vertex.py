@@ -410,3 +410,157 @@ async def test_vertex_adc_rejects_invalid_refreshed_token() -> None:
 
     with pytest.raises(VertexCredentialError, match="invalid access token"):
         await provider()
+
+
+@pytest.mark.asyncio
+async def test_vertex_adc_refresh_attests_effective_principal_at_token_dispatch(
+    tmp_path,
+) -> None:
+    from ash.providers.replay_affinity import (
+        ProviderReplayAffinityError,
+        ProviderReplayAttempt,
+        ProviderReplayBindingRecord,
+        provider_replay_attempt,
+    )
+    from ash.providers.replay_state import ProviderReplayStateCipher
+
+    class RotatingCredentials(_Credentials):
+        replacement_principal = "subject-b@fictional.invalid"
+
+        def refresh(self, request) -> None:
+            super().refresh(request)
+            self.service_account_email = self.replacement_principal
+
+    credentials = RotatingCredentials(
+        token="fictional-token-before", valid=True,
+        service_account_email="subject-a@fictional.invalid",
+    )
+    token_provider = GoogleAdcTokenProvider(
+        credentials=credentials, request="request"
+    )
+    provider = VertexProvider(
+        "google/gemini-test", project="project-123", location="global",
+        token_provider=token_provider, client=SimpleNamespace(),
+    )
+    original = await provider.resolve_replay_credential_identity()
+    assert original is not None
+    state = [{"type": "reasoning", "id": "fixture", "encrypted_content": "OPAQUE"}]
+    cipher = ProviderReplayStateCipher(
+        tmp_path / "provider-replay-state", trusted_root=tmp_path
+    )
+    binding = cipher.bind_credential_identity(
+        original, session_scope_id="session-root", owner="vertex/google/gemini-test",
+        profile=None, state=state,
+    )
+    record = ProviderReplayBindingRecord(
+        owner="vertex/google/gemini-test", profile=None, state=state, binding=binding
+    )
+    attempt = ProviderReplayAttempt(
+        cipher=cipher, session_scope_id="session-root",
+        expected_owner="vertex/google/gemini-test", expected_profile=None,
+        expected_records=(record,),
+    )
+    with provider_replay_attempt(attempt):
+        with pytest.raises(ProviderReplayAffinityError, match="/restart-context"):
+            await provider._api_key()  # SDK's effective token callback
+    assert credentials.refresh_count == 1
+    assert token_provider.redaction_secrets() == ("adc-token-1",)
+
+    credentials.service_account_email = "subject-a@fictional.invalid"
+    credentials.valid = False
+    credentials.replacement_principal = "subject-a@fictional.invalid"
+    continued = ProviderReplayAttempt(
+        cipher=cipher, session_scope_id="session-root",
+        expected_owner="vertex/google/gemini-test", expected_profile=None,
+        expected_records=(record,),
+    )
+    with provider_replay_attempt(continued):
+        token = await provider._api_key()
+    assert token == "adc-token-2"
+    assert credentials.refresh_count == 2
+
+
+@pytest.mark.asyncio
+async def test_vertex_sdk_token_callback_rejects_switched_principal_before_transport(
+    tmp_path,
+) -> None:
+    import httpx2
+    import openai
+    from ash.providers.replay_affinity import (
+        ProviderReplayAttempt, ProviderReplayBindingRecord, provider_replay_attempt,
+    )
+    from ash.providers.replay_state import ProviderReplayStateCipher
+    from ash.providers.retry import classify_provider_failure
+
+    class ReplacementCredentials(_Credentials):
+        def refresh(self, request) -> None:
+            super().refresh(request)
+            self.service_account_email = "different-owner@fictional.invalid"
+
+    credentials = ReplacementCredentials(
+        token="fictional-original", valid=True,
+        service_account_email="original-owner@fictional.invalid",
+    )
+    provider = VertexProvider(
+        "google/gemini-fixture", project="fixture-project", location="global",
+        token_provider=GoogleAdcTokenProvider(
+            credentials=credentials, request="request",
+        ),
+    )
+    observed_requests: list[Any] = []
+
+    def fake_transport(request: Any) -> Any:
+        observed_requests.append(request)
+        return httpx2.Response(200, json={"choices": []})
+
+    provider._client = openai.AsyncOpenAI(
+        api_key=provider._scoped_request_token,
+        base_url=vertex_openai_base_url(provider.project, provider.location),
+        max_retries=0,
+        http_client=httpx2.AsyncClient(
+            transport=httpx2.MockTransport(fake_transport), trust_env=False,
+        ),
+    )
+    assert provider._owns_client is True
+    identity = await provider.resolve_replay_credential_identity()
+    assert identity is not None
+    state = [{
+        "type": "reasoning", "id": "fictional", "summary": [],
+        "encrypted_content": "FICTIONAL_SOURCE_A",
+    }]
+    cipher = ProviderReplayStateCipher(
+        tmp_path / "replay-state", trusted_root=tmp_path,
+    )
+    owner = "vertex/" + provider.model_name
+    binding = cipher.bind_credential_identity(
+        identity, session_scope_id="root-a", owner=owner,
+        profile=None, state=state,
+    )
+    attempt = ProviderReplayAttempt(
+        cipher=cipher, session_scope_id="root-a",
+        expected_owner=owner, expected_profile=None,
+        expected_records=(ProviderReplayBindingRecord(
+            owner=owner, profile=None, state=state, binding=binding,
+        ),),
+    )
+    try:
+        with provider_replay_attempt(attempt):
+            with pytest.raises(Exception) as exc_info:
+                _ = [
+                    chunk async for chunk in provider.stream_chat([{
+                        "role": "assistant", "content": "", "provider_state": state,
+                    }])
+                ]
+        assert not classify_provider_failure(exc_info.value).retriable
+        chain = []
+        current: BaseException | None = exc_info.value
+        while current is not None and len(chain) < 8:
+            chain.append(type(current).__name__)
+            current = (
+                current.__cause__
+                if current.__cause__ is not None else current.__context__
+            )
+        assert "ProviderReplayAffinityError" in chain
+        assert observed_requests == []
+    finally:
+        await provider.aclose()

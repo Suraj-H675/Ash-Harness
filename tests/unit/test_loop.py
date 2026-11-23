@@ -3140,8 +3140,17 @@ async def test_native_compaction_installs_replayable_child_and_preserves_source(
         OpenAIResponsesProvider, prepare_openai_responses_input,
     )
 
+    from ash.providers.replay_state import ProviderReplayCredentialIdentity
+
     class SyntheticWindowProvider(OpenAIResponsesProvider):
         supports_native_compaction = True
+
+        def replay_credential_identity(self) -> ProviderReplayCredentialIdentity:
+            # The injected mock HTTP client does not expose its actual route.
+            # This test adapter explicitly attests only its fictional key.
+            return ProviderReplayCredentialIdentity.from_secret(
+                "synthetic-key", scope=("test-only", "native-compaction")
+            )
 
     class Responses:
         requests: list[dict[str, Any]]
@@ -3310,8 +3319,17 @@ async def test_native_compaction_refuses_source_changed_while_network_pending(
 ) -> None:
     from ash.providers.openai_responses import OpenAIResponsesProvider
 
+    from ash.providers.replay_state import ProviderReplayCredentialIdentity
+
     class SyntheticWindowProvider(OpenAIResponsesProvider):
         supports_native_compaction = True
+
+        def replay_credential_identity(self) -> ProviderReplayCredentialIdentity:
+            # The injected mock HTTP client does not expose its actual route.
+            # This test adapter explicitly attests only its fictional key.
+            return ProviderReplayCredentialIdentity.from_secret(
+                "synthetic-key", scope=("test-only", "native-compaction")
+            )
 
     store = SessionStore(tmp_path / "compaction-race.db")
     source_id: str | None = None

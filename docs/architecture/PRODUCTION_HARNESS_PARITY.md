@@ -295,6 +295,35 @@ provider identity hook. The chief independently verified imported untrusted
 metadata is stripped at import, without losing ordinary conversation content.
 No live provider request or model spend is part of this validation.
 
+**Adversarial route-review correction (2026-11-23, candidate):** An
+independent read-only review identified that the OpenAI Python SDK can inherit
+`OPENAI_BASE_URL`, `OPENAI_ORG_ID`, and `OPENAI_PROJECT_ID` even when Ash passes
+`base_url=None`. The original credential-binding scope did not reliably follow
+that effective HTTP destination or the organization/project selected for
+OpenAI-compatible SDK routes. The corrected proof reads the effective base URL,
+organization, and project from the same cached first-party-owned SDK client
+used for dispatch; changing ambient variables after its construction does not
+silently change the proof. Unverifiable externally injected SDK clients cannot
+attest opaque replay ownership, and unexpected credentialed remote plaintext
+HTTP destinations are rejected. Google Vertex ADC refreshes now read token and
+principal in one locked snapshot and recheck the active request's binding at
+the actual SDK token callback. This does not independently authenticate an ADC
+implementation's account semantics; it trusts the credential provider for
+that assertion. Lightweight custom provider adapters remain usable for
+stateless calls, but cannot replay opaque history without a verifiable family
+and credential identity. Existing synthetic native-compaction fixtures now
+provide explicit fictional test identity rather than bypassing the guard.
+
+The exact `dd5dd80` hosted run `45101772320` **failed** in the Python 3.12
+full integration lanes because old fake providers lacked `provider_family`.
+This regression has since been reproduced and corrected in the isolated
+follow-up candidate, with all 96 integration tests and a 657-test adjacent
+provider/session suite passing locally; a new exact-commit hosted Linux/macOS
+CI result is still required before integration. Persisting a successful answer
+without a binding when the private key store fails still conservatively blocks
+later opaque replay; clearer immediate continuity feedback is a separate
+lower-priority reliability issue, not a demonstrated cross-credential leak.
+
 **Later coding evidence (2026-11-10):** The first ChatGPT-plan coding replay
 passed the synthetic two-file fixture with GPT-6 Luna and the synthetic
 three-module `event-log` fixture with GPT-6.1 Sol. The intervening Luna

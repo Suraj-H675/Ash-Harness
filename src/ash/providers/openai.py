@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import os
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager
 from typing import Any, AsyncGenerator
@@ -41,19 +40,39 @@ def _api_key_replay_identity(
     base_url: str | None,
     extra_scope: Sequence[str] = (),
 ) -> ProviderReplayCredentialIdentity:
-    scope = [provider_family, base_url or "provider-default"]
-    if provider_family == "openai":
-        scope.extend(
-            (
-                os.environ.get("OPENAI_ORG_ID", ""),
-                os.environ.get("OPENAI_PROJECT_ID", ""),
-            )
-        )
-    scope.extend(extra_scope)
+    # The caller supplies the exact effective SDK route and tenant snapshot.
+    # Ambient environment variables are not evidence of where an existing
+    # cached client will send a request.
+    scope = [provider_family, base_url or "provider-default", *extra_scope]
     return ProviderReplayCredentialIdentity.from_secret(
         api_key,
         scope=tuple(scope),
     )
+
+
+def _sdk_replay_transport_scope(
+    client: Any,
+    *,
+    provider_family: str,
+) -> tuple[str, str, str] | None:
+    """Bind to the exact, cached SDK client that sends the HTTP request.
+
+    An externally supplied transport without attested routing cannot safely
+    claim credential ownership of opaque provider history.
+    """
+    if not isinstance(client, openai.AsyncOpenAI):
+        return None
+    base_url = normalize_provider_base_url(
+        str(client.base_url), provider=provider_family
+    )
+    require_secure_provider_transport(base_url, provider=provider_family)
+    organization = client.organization
+    project = client.project
+    if not (organization is None or isinstance(organization, str)):
+        return None
+    if not (project is None or isinstance(project, str)):
+        return None
+    return base_url, organization or "", project or ""
 
 
 @asynccontextmanager
@@ -297,14 +316,25 @@ class OpenAIProvider(ProviderABC):
 
         if not isinstance(self._api_key, str) or not self._api_key:
             return None
+        # This provider only attests the transport it constructed. External
+        # injected clients may use different keys/endpoints/tenants, so opaque
+        # replay under their unverifiable provenance must fail closed.
+        if not self._owns_client:
+            return None
+        client_scope = _sdk_replay_transport_scope(
+            self._resolve_client(), provider_family=self.provider_family
+        )
+        if client_scope is None:
+            return None
+        base_url, organization, project = client_scope
         default_headers = self._client_options.get("default_headers") or {}
-        extra_scope_parts: list[str] = []
+        extra_scope_parts: list[str] = [organization, project]
         for key, value in sorted(default_headers.items()):
             extra_scope_parts.extend((str(key).casefold(), str(value)))
         return _api_key_replay_identity(
             self._api_key,
             provider_family=self.provider_family,
-            base_url=self._base_url,
+            base_url=base_url,
             extra_scope=tuple(extra_scope_parts),
         )
 

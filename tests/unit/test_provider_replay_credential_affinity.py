@@ -236,3 +236,59 @@ def test_changed_api_key_is_refused_before_provider_dispatch(tmp_path: Path) -> 
 
     asyncio.run(verify_before_dispatch())
     assert client.calls == 0
+
+
+def test_sdk_effective_base_url_is_bound_for_openai_and_responses(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ash.providers.openai_responses import OpenAIResponsesProvider
+
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+    monkeypatch.delenv("OPENAI_ORG_ID", raising=False)
+    monkeypatch.delenv("OPENAI_PROJECT_ID", raising=False)
+    for provider_type in (OpenAIProvider, OpenAIResponsesProvider):
+        previous = provider_type(model_name="gpt-fixture", api_key="FICTIONAL_KEY")
+        first = previous.replay_credential_identity()
+        assert first is not None
+        monkeypatch.setenv("OPENAI_BASE_URL", "https://other-origin.invalid/v1")
+        later = provider_type(model_name="gpt-fixture", api_key="FICTIONAL_KEY")
+        second = later.replay_credential_identity()
+        assert second is not None
+        assert first._value != second._value, (
+            "The effective SDK base URL must be in credential replay identity"
+        )
+        assert "other-origin.invalid" in str(later._resolve_client().base_url)
+        # The live SDK client retains its original routing if env later changes.
+        monkeypatch.setenv("OPENAI_BASE_URL", "https://third-origin.invalid/v1")
+        assert second._value == later.replay_credential_identity()._value
+        monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+
+
+def test_sdk_organization_project_are_bound_for_openai_compatible(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Compatible(OpenAIProvider):
+        provider_family = "openai-compatible"
+
+    monkeypatch.setenv("OPENAI_ORG_ID", "org-fictional-A")
+    monkeypatch.setenv("OPENAI_PROJECT_ID", "proj-fictional-A")
+    original = Compatible(
+        model_name="gpt-fixture", api_key="FICTIONAL_KEY",
+        base_url="https://provider-fixture.invalid/v1",
+    )
+    previous = original.replay_credential_identity()
+    assert previous is not None
+    monkeypatch.setenv("OPENAI_ORG_ID", "org-fictional-B")
+    monkeypatch.setenv("OPENAI_PROJECT_ID", "proj-fictional-B")
+    replacement = Compatible(
+        model_name="gpt-fixture", api_key="FICTIONAL_KEY",
+        base_url="https://provider-fixture.invalid/v1",
+    )
+    current = replacement.replay_credential_identity()
+    assert current is not None
+    assert previous._value != current._value, (
+        "Effective SDK organization/project must be in replay identity"
+    )
+    assert replacement._resolve_client().organization == "org-fictional-B"
+    assert replacement._resolve_client().project == "proj-fictional-B"
+    assert previous._value == original.replay_credential_identity()._value

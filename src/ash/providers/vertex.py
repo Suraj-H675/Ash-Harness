@@ -18,6 +18,7 @@ from ash.providers.capabilities import (
 from ash.providers.google_replay import GoogleThoughtSignatureReplay
 from ash.providers.messages import MessageInput
 from ash.providers.openai import OpenAIProvider
+from ash.providers.replay_affinity import verify_provider_replay_identity
 from ash.providers.replay_state import ProviderReplayCredentialIdentity
 from ash.providers.replay_state import ProviderReplayStateCipher
 
@@ -65,6 +66,12 @@ class GoogleAdcTokenProvider:
         self._recent_tokens: deque[str] = deque(maxlen=2)
 
     async def __call__(self) -> str:
+        token, _principal = await self.token_with_principal()
+        return token
+
+    async def token_with_principal(self) -> tuple[str, str | None]:
+        """Read the effective ADC token and principal under one refresh lock."""
+
         async with self._lock:
             if self._credentials is None or self._request is None:
                 await self._load_default_credentials()
@@ -79,8 +86,9 @@ class GoogleAdcTokenProvider:
                         f"({type(exc).__name__})"
                     ) from exc
             token = _validated_adc_token(getattr(credentials, "token", None))
+            principal = _adc_service_account_principal(credentials)
             self._recent_tokens.append(token)
-            return token
+            return token, principal
 
     def redaction_secrets(self) -> tuple[str, ...]:
         return tuple(self._recent_tokens)
@@ -91,20 +99,7 @@ class GoogleAdcTokenProvider:
         async with self._lock:
             if self._credentials is None or self._request is None:
                 await self._load_default_credentials()
-            credentials = self._credentials
-            principal = getattr(credentials, "service_account_email", None)
-            if (
-                not isinstance(principal, str)
-                or not principal
-                or principal.casefold() == "default"
-                or len(principal) > 4096
-                or any(
-                    ord(character) < 33 or ord(character) == 127
-                    for character in principal
-                )
-            ):
-                return None
-            return principal
+            return _adc_service_account_principal(self._credentials)
 
     async def _load_default_credentials(self) -> None:
         try:
@@ -174,7 +169,7 @@ class VertexProvider(OpenAIProvider):
         )
         super().__init__(
             model_name=model_name,
-            api_key=self._adc,
+            api_key=self._scoped_request_token,
             base_url=vertex_openai_base_url(self.project, self.location),
             error_secrets_supplier=self._adc.redaction_secrets,
             client=client,
@@ -191,6 +186,26 @@ class VertexProvider(OpenAIProvider):
             principal,
             scope=("vertex", self.project, self.location),
         )
+
+    async def _scoped_request_token(self) -> str:
+        """Verify the refreshed token's principal before handing it to the SDK."""
+
+        token, principal = await self._adc.token_with_principal()
+        identity = (
+            ProviderReplayCredentialIdentity.from_verified_subject(
+                "https://accounts.google.com",
+                principal,
+                scope=("vertex", self.project, self.location),
+            )
+            if principal is not None
+            else None
+        )
+        verify_provider_replay_identity(
+            identity,
+            provider_family=self.provider_family,
+            model_name=self.model_name,
+        )
+        return token
 
     @property
     def capabilities(self) -> ProviderCapabilities:
@@ -227,6 +242,19 @@ class VertexProvider(OpenAIProvider):
         """Resolve/refresh ADC without issuing a model request."""
 
         await self._adc()
+
+
+def _adc_service_account_principal(credentials: Any) -> str | None:
+    principal = getattr(credentials, "service_account_email", None)
+    if (
+        not isinstance(principal, str)
+        or not principal
+        or principal.casefold() == "default"
+        or len(principal) > 4096
+        or any(ord(character) < 33 or ord(character) == 127 for character in principal)
+    ):
+        return None
+    return principal
 
 
 def _credentials_are_fresh(credentials: Any) -> bool:
