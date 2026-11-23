@@ -189,20 +189,40 @@ class ListDirectoryTool(BaseTool):
             relative = path.relative_to(self.safety_guard.project_root).as_posix()
             entries.append(relative + ("/" if is_directory else ""))
         entries.sort()
-        output = "\n".join(entries)
-        if truncated:
-            output += f"\n[truncated after {args.max_results} entries]"
-        elif scan_incomplete:
-            output += ("\n" if output else "") + "[workspace directory listing incomplete]"
-        note = _skipped_generated_note(skipped_generated)
-        if note:
-            output += ("\n" if output else "") + note
-        return ToolResult(
-            success=True,
-            output=output,
-            token_count=count_output_tokens(output),
-            truncated=truncated or scan_incomplete,
-        )
+        def build_result(selected: list[str], context_limited: bool) -> ToolResult:
+            output = "\n".join(selected)
+            if truncated and not context_limited:
+                output += f"\n[truncated after {args.max_results} entries]"
+            if scan_incomplete:
+                output += (
+                    ("\n" if output else "")
+                    + "[workspace directory listing incomplete]"
+                )
+            if context_limited:
+                other_limit = (
+                    f"; max_results={args.max_results} also reached"
+                    if truncated else ""
+                )
+                output += (
+                    ("\n" if output else "")
+                    + "[context budget truncated directory results"
+                    + other_limit
+                    + "; narrow the path or request fewer entries.]"
+                )
+            note = _skipped_generated_note(skipped_generated)
+            if note:
+                output += ("\n" if output else "") + note
+            return ToolResult(
+                success=True,
+                output=output,
+                token_count=count_output_tokens(output),
+                truncated=truncated or scan_incomplete or context_limited,
+            )
+
+        budget = self.output_budget
+        if budget is not None:
+            return budget.fit_lines(entries, build_result)
+        return build_result(entries, False)
 
 
 class GlobFilesArgs(BaseModel):
@@ -280,24 +300,47 @@ class GlobFilesTool(BaseTool):
                 break
             matches.append(path.relative_to(self.safety_guard.project_root).as_posix())
         matches.sort()
-        output = "\n".join(matches)
-        if match_truncated:
-            output += f"\n[truncated after {args.max_results} matches]"
-        elif scan_truncated:
-            output += (
-                f"\n[workspace scan truncated after {MAX_GLOB_SCAN_ENTRIES} entries]"
+        def build_result(selected: list[str], context_limited: bool) -> ToolResult:
+            output = "\n".join(selected)
+            if match_truncated and not context_limited:
+                output += f"\n[truncated after {args.max_results} matches]"
+            if scan_truncated:
+                output += (
+                    ("\n" if output else "")
+                    + f"[workspace scan truncated after {MAX_GLOB_SCAN_ENTRIES} entries]"
+                )
+            elif scan_incomplete:
+                output += ("\n" if output else "") + "[workspace glob incomplete]"
+            if context_limited:
+                other_limit = (
+                    f"; max_results={args.max_results} also reached"
+                    if match_truncated else ""
+                )
+                output += (
+                    ("\n" if output else "")
+                    + "[context budget truncated glob results"
+                    + other_limit
+                    + "; narrow the pattern or request fewer matches.]"
+                )
+            note = _skipped_generated_note(skipped_generated)
+            if note:
+                output += ("\n" if output else "") + note
+            return ToolResult(
+                success=True,
+                output=output,
+                token_count=count_output_tokens(output),
+                truncated=(
+                    match_truncated
+                    or scan_truncated
+                    or scan_incomplete
+                    or context_limited
+                ),
             )
-        elif scan_incomplete:
-            output += ("\n" if output else "") + "[workspace glob incomplete]"
-        note = _skipped_generated_note(skipped_generated)
-        if note:
-            output += ("\n" if output else "") + note
-        return ToolResult(
-            success=True,
-            output=output,
-            token_count=count_output_tokens(output),
-            truncated=match_truncated or scan_truncated or scan_incomplete,
-        )
+
+        budget = self.output_budget
+        if budget is not None:
+            return budget.fit_lines(matches, build_result)
+        return build_result(matches, False)
 
 
 class SearchTextArgs(BaseModel):
@@ -629,47 +672,69 @@ class SearchTextTool(BaseTool):
                 break
             if output_limited or match_limited:
                 break
-        output = "\n".join(matches)
-        separator = "\n" if output else ""
-        if regex_incomplete:
-            output += (
-                f"{separator}[workspace search incomplete: "
-                "regex time budget exhausted]"
+        def build_result(selected: list[str], context_limited: bool) -> ToolResult:
+            output = "\n".join(selected)
+            separator = "\n" if output else ""
+            if regex_incomplete:
+                output += (
+                    f"{separator}[workspace search incomplete: "
+                    "regex time budget exhausted]"
+                )
+            elif output_limited and not context_limited:
+                output += (
+                    f"{separator}[search output capture truncated after "
+                    f"{capture_limit} bytes]"
+                )
+            elif match_limited and not context_limited:
+                unit = "matching files" if args.files_only else "matches"
+                output += f"{separator}[truncated after {args.max_results} {unit}]"
+            elif scan_truncated:
+                output += (
+                    f"{separator}[workspace scan truncated after "
+                    f"{MAX_SEARCH_SCAN_ENTRIES} entries]"
+                )
+            elif scan_incomplete:
+                output += f"{separator}[workspace search incomplete]"
+            elif skipped_file:
+                output += (
+                    f"{separator}[workspace search incomplete: "
+                    "skipped unreadable or invalid text files]"
+                )
+            if context_limited:
+                other_limit = (
+                    "; output capture limit also reached"
+                    if output_limited
+                    else (
+                        f"; max_results={args.max_results} also reached"
+                        if match_limited else ""
+                    )
+                )
+                output += (
+                    ("\n" if output else "")
+                    + "[context budget truncated search results"
+                    + other_limit
+                    + "; narrow the pattern or directory_path to continue.]"
+                )
+            note = _skipped_generated_note(skipped_generated)
+            if note:
+                output += ("\n" if output else "") + note
+            return ToolResult(
+                success=True,
+                output=output,
+                token_count=count_output_tokens(output),
+                truncated=(
+                    regex_incomplete
+                    or output_limited
+                    or match_limited
+                    or scan_truncated
+                    or scan_incomplete
+                    or skipped_file
+                    or preview_truncated
+                    or context_limited
+                ),
             )
-        elif output_limited:
-            output += (
-                f"{separator}[search output capture truncated after "
-                f"{capture_limit} bytes]"
-            )
-        elif match_limited:
-            unit = "matching files" if args.files_only else "matches"
-            output += f"{separator}[truncated after {args.max_results} {unit}]"
-        elif scan_truncated:
-            output += (
-                f"{separator}[workspace scan truncated after "
-                f"{MAX_SEARCH_SCAN_ENTRIES} entries]"
-            )
-        elif scan_incomplete:
-            output += f"{separator}[workspace search incomplete]"
-        elif skipped_file:
-            output += (
-                f"{separator}[workspace search incomplete: "
-                "skipped unreadable or invalid text files]"
-            )
-        note = _skipped_generated_note(skipped_generated)
-        if note:
-            output += ("\n" if output else "") + note
-        return ToolResult(
-            success=True,
-            output=output,
-            token_count=count_output_tokens(output),
-            truncated=(
-                regex_incomplete
-                or output_limited
-                or match_limited
-                or scan_truncated
-                or scan_incomplete
-                or skipped_file
-                or preview_truncated
-            ),
-        )
+
+        budget = self.output_budget
+        if budget is not None:
+            return budget.fit_lines(matches, build_result)
+        return build_result(matches, False)

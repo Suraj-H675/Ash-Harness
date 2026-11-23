@@ -127,6 +127,45 @@ class ToolResult(BaseModel):
         return self
 
 
+@dataclass(frozen=True)
+class ToolOutputBudget:
+    """Provider-aware admission for one tool result before it becomes history."""
+
+    accepts: Callable[[ToolResult], bool]
+    can_dispatch: bool
+
+    def fit_lines(
+        self,
+        lines: list[str],
+        build: Callable[[list[str], bool], ToolResult],
+    ) -> ToolResult:
+        """Build the largest fitting line prefix with a tool-owned marker."""
+
+        complete = build(lines, False)
+        if self.accepts(complete):
+            return complete
+        low = 0
+        high = len(lines)
+        while low < high:
+            middle = (low + high + 1) // 2
+            candidate = build(lines[:middle], True)
+            if self.accepts(candidate):
+                low = middle
+            else:
+                high = middle - 1
+        bounded = build(lines[:low], True)
+        if self.accepts(bounded):
+            return bounded
+        return ToolResult(
+            success=False,
+            output="",
+            error=(
+                "Context budget left no room for this navigation result; use existing "
+                "evidence, edit/test, or explicitly enabled safe continuation."
+            ),
+        )
+
+
 def scoped_path_refusal(error: SafetyViolation) -> ToolResult:
     """Report a rejected path as a known failure; never remap or retry it."""
     reason = str(error)
@@ -165,6 +204,9 @@ class BaseTool(ABC):
         self._event_sink: Callable[[dict[str, Any]], None] | None = None
         self._event_context: ContextVar[dict[str, Any] | None] = ContextVar(
             f"tool_event_context_{id(self)}", default=None
+        )
+        self._output_budget_context: ContextVar[ToolOutputBudget | None] = ContextVar(
+            f"tool_output_budget_{id(self)}", default=None
         )
 
     @abstractmethod
@@ -235,6 +277,25 @@ class BaseTool(ABC):
         """Return a copy of the current per-invocation event context."""
 
         return dict(self._event_context.get() or {})
+
+    @property
+    def output_budget(self) -> ToolOutputBudget | None:
+        """Return the immutable context budget attached to this invocation."""
+
+        return self._output_budget_context.get()
+
+    @contextmanager
+    def output_budget_context(
+        self,
+        budget: ToolOutputBudget | None,
+    ) -> Iterator[None]:
+        """Bind a per-call budget without sharing mutable state across readers."""
+
+        token = self._output_budget_context.set(budget)
+        try:
+            yield
+        finally:
+            self._output_budget_context.reset(token)
 
 
 def redact_tool_arguments(

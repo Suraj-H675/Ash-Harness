@@ -50,6 +50,7 @@ from ash.context.assembly import ContextAssemblyRequest, assemble_context
 from ash.context.history import (
     RUNTIME_ONLY_HISTORY_KEY,
     ContextBudgetExceededError,
+    HistoryCompactor,
     RequestTokenBudget,
     resolve_request_token_budget,
 )
@@ -150,6 +151,7 @@ from ash.tools.base import (
     ToolExecutionOutcome,
     ToolMiddleware,
     ToolMiddlewareSkip,
+    ToolOutputBudget,
     ToolReplayPolicy,
     ToolResult,
     count_output_tokens,
@@ -4867,6 +4869,15 @@ class AshLoop:
 
             # Independent read-only calls may execute concurrently; all other
             # calls retain deterministic sequential side-effect ordering.
+            navigation_output_budgets = self._navigation_output_budgets(
+                messages=messages,
+                assistant_text=assistant_text,
+                tool_calls=tool_calls,
+                provider_state=model_completion.provider_state,
+                tool_schema=iteration_tool_schema,
+                request_budget=request_budget,
+                tools_snapshot=iteration_tools,
+            )
             try:
                 results = await self._execute_tool_calls(
                     tool_calls,
@@ -4874,6 +4885,7 @@ class AshLoop:
                     tools_snapshot=iteration_tools,
                     persist_tool_messages=True,
                     tool_result_images=tool_result_images,
+                    navigation_output_budgets=navigation_output_budgets,
                 )
             except CircuitBreakerError:
                 _log.warning("circuit breaker tripped — halting turn")
@@ -5711,6 +5723,216 @@ class AshLoop:
             replacement["name"] = current_name
             rewritten.append(replacement)
         return rewritten
+
+    def _navigation_output_budgets(
+        self,
+        *,
+        messages: list[dict[str, Any]],
+        assistant_text: str,
+        tool_calls: list[dict[str, Any]],
+        provider_state: list[dict[str, Any]],
+        tool_schema: list[dict[str, Any]],
+        request_budget: RequestTokenBudget | None,
+        tools_snapshot: dict[str, BaseTool],
+    ) -> dict[str, ToolOutputBudget]:
+        """Project opaque-history navigation results against this provider's limit."""
+
+        if (
+            request_budget is None
+            or not tool_calls
+            or not (
+                provider_state
+                or any(
+                    item.get("role") == "assistant" and item.get("provider_state")
+                    for item in messages
+                )
+            )
+        ):
+            return {}
+
+        # The production CLI always attaches checkpoint and redaction
+        # middlewares. Only known built-ins have the proven semantics needed
+        # to project a navigation result before it becomes protected history:
+        # checkpointing and LSP diagnostics are inert for navigation, and
+        # secret redaction has a deterministic output transformation. Unknown
+        # middleware or configured hooks may change results or perform effects,
+        # so do not speculate about their pre/post-tool behavior.
+        from ash.core.checkpoints import FileCheckpointMiddleware
+        from ash.core.secret_middleware import SecretRedactionMiddleware
+        from ash.lsp.middleware import LSPDiagnosticsMiddleware
+
+        builtin_middlewares = (
+            FileCheckpointMiddleware,
+            LSPDiagnosticsMiddleware,
+            SecretRedactionMiddleware,
+        )
+        if any(
+            type(middleware) not in builtin_middlewares
+            for middleware in self.tool_middlewares
+        ):
+            return {}
+        hooks = self._active_hooks()
+        if hooks is not None and hooks.has_registered_hooks:
+            return {}
+        redaction_enabled = any(
+            type(middleware) is SecretRedactionMiddleware
+            for middleware in self.tool_middlewares
+        )
+
+        from ash.tools.filesystem import ReadFileTool, ReadFilesTool
+        from ash.tools.search import GlobFilesTool, ListDirectoryTool, SearchTextTool
+
+        navigation_types = (
+            ReadFileTool,
+            ReadFilesTool,
+            SearchTextTool,
+            ListDirectoryTool,
+            GlobFilesTool,
+        )
+        navigation_calls = [
+            call
+            for call in tool_calls
+            if isinstance(call.get("name"), str)
+            and type(tools_snapshot.get(call["name"])) in navigation_types
+        ]
+        if not navigation_calls:
+            return {}
+        # Model completions sometimes request navigation alongside edits or
+        # tests. Bound only the verified read-only tools; keep other calls'
+        # permission/side-effect handling unchanged and reserve their output.
+        # An unbounded non-navigation result is NOT covered by this guarantee.
+        non_navigation_count = len(tool_calls) - len(navigation_calls)
+
+        projected = deepcopy(messages)
+        assistant_message: dict[str, Any] = {
+            "role": "assistant",
+            "content": assistant_text,
+            "tool_calls": self._provider_history_tool_calls(tool_calls),
+        }
+        if provider_state:
+            assistant_message["provider_state"] = provider_state
+        projected.append(assistant_message)
+
+        navigation_refusal = (
+            "Not dispatched because the remaining context budget cannot fit "
+            "a useful source-navigation result. Continue from evidence already "
+            "returned, make the requested edit or test, or use an explicitly "
+            "enabled safe context continuation."
+        )
+        navigation_names = {call["call_id"] for call in navigation_calls}
+        result_indexes: dict[str, int] = {}
+        for call in tool_calls:
+            call_id = call["call_id"]
+            tool_name = call["name"]
+            result_indexes[call_id] = len(projected)
+            projected.append(
+                {
+                    "role": "tool",
+                    "content": _render_tool_response(
+                        call_id,
+                        tool_name,
+                        {
+                            "success": False,
+                            "output": "",
+                            # Reserve the real refusal response for ALL
+                            # navigation calls, not an unrealistically empty
+                            # placeholder. Every pre-dispatch refusal must
+                            # fit before immutable tool history is written.
+                            "error": (
+                                navigation_refusal
+                                if call_id in navigation_names
+                                else None
+                            ),
+                            "truncated": False,
+                            "token_count": 0,
+                        },
+                    ),
+                    "tool_call_id": call_id,
+                }
+            )
+
+        count_tokens = self.provider.count_tokens
+        native_schema_tokens = (
+            self._estimate_tool_schema_tokens(tool_schema)
+            if _provider_capabilities(self.provider).native_tools
+            else 0
+        )
+        baseline = HistoryCompactor._count(projected, count_tokens) + native_schema_tokens
+        input_limit = request_budget.input_limit
+        follow_up_reserve = max(128, min(2_048, input_limit // 12))
+        # Side-effectful results cannot be safely reduced after dispatch.
+        # Reserve modest room for them; only read-only navigation is bounded.
+        other_result_reserve = non_navigation_count * max(
+            256, min(2_048, input_limit // 16)
+        )
+        navigation_limit = max(
+            1, input_limit - follow_up_reserve - other_result_reserve
+        )
+        per_call_share = max(
+            0,
+            (navigation_limit - baseline) // len(navigation_calls) - 32,
+        )
+
+        # Each budget must retain its OWN call identity. Closures directly
+        # defined in the loop would all see the final call's variables when
+        # read-only sibling tools execute later (possibly in parallel).
+        def accepts_for_call(
+            call_id: str, tool_name: str, result_index: int
+        ) -> Callable[[ToolResult], bool]:
+            def projected_tokens(result: ToolResult) -> int:
+                candidate = deepcopy(projected)
+                projected_result = result
+                if redaction_enabled:
+                    # The same built-in redaction runs after the tool, before
+                    # persistence. It can EXPAND short sensitive URL fields,
+                    # so counting the raw result would underbudget the true
+                    # provider-visible message. Navigation tools return text,
+                    # not structured diagnostics or image payloads.
+                    projected_result = result.model_copy(deep=True)
+                    projected_result.output = redact_text(projected_result.output)
+                    if projected_result.error:
+                        projected_result.error = redact_text(projected_result.error)
+                candidate[result_index]["content"] = _render_tool_response(
+                    call_id,
+                    tool_name,
+                    projected_result.model_dump(mode="python"),
+                )
+                return (
+                    HistoryCompactor._count(candidate, count_tokens)
+                    + native_schema_tokens
+                )
+
+            def accepts(result: ToolResult) -> bool:
+                tokens = projected_tokens(result)
+                return (
+                    tokens <= navigation_limit
+                    and tokens - baseline <= per_call_share
+                )
+
+            return accepts
+
+        budgets: dict[str, ToolOutputBudget] = {}
+        for call in navigation_calls:
+            call_id = call["call_id"]
+            tool_name = call["name"]
+            accepts = accepts_for_call(
+                call_id, tool_name, result_indexes[call_id]
+            )
+            useful_sample = ToolResult(
+                success=True,
+                output=(
+                    "1: representative source excerpt; sha256="
+                    + "0" * 64
+                    + "; next_start_line=2; next_start_column=1"
+                ),
+                truncated=True,
+                token_count=64,
+            )
+            budgets[call_id] = ToolOutputBudget(
+                accepts=accepts,
+                can_dispatch=accepts(useful_sample),
+            )
+        return budgets
 
     async def _stream_one_completion(
         self,
@@ -6866,6 +7088,7 @@ class AshLoop:
         session: Session,
         *,
         tools_snapshot: dict[str, BaseTool] | None = None,
+        navigation_output_budgets: dict[str, ToolOutputBudget] | None = None,
         persist_tool_messages: bool = False,
         tool_result_images: _TurnToolResultImages | None = None,
         _defer_terminal_persistence: bool = False,
@@ -6913,6 +7136,7 @@ class AshLoop:
                         [call],
                         session,
                         tools_snapshot=tools_snapshot,
+                        navigation_output_budgets=navigation_output_budgets,
                         _defer_terminal_persistence=(
                             persist_tool_messages or _defer_terminal_persistence
                         ),
@@ -7017,7 +7241,10 @@ class AshLoop:
             self._emit_event({"type": "tool.requested", **event_base})
 
             async def reject_invalid_call(
-                *, error: str, provider_error: str | None = None
+                *,
+                error: str,
+                provider_error: str | None = None,
+                breaker_failure: bool = True,
             ) -> None:
                 """Persist a pre-dispatch refusal without granting approval."""
 
@@ -7067,7 +7294,8 @@ class AshLoop:
                     arguments=record.arguments,
                     error=record.error,
                 )
-                record_breaker_outcome(tool_name, False)
+                if breaker_failure:
+                    record_breaker_outcome(tool_name, False)
 
             if tool is None:
                 await reject_invalid_call(
@@ -7090,9 +7318,35 @@ class AshLoop:
                 )
                 continue
 
+            # Policy DENY must retain its normal safety_block audit even if
+            # the navigation result would not fit the context. Evaluating
+            # policy has no external side effects; do NOT seek user approval
+            # or dispatch before the budget refusal.
             decision = self.permission_policy.evaluate(
                 tool_name, deepcopy(arguments)
             )
+            navigation_budget = (
+                navigation_output_budgets.get(call_id)
+                if navigation_output_budgets is not None
+                else None
+            )
+            if (
+                navigation_budget is not None
+                and not navigation_budget.can_dispatch
+                and decision.action != PolicyAction.DENY
+            ):
+                navigation_refusal = (
+                    "Not dispatched because the remaining context budget cannot fit "
+                    "a useful source-navigation result. Continue from evidence already "
+                    "returned, make the requested edit or test, or use an explicitly "
+                    "enabled safe context continuation."
+                )
+                await reject_invalid_call(
+                    error=navigation_refusal,
+                    provider_error=navigation_refusal,
+                    breaker_failure=False,
+                )
+                continue
             if tool_name in {
                 "write_file",
                 "replace_file_content",
@@ -7389,7 +7643,9 @@ class AshLoop:
                     with tool.event_context(tool_context):
                         tool_started = True
                         result_dict = await _execute_tool_once(
-                            tool, deepcopy(arguments)
+                            tool,
+                            deepcopy(arguments),
+                            output_budget=navigation_budget,
                         )
                     tool_result = ToolResult(
                         success=result_dict["success"],
@@ -9262,10 +9518,39 @@ class AshLoop:
 async def _execute_tool_once(
     tool: "BaseTool",
     arguments: dict[str, Any],
+    *,
+    output_budget: ToolOutputBudget | None = None,
 ) -> dict[str, Any]:
     """Dispatch one tool invocation exactly once and preserve its typed result."""
 
-    tool_result: "ToolResult" = await tool.run(**arguments)
+    with tool.output_budget_context(output_budget):
+        tool_result: "ToolResult" = await tool.run(**arguments)
+    if output_budget is not None and not output_budget.accepts(tool_result):
+        # A built-in read-only navigation tool can return early with an error
+        # (missing path, stale SHA, encoding, etc.) before its own output
+        # limiter runs. Do not let that unbounded error become protected tool
+        # history. The read did run; explicitly report omission rather than
+        # claiming the requested source was inspected successfully.
+        for notice in (
+            "Context budget: navigation result omitted; request a smaller range.",
+            "Context budget: result omitted.",
+            "Context budget.",
+        ):
+            fallback = ToolResult(
+                success=False, output="", error=notice,
+                truncated=True, token_count=0,
+            )
+            if output_budget.accepts(fallback):
+                tool_result = fallback
+                break
+        else:
+            # If even minimal feedback cannot fit, keep a truthful durable
+            # failure. The next context-admission boundary still fails closed
+            # rather than rewriting opaque provider history.
+            tool_result = ToolResult(
+                success=False, output="", error="Context budget.",
+                truncated=True, token_count=0,
+            )
     return {
         "success": tool_result.success,
         "output": tool_result.output,

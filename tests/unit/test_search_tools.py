@@ -10,6 +10,7 @@ import pytest
 
 from ash.safety.guard import SafetyGuard
 from ash.tools import search as search_module
+from ash.tools.base import ToolOutputBudget
 from ash.tools.filesystem import ReadFileTool
 from ash.tools.search import GlobFilesTool, ListDirectoryTool, SearchTextArgs, SearchTextTool
 
@@ -629,6 +630,125 @@ async def test_search_text_defaults_to_bounded_capture_with_explicit_larger_outp
     assert explicit.truncated is False
     assert "large.py:200:needle_199" in explicit.output
     assert len(explicit.output) > 60_000
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("tool_type", "arguments"),
+    [
+        (ListDirectoryTool, {"max_results": 20}),
+        (GlobFilesTool, {"pattern": "**/*.py", "max_results": 20}),
+    ],
+)
+async def test_directory_navigation_honors_provider_output_budget(
+    tmp_path, tool_type, arguments: dict[str, object]
+) -> None:
+    for index in range(20):
+        (tmp_path / f"module_{index:02}.py").write_text(
+            f"VALUE_{index} = {index}\n", encoding="utf-8"
+        )
+    tool = tool_type(SafetyGuard(tmp_path))
+    budget = ToolOutputBudget(
+        accepts=lambda result: len(result.output) <= 180,
+        can_dispatch=True,
+    )
+
+    with tool.output_budget_context(budget):
+        result = await tool.run(**arguments)
+
+    assert result.success is True
+    assert result.truncated is True
+    assert "context budget truncated" in result.output
+    assert len(result.output) <= 180
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("tool_type", "arguments", "limit_marker"),
+    [
+        (
+            ListDirectoryTool,
+            {"max_results": 2},
+            "[truncated after 2 entries]",
+        ),
+        (
+            GlobFilesTool,
+            {"pattern": "**/*.py", "max_results": 2},
+            "[truncated after 2 matches]",
+        ),
+    ],
+)
+async def test_directory_context_truncation_does_not_claim_displayed_limit(
+    tmp_path, tool_type, arguments: dict[str, object], limit_marker: str
+) -> None:
+    for index in range(3):
+        filename = f"module_{index}_{'x' * 100}.py"
+        (tmp_path / filename).write_text("VALUE = 1\n", encoding="utf-8")
+    tool = tool_type(SafetyGuard(tmp_path))
+    budget = ToolOutputBudget(
+        accepts=lambda result: len(result.output) <= 220,
+        can_dispatch=True,
+    )
+
+    with tool.output_budget_context(budget):
+        result = await tool.run(**arguments)
+
+    assert result.success is True
+    assert result.truncated is True
+    assert "context budget truncated" in result.output
+    assert "max_results=2 also reached" in result.output
+    assert limit_marker not in result.output
+
+
+@pytest.mark.asyncio
+async def test_search_text_honors_provider_output_budget(tmp_path) -> None:
+    for index in range(10):
+        (tmp_path / f"module_{index:02}.py").write_text(
+            f"needle_{index} = '{'x' * 256}'\n", encoding="utf-8"
+        )
+    tool = SearchTextTool(SafetyGuard(tmp_path))
+    budget = ToolOutputBudget(
+        accepts=lambda result: len(result.output) <= 600,
+        can_dispatch=True,
+    )
+
+    with tool.output_budget_context(budget):
+        result = await tool.run(pattern="needle", fixed_strings=True)
+
+    assert result.success is True
+    assert result.truncated is True
+    assert "context budget truncated search results" in result.output
+    assert "module_00.py:1" in result.output
+    assert len(result.output) <= 600
+
+
+@pytest.mark.asyncio
+async def test_search_context_truncation_does_not_claim_displayed_match_limit(
+    tmp_path,
+) -> None:
+    for index in range(3):
+        filename = f"source_{index}_{'x' * 60}.py"
+        (tmp_path / filename).write_text(
+            f"needle {'x' * 35}\n", encoding="utf-8"
+        )
+    tool = SearchTextTool(SafetyGuard(tmp_path))
+    budget = ToolOutputBudget(
+        accepts=lambda result: len(result.output) <= 215,
+        can_dispatch=True,
+    )
+
+    with tool.output_budget_context(budget):
+        result = await tool.run(
+            pattern="needle",
+            fixed_strings=True,
+            max_results=2,
+        )
+
+    assert result.success is True
+    assert result.truncated is True
+    assert "context budget truncated search results" in result.output
+    assert "max_results=2 also reached" in result.output
+    assert "[truncated after 2 matches]" not in result.output
 
 
 @pytest.mark.asyncio
