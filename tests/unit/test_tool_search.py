@@ -491,6 +491,9 @@ async def test_real_git_review_tool_is_available_with_large_effective_context(
         session, provider_tools=visible, tool_schema_payload=schema,
     )
     assert "run the explicitly authorized focused test" in messages[0]["content"]
+    assert "`search_text` with `files_only=true`" in messages[0]["content"]
+    assert "one `file:line` per matching file" in messages[0]["content"]
+    assert "read focused ranges only in likely files" in messages[0]["content"]
     assert loop._last_context_tokens <= loop._resolve_request_token_budget().input_limit
     await loop.aclose()
 

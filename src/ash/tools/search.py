@@ -160,6 +160,7 @@ class ListDirectoryTool(BaseTool):
         entries: list[str] = []
         truncated = False
         scan_incomplete = False
+        skipped_generated: set[str] = set()
 
         def mark_incomplete() -> None:
             nonlocal scan_incomplete
@@ -172,6 +173,12 @@ class ListDirectoryTool(BaseTool):
             recursive=args.recursive,
             max_depth=MAX_LIST_DIRECTORY_DEPTH,
             on_incomplete=mark_incomplete if args.recursive else None,
+            ignored_dirs=(
+                _generated_descendants_to_skip(root, self.safety_guard)
+                if args.recursive
+                else frozenset()
+            ),
+            on_skipped=skipped_generated.add if args.recursive else None,
         ):
             scanned += 1
             if len(entries) >= args.max_results:
@@ -187,6 +194,9 @@ class ListDirectoryTool(BaseTool):
             output += f"\n[truncated after {args.max_results} entries]"
         elif scan_incomplete:
             output += ("\n" if output else "") + "[workspace directory listing incomplete]"
+        note = _skipped_generated_note(skipped_generated)
+        if note:
+            output += ("\n" if output else "") + note
         return ToolResult(
             success=True,
             output=output,

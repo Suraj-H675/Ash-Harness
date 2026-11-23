@@ -8154,6 +8154,49 @@ def test_instruction_scope_tracks_nested_directory_exploration_and_edits(tmp_pat
     assert loaded[-1] == (nested,)
 
 
+def test_repo_map_batch_reads_track_only_successful_workspace_files(tmp_path: Path) -> None:
+    package = tmp_path / "pkg"
+    package.mkdir()
+    (package / "a.py").write_text("x = 1\n")
+    (package / "b.py").write_text("x = 2\n")
+    outside = tmp_path.parent / "outside.py"
+    (tmp_path / "link.py").symlink_to(outside)
+    loop = AshLoop.__new__(AshLoop)
+    loop.safety_guard = SafetyGuard(tmp_path)
+    loop.repo_map = object()
+    loop._repo_map_active_files = []
+    loop._repo_map_dirty = False
+    inputs = {"files": [
+        {"file_path": "pkg/a.py"},
+        {"file_path": "pkg/b.py"},
+        {"file_path": "pkg/a.py"},
+    ]}
+    successful = ToolResult(success=True, output="source")
+
+    loop._record_repo_map_activity("read_files", inputs, successful)
+    assert set(loop._repo_map_active_files) == {
+        package / "a.py", package / "b.py"
+    }
+    assert not loop._repo_map_dirty
+    prior = set(loop._repo_map_active_files)
+
+    # An incomplete/failed batch cannot prove which individual ranges succeeded.
+    loop._record_repo_map_activity(
+        "read_files", {"files": [{"file_path": "pkg/new.py"}]},
+        ToolResult(success=False, output="", error="stale hash"),
+    )
+    assert set(loop._repo_map_active_files) == prior
+    loop._record_repo_map_activity(
+        "read_files",
+        {"files": [
+            {"file_path": "../outside.py"}, {"file_path": "link.py"},
+            {"file_path": ""}, {"file_path": 42}, {},
+        ]},
+        successful,
+    )
+    assert set(loop._repo_map_active_files) == prior
+
+
 def test_repo_map_refresh_failure_stays_dirty_and_retries_next_prompt(tmp_path: Path) -> None:
     class FlakyRepoMap:
         ready = True

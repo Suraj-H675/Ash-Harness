@@ -64,6 +64,34 @@ async def test_list_directory_caps_recursive_depth(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_recursive_list_dir_skips_generated_only_for_broad_discovery(tmp_path) -> None:
+    objects = tmp_path / ".git" / "objects"
+    objects.mkdir(parents=True)
+    for n in range(220):
+        (objects / f"{n:03d}").write_text("generated")
+    (tmp_path / "src").mkdir()
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "src" / "feature.py").write_text("feature")
+    (tmp_path / "tests" / "test_feature.py").write_text("test")
+    listing = ListDirectoryTool(SafetyGuard(tmp_path))
+
+    broad = await listing.run(recursive=True, max_results=200)
+    assert broad.success and not broad.truncated
+    assert "src/feature.py" in broad.output
+    assert "tests/test_feature.py" in broad.output
+    assert ".git/objects/000" not in broad.output
+    assert "skipped generated directories: .git" in broad.output
+
+    explicit = await listing.run(directory_path=".git", recursive=True, max_results=20)
+    assert explicit.success and explicit.truncated
+    assert ".git/objects/000" in explicit.output
+
+    nonrecursive = await listing.run(recursive=False)
+    assert nonrecursive.success
+    assert ".git/" in nonrecursive.output
+
+
+@pytest.mark.asyncio
 async def test_list_directory_marks_unreadable_descendants_incomplete(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

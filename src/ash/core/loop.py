@@ -1088,7 +1088,11 @@ SYSTEM_PROMPT_TEMPLATE = """You are Ash, a terminal-native AI coding harness for
 LARGE_CONTEXT_CODING_GUIDANCE = (
     "### Coding workflow\n"
     "Prefer focused symbol searches and bounded source reads over repeatedly "
-    "reading unchanged regions. For changes spanning modules, inspect the "
+    "reading unchanged regions. For broad repository-wide symbol or call-site "
+    "discovery, use `search_text` with `files_only=true`. It returns one "
+    "`file:line` per matching file; narrow the search when results are truncated, then "
+    "read focused ranges only in likely files. Use ordinary search output when "
+    "you need source lines. For changes spanning modules, inspect the "
     "relevant definitions and callers, make consistent edits across affected "
     "files, and run the explicitly authorized focused test before reporting "
     "completion. Review edits with the available workspace_diff (Ash-edited "
@@ -7892,6 +7896,17 @@ class AshLoop:
             file_path = arguments.get("file_path")
             if isinstance(file_path, str) and file_path:
                 return {file_path}
+        if tool_name == "read_files":
+            files = arguments.get("files")
+            if not isinstance(files, list):
+                return set()
+            return {
+                item["file_path"]
+                for item in files
+                if isinstance(item, dict)
+                and isinstance(item.get("file_path"), str)
+                and item["file_path"]
+            }
         return set()
 
     def _append_tool_audit(

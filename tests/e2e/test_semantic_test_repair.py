@@ -75,6 +75,7 @@ async def test_multifile_coding_discovery_patch_and_real_verification(
             visible = {tool["function"]["name"] for tool in (tools or [])}
             history = repr(messages)
             if self.requests == 1:
+                assert "`search_text` with `files_only=true`" in messages[0]["content"]
                 assert "search_tools" in visible
                 assert "apply_patch" not in visible
                 calls = [{"id": "discover", "name": "search_tools", "arguments": {
