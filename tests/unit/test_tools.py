@@ -627,7 +627,7 @@ async def test_default_read_budget_is_small_but_full_file_access_remains_explici
     # Large source reads are especially costly when an opaque provider state
     # prevents history compaction. Keep the normal inspection bounded without
     # removing the ability to inspect an exact larger range on demand.
-    assert DEFAULT_MAX_READ_CHARS == 8_192
+    assert DEFAULT_MAX_READ_CHARS == 4_096
     content = "# " + "x" * 20_000
     path = project_root / "module.py"
     path.write_text(content + "\n")
@@ -635,8 +635,8 @@ async def test_default_read_budget_is_small_but_full_file_access_remains_explici
 
     first = await reader.run(file_path="module.py")
     assert first.success and first.truncated
-    assert "source_chars_limit=8192" in first.output
-    assert "next_start_line=1; next_start_column=8193" in first.output
+    assert "source_chars_limit=4096" in first.output
+    assert "next_start_line=1; next_start_column=4097" in first.output
     digest = hashlib.sha256(path.read_bytes()).hexdigest()
     assert f"sha256={digest}" in first.output
 
@@ -649,10 +649,10 @@ async def test_default_read_budget_is_small_but_full_file_access_remains_explici
     # Exact cursor pagination reconstructs content without losing characters.
     second = await reader.run(
         file_path="module.py", start_line=1, end_line=1,
-        start_column=8_193, max_chars=32_768, expected_sha256=digest,
+        start_column=4_097, max_chars=32_768, expected_sha256=digest,
     )
     assert second.success and not second.truncated
-    assert content[8_192:] in second.output
+    assert content[4_096:] in second.output
 
 
 @pytest.mark.asyncio
@@ -766,7 +766,9 @@ async def test_read_file_truncation_reports_follow_up_range(
         encoding="utf-8",
     )
 
-    result = await ReadFileTool(guard).run(file_path="large.txt")
+    result = await ReadFileTool(guard).run(
+        file_path="large.txt", max_chars=16_384,
+    )
 
     assert result.success is True
     assert result.truncated is True
@@ -791,8 +793,11 @@ async def test_read_file_paginates_a_single_long_code_line_without_losing_text(
     first = await reader.run(file_path="bundle.js")
     assert first.success and first.truncated
     assert len(first.output) < 10_000
-    assert "next_start_line=1; next_start_column=8193" in first.output
-    assert 1_500 < first.token_count < 5_000
+    assert (
+        f"next_start_line=1; next_start_column={DEFAULT_MAX_READ_CHARS + 1}"
+        in first.output
+    )
+    assert 1_000 < first.token_count < 3_000
 
     parts: list[str] = []
     column = 1
@@ -1662,6 +1667,7 @@ async def test_read_file_truncation_metadata_respects_start_line(
         file_path="large.txt",
         start_line=101,
         end_line=950,
+        max_chars=16_384,
     )
 
     assert result.success is True

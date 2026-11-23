@@ -165,6 +165,64 @@ async def test_focused_default_reads_preserve_an_opaque_replay_history_budget(
     assert result.estimated_tokens <= compact.input_limit
 
 
+@pytest.mark.asyncio
+async def test_repeated_default_reads_fit_an_opaque_replay_history_budget(
+    tmp_path,
+) -> None:
+    from ash.context.tokens import estimate_text_tokens
+    from ash.safety.guard import SafetyGuard
+    from ash.tools.filesystem import ReadFileTool
+
+    reader = ReadFileTool(SafetyGuard(tmp_path))
+    source = "\n".join(f"value_{index} = {index}" for index in range(4_000))
+    paths = ("filesystem.py", "search.py", "loop.py")
+    for name in paths:
+        (tmp_path / name).write_text(source)
+
+    messages: list[dict] = [
+        {"role": "system", "content": "Trusted coding policy and tools."},
+        {"role": "user", "content": "Inspect three modules before editing."},
+    ]
+    for index in range(13):
+        path = paths[index % len(paths)]
+        call_id = f"read-{index + 1}"
+        args = {"file_path": path}
+        result = await reader.run(**args)
+        assert result.success
+        messages.extend([
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "call_id": call_id,
+                    "name": "read_file",
+                    "arguments": args,
+                }],
+                "provider_state": [{
+                    "type": "reasoning",
+                    "id": f"rs-{index + 1}",
+                    "encrypted_content": "opaque-replay-state",
+                }],
+            },
+            {"role": "tool", "tool_call_id": call_id, "content": result.output},
+        ])
+
+    compactor = HistoryCompactor(
+        max_context_tokens=35_744,
+        completion_reserve=4_000,
+        input_token_limit=31_744,
+    )
+    result = compactor.compact(
+        messages,
+        count_tokens=estimate_text_tokens,
+        protected_from_index=1,
+    )
+
+    assert result.provider_replay_state_preserved
+    assert result.messages == messages
+    assert result.estimated_tokens <= compactor.input_limit
+
+
 def test_opaque_provider_replay_state_refuses_local_compaction_when_full() -> None:
     messages = [
         {"role": "system", "content": "Policy"},

@@ -38,7 +38,7 @@ DEFAULT_MAX_READ_LINES = 800
 # Opaque reasoning replay can make prior tool outputs non-compacted context.
 # Keep ordinary source inspections bounded; models can explicitly opt into
 # larger reads or page with the returned line/column and SHA-256 cursor.
-DEFAULT_MAX_READ_CHARS = 8_192
+DEFAULT_MAX_READ_CHARS = 4_096
 HARD_MAX_READ_CHARS = 131_072
 MAX_BATCH_READ_FILES = 4
 MAX_BATCH_READ_SOURCE_CHARS = 16_384
@@ -199,7 +199,7 @@ class ReadFileArgs(BaseModel):
         DEFAULT_MAX_READ_CHARS,
         ge=1,
         le=HARD_MAX_READ_CHARS,
-        description="Source limit (default 8192).",
+        description="Source limit (default 4096).",
     )
     expected_sha256: str | None = Field(
         None,
@@ -359,7 +359,7 @@ class ReadFileTool(BaseTool):
     name = "read_file"
     execution_contract = ToolExecutionContract(parallel_safe=True)
     description = (
-        "Read numbered file lines (default 8192 source chars). For large files, "
+        "Read numbered file lines (default 4096 source chars). For large files, "
         "search_text then read focused start_line/end_line ranges; specify "
         "max_chars for larger reads. Truncation includes next line/column and SHA-256."
     )

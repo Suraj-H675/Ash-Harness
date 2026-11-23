@@ -401,11 +401,17 @@ async def test_large_context_coding_tools_fit_effective_provider_window(
     tmp_path, configured_window: int, provider_window: int, promoted: bool,
 ) -> None:
     guard = SafetyGuard(tmp_path)
+    from ash.tools.filesystem import ReadFileTool
+
     catalog: dict[str, BaseTool] = {}
     search = SearchToolsTool(guard, lambda: catalog, threshold=12)
     catalog[search.name] = search
     for name in ESSENTIAL_TOOL_NAMES:
-        catalog[name] = DummyTool(guard, name, f"Essential {name} tool")
+        catalog[name] = (
+            ReadFileTool(guard)
+            if name == "read_file"
+            else DummyTool(guard, name, f"Essential {name} tool")
+        )
     for name in ("git_diff", "apply_patch"):
         catalog[name] = DummyTool(guard, name, f"Review or edit with {name}")
     for index in range(32):
