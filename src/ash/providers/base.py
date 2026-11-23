@@ -14,6 +14,7 @@ from typing import Any, AsyncGenerator, Literal, Protocol, runtime_checkable
 from pydantic import BaseModel, Field, PrivateAttr, field_validator
 from ash.providers.capabilities import ProviderCapabilities, infer_capabilities
 from ash.providers.messages import CanonicalMessage, CanonicalToolCall, MessageInput
+from ash.providers.replay_affinity import ProviderReplayAffinityError
 
 
 MAX_PROVIDER_USAGE_TOKENS = 2**53 - 1
@@ -278,6 +279,9 @@ class CompletionOutcome(BaseModel):
     _provider_state_credential_profile: str | None = PrivateAttr(default=None)
     _provider_state_credential_binding: dict[str, Any] | None = PrivateAttr(
         default=None
+    )
+    _provider_state_credential_binding_error: ProviderReplayAffinityError | None = (
+        PrivateAttr(default=None)
     )
 
     @field_validator("provider_state", mode="before")

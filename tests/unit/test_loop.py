@@ -3377,7 +3377,10 @@ async def test_native_compaction_refuses_source_changed_while_network_pending(
 async def test_sealed_provider_replay_state_persists_exactly_without_plaintext(
     tmp_path,
 ) -> None:
-    from ash.providers.replay_state import ProviderReplayStateCipher
+    from ash.providers.replay_state import (
+        ProviderReplayCredentialIdentity,
+        ProviderReplayStateCipher,
+    )
 
     plaintext = "private reasoning OPENAI_API_KEY=sk-proj-abcdefghijklmnopqrstuvwxyz"
     sealed = ProviderReplayStateCipher(
@@ -3391,6 +3394,11 @@ async def test_sealed_provider_replay_state_persists_exactly_without_plaintext(
 
     class SealedReplayProvider(ProviderABC):
         model_name = "sealed-replay"
+
+        def replay_credential_identity(self):
+            return ProviderReplayCredentialIdentity.from_secret(
+                "synthetic-sealed-replay-key"
+            )
 
         def count_tokens(self, text):
             return len(str(text).split())

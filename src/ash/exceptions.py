@@ -164,6 +164,24 @@ def classify_exception(exc: BaseException) -> ErrorInfo:
         )
 
     if (
+        name == "ProviderReplayAffinityError"
+        and module == "ash.providers.replay_affinity"
+    ):
+        return ErrorInfo(
+            ErrorCategory.CONTEXT,
+            message,
+            "The turn is incomplete because Ash could not verify the credential "
+            "binding for opaque provider state. Inspect ash sessions recovery "
+            "--session SESSION and independently resolve any unknown tool "
+            "outcome. When every side effect has a known outcome, create a fresh "
+            "reasoning window with /restart-context <handoff-for-next-turn> or "
+            "ash sessions restart-context --session SESSION --handoff TEXT, "
+            "then resume the child session. Earlier actions and approvals are "
+            "not copied or replayed.",
+            retriable=False,
+        )
+
+    if (
         name == "SessionStorageError"
         or module == "sqlite3"
         or "database" in lowered

@@ -15,8 +15,12 @@ from ash.providers.replay_state import (
 
 
 _RESTART_GUIDANCE = (
-    "The credential for opaque provider history cannot be verified; use "
-    "/restart-context with an explicit handoff before continuing."
+    "Opaque provider history has no verified credential binding, so its "
+    "credential cannot be verified. This turn cannot complete safely. Use "
+    "/restart-context <handoff-for-next-turn> in the "
+    "interactive terminal or ash sessions restart-context --session SESSION "
+    "--handoff TEXT from a shell, then resume the child session after checking "
+    "the parent's recovery state. Earlier actions and approvals are not copied."
 )
 
 

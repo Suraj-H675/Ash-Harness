@@ -324,6 +324,20 @@ the provider limit, Ash stops with a context error rather than silently
 discarding state, rewriting tool results, or repeating actions. This can
 happen partway through a multi-file coding task.
 
+A different context failure occurs if a provider returns opaque reasoning state
+but Ash cannot securely bind it to the credential that produced it (for example,
+when private state-key storage is unavailable or the credential identity cannot
+be verified). Ash may have already streamed useful assistant text and completed
+some authorized actions. The current turn is nevertheless **incomplete**:
+headless clients receive a nonzero exit and `turn.error` with stop reason
+`provider_replay_binding` rather than `turn.completed`. The saved answer and
+known tool results remain in the original session for inspection; replay is
+refused. This failure never automatically retries an earlier tool action.
+Fix the underlying storage or credential problem as appropriate, inspect
+`ash sessions recovery --session SESSION` and the actual workspace, and then
+use an explicit new-window handoff. Do not treat the streamed text as proof the
+whole coding task finished.
+
 Inspect the workspace and any recovery warnings before opening a new reasoning
 window. In the interactive terminal, use `/restart-context <explicit handoff>`.
 From the source workspace, the equivalent one-shot workflow is:

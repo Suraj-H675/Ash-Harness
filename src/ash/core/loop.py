@@ -4079,13 +4079,19 @@ class AshLoop:
             if current_turn_id is not None and current_turn_id != previous_turn_id:
                 self._last_interrupted_edit_files = len(self._turn_modified_paths)
                 self.session_store.interrupt_turn(current_turn_id)
-                stop_reason = "error"
+                stop_reason = (
+                    "provider_replay_binding"
+                    if isinstance(exc, ProviderReplayAffinityError)
+                    else "error"
+                )
+                self._last_turn_stop_reason = stop_reason
                 if isinstance(exc, ContextBudgetExceededError):
                     stop_reason = (
                         "opaque_context"
                         if exc.provider_replay_state_preserved
                         else "context_budget"
                     )
+                    self._last_turn_stop_reason = stop_reason
                 self._emit_event(
                     {
                         "type": "turn.error",
@@ -4687,6 +4693,9 @@ class AshLoop:
             self._last_turn_iteration_limit = iteration_budget
             self._persist_turn_usage(emit_event=False)
 
+            replay_binding_error = (
+                model_completion._provider_state_credential_binding_error
+            )
             await self._fire_hook_lifecycle(
                 "post_model",
                 {
@@ -4694,8 +4703,12 @@ class AshLoop:
                     "turn_id": self.turn_context.turn_id,
                     "model": self.provider.model_name,
                     "iteration": iteration,
-                    "status": "completed",
-                    "response": redact_text(assistant_text),
+                    "status": "error" if replay_binding_error is not None else "completed",
+                    **(
+                        {"error": redact_text(str(replay_binding_error))}
+                        if replay_binding_error is not None
+                        else {"response": redact_text(assistant_text)}
+                    ),
                     "tool_call_count": len(tool_calls),
                     "prompt_tokens": turn_prompt_tokens,
                     "completion_tokens": turn_completion_tokens,
@@ -4771,6 +4784,19 @@ class AshLoop:
             )
             session.messages.append(assistant_message)
 
+            if replay_binding_error is not None:
+                if tool_calls:
+                    self._persist_unexecuted_tool_calls(
+                        session=session,
+                        calls=tool_calls,
+                        reason=(
+                            "Tool call was not approved or dispatched because "
+                            "the provider's opaque reasoning state could not be "
+                            "bound to its credential."
+                        ),
+                    )
+                raise replay_binding_error
+
             used_tokens = total_prompt_tokens + total_completion_tokens
             if turn_token_budget > 0 and (
                 used_tokens > turn_token_budget
@@ -4783,35 +4809,11 @@ class AshLoop:
                         "Turn token budget was exhausted before this tool call could "
                         "be approved or dispatched; it was not run."
                     )
-                    for call in tool_calls:
-                        tool = self.tools.get(call["name"])
-                        record = ToolCallRecord(
-                            call_id=call["call_id"],
-                            tool_name=call["name"],
-                            arguments=redact_tool_arguments(
-                                tool,
-                                call["arguments"],
-                            ),
-                            approved=False,
-                            executed=False,
-                            dispatched=False,
-                            error=budget_error,
-                            timestamp=_utc_now(),
-                        )
-                        result_payload = self._tool_result_payload(
-                            {
-                                "success": False,
-                                "output": "",
-                                "error": budget_error,
-                            },
-                            record,
-                            defer_terminal_persistence=True,
-                        )
-                        self._persist_deferred_tool_result(
-                            session=session,
-                            call=call,
-                            result=result_payload,
-                        )
+                    self._persist_unexecuted_tool_calls(
+                        session=session,
+                        calls=tool_calls,
+                        reason=budget_error,
+                    )
                 tool_notice = (
                     " Pending tool calls were not executed." if tool_calls else ""
                 )
@@ -6538,6 +6540,9 @@ class AshLoop:
         replay_state_owner = None
         replay_state_profile = None
         replay_state_binding = None
+        replay_state_binding_error = None
+        if provider_state and session_id is not None and completed_replay_attempt is None:
+            replay_state_binding_error = ProviderReplayAffinityError()
         if provider_state and completed_replay_attempt is not None:
             replay_state_owner = completed_replay_attempt.owner
             replay_state_profile = completed_replay_attempt.selected_profile
@@ -6556,13 +6561,16 @@ class AshLoop:
                         self.session_store.provider_replay_state_cipher()
                     )
                 except ProviderReplayStateError:
-                    pass
-            try:
-                replay_state_binding = completed_replay_attempt.output_binding(
-                    provider_state
-                )
-            except ProviderReplayStateError:
-                replay_state_binding = None
+                    replay_state_binding_error = ProviderReplayAffinityError()
+            if replay_state_binding_error is None:
+                try:
+                    replay_state_binding = completed_replay_attempt.output_binding(
+                        provider_state
+                    )
+                except ProviderReplayStateError:
+                    replay_state_binding_error = ProviderReplayAffinityError()
+                if replay_state_binding is None:
+                    replay_state_binding_error = ProviderReplayAffinityError()
 
         completion = CompletionOutcome(
             text="".join(text_chunks),
@@ -6580,6 +6588,9 @@ class AshLoop:
         completion._provider_state_owner = replay_state_owner
         completion._provider_state_credential_profile = replay_state_profile
         completion._provider_state_credential_binding = replay_state_binding
+        completion._provider_state_credential_binding_error = (
+            replay_state_binding_error
+        )
         return completion
 
     def _handle_event(
@@ -7667,6 +7678,38 @@ class AshLoop:
             if archive_ambiguous_mcp_task:
                 payload["_archive_ambiguous_mcp_task"] = True
         return payload
+
+    def _persist_unexecuted_tool_calls(
+        self,
+        *,
+        session: Session,
+        calls: list[dict[str, Any]],
+        reason: str,
+    ) -> None:
+        """Close model tool calls that Ash deliberately did not dispatch."""
+
+        for call in calls:
+            tool = self.tools.get(call["name"])
+            record = ToolCallRecord(
+                call_id=call["call_id"],
+                tool_name=call["name"],
+                arguments=redact_tool_arguments(tool, call["arguments"]),
+                approved=False,
+                executed=False,
+                dispatched=False,
+                error=reason,
+                timestamp=_utc_now(),
+            )
+            result_payload = self._tool_result_payload(
+                {"success": False, "output": "", "error": reason},
+                record,
+                defer_terminal_persistence=True,
+            )
+            self._persist_deferred_tool_result(
+                session=session,
+                call=call,
+                result=result_payload,
+            )
 
     def _persist_deferred_tool_result(
         self,

@@ -167,6 +167,7 @@ AUTOMATIC_CONTEXT_HANDOFF_TOOLS = frozenset({
 
 INCOMPLETE_TURN_STOP_REASONS = frozenset({
     "token_budget", "iteration_limit", "circuit_breaker",
+    "provider_replay_binding",
 })
 
 
@@ -4417,7 +4418,11 @@ class SessionStore:
             if row["event_type"] == "turn.cancelled":
                 return "wall_time_budget" if reason == "wall_time_budget" else "cancelled"
             if row["event_type"] == "turn.error":
-                if isinstance(reason, str) and reason in ("context_budget", "opaque_context"):
+                if isinstance(reason, str) and reason in (
+                    "context_budget",
+                    "opaque_context",
+                    "provider_replay_binding",
+                ):
                     return reason
                 return "error"
             return "interrupted"
@@ -5599,11 +5604,9 @@ class SessionStore:
                     continue
                 binding = metadata.get("provider_state_credential_binding")
                 if not isinstance(binding, dict):
-                    raise RuntimeError(
-                        "Opaque provider history has no verified credential "
-                        "binding; use /restart-context with an explicit handoff "
-                        "before continuing."
-                    )
+                    from ash.providers.replay_affinity import ProviderReplayAffinityError
+
+                    raise ProviderReplayAffinityError from None
                 if (
                     metadata.get("provider_state_owner") != owner
                     or metadata.get("provider_state_credential_profile") != profile
