@@ -1818,3 +1818,67 @@ def test_real_repo_cli_rejects_invalid_options_without_evidence(
     assert child.returncode == 2
     assert error in child.stderr
     assert not evidence.exists()
+
+
+def test_r23_packaging_legacy_pickle_task_is_sealed_and_fair() -> None:
+    """Pinned new three-module task; alternative correct patches may differ."""
+    task = bench.TASKS["packaging-legacy-dataclass-pickles"]
+    assert task.source == "pypa/packaging"
+    assert task.upstream == "https://github.com/pypa/packaging.git"
+    assert task.upstream_pr == "https://github.com/pypa/packaging/pull/1548"
+    assert task.license == "Apache-2.0 OR BSD-2-Clause"
+    assert task.base_sha == "0efe21aa398df645c259ee31e54a8a4400b1fc6b"
+    assert task.reference_fix_sha == "6c838aca5942572ba04a1d1a603f5eaed0694263"
+    assert task.editable == frozenset({
+        "src/packaging/_structures.py",
+        "src/packaging/direct_url.py",
+        "src/packaging/pylock.py",
+    })
+    assert task.expected_reference_paths == frozenset({
+        "pyproject.toml",
+        "src/packaging/_structures.py",
+        "src/packaging/direct_url.py",
+        "src/packaging/pylock.py",
+        "tests/test_direct_url.py",
+        "tests/test_pylock.py",
+    })
+    assert task.require_both_oracles_red_green is True
+    assert task.require_all_editable_changed is False
+    assert task.runtime is None
+    assert task.command_grant == "python3 -B qa_visible.py"
+    assert task.visible_script == "qa_visible.py"
+    assert hashlib.sha256(task.visible_source.encode()).hexdigest() == (
+        "f93ccad77d00cd3dfba104aefd8fe65d0dfed02e5cfdc082569fe8a060018005"
+    )
+    assert hashlib.sha256(task.hidden_source.encode()).hexdigest() == (
+        "7b3ae5e595787dfb7bb99580c7adbb96d17140859e57105b0e1ce175f400e41f"
+    )
+    assert task.hidden_source not in task.visible_source
+    assert task.hidden_source not in task.prompt
+    assert task.reference_fix_sha not in task.prompt
+    assert task.reference_fix_sha not in bench.shared_user_prompt(task)
+    assert "hidden_" not in task.prompt
+    assert "hidden_" not in task.visible_source
+    assert "R23_PACKAGING_VISIBLE_OK" in task.visible_source
+    assert "R23_PACKAGING_HIDDEN_OK" in task.hidden_source
+    compile(task.visible_source, "qa_visible.py", "exec")
+    compile(task.hidden_source, "<sealed-oracle>", "exec")
+
+
+def test_r23_packaging_legacy_pickle_oracle_covers_all_model_types() -> None:
+    task = bench.TASKS["packaging-legacy-dataclass-pickles"]
+    # Both independently authored arms use authentic historical 26.3 binary
+    # specimens. The sealed arm covers remaining dataclasses and broken states.
+    for name in ("visible_vcs_info", "visible_direct_url_nested_vcs",
+                 "visible_package_vcs", "visible_pylock_nested"):
+        assert name in task.visible_source
+    for name in ("hidden_archive_info", "hidden_dir_info",
+                 "hidden_direct_url_archive", "hidden_direct_url_directory",
+                 "hidden_package_archive", "hidden_package_direct",
+                 "hidden_package_directory", "hidden_package_nested",
+                 "hidden_package_sdist", "hidden_package_wheel"):
+        assert name in task.hidden_source
+    assert "blank.__setstate__(state)" in task.hidden_source
+    assert "pickle.HIGHEST_PROTOCOL" in task.hidden_source
+    assert "pickle.loads(pickle.dumps(loaded" in task.hidden_source
+    assert "blank.__setstate__(state)" not in task.visible_source

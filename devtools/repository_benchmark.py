@@ -675,6 +675,117 @@ assert ordinary.number == 9
 """
 
 
+PACKAGING_LEGACY_DATACLASS_VISIBLE = r'''"""Frozen original-format packaging 26.3 compatibility test. No network."""
+from __future__ import annotations
+import base64
+import dataclasses
+import importlib
+import pickle
+import sys
+from collections.abc import Mapping
+sys.path.insert(0,'src')
+
+def normalize(v):
+    if dataclasses.is_dataclass(v) and not isinstance(v,type):
+        return {'class':f'{type(v).__module__}.{type(v).__qualname__}',
+                'fields':{f.name:normalize(getattr(v,f.name)) for f in dataclasses.fields(v)}}
+    if isinstance(v,Mapping):
+        return {'map':{str(k):normalize(val) for k,val in sorted(v.items(),key=lambda pair:str(pair[0]))}}
+    if isinstance(v,(list,tuple)):
+        return {'sequence':[normalize(x) for x in v]}
+    if v is None or type(v) in (str,int,float,bool):
+        return v
+    if type(v).__module__.startswith('packaging.'):
+        return {'class':f'{type(v).__module__}.{type(v).__qualname__}', 'string':str(v)}
+    raise TypeError(f'unsupported state value {type(v)}')
+
+def check_payload(name,row):
+    module_name,class_name=row['class'].rsplit('.',1)
+    cls=getattr(importlib.import_module(module_name),class_name)
+    value=pickle.loads(base64.b64decode(row['blob'],validate=True))
+    assert type(value) is cls,(name,type(value),cls)
+    observed=normalize(value)
+    assert observed==row['expected'],(name,observed,row['expected'])
+    return value
+
+FIXTURES={'visible_direct_url_nested_vcs': {'class': 'packaging.direct_url.DirectUrl', 'blob': 'gASV4wAAAAAAAACMFHBhY2thZ2luZy5kaXJlY3RfdXJslIwJRGlyZWN0VXJslJOUKYGUfZQojAN1cmyUjBhodHRwczovL2V4YW1wbGUub3JnL3JlcG+UjAxhcmNoaXZlX2luZm+UTowIdmNzX2luZm+UaACMB1Zjc0luZm+Uk5QpgZR9lCiMA3Zjc5SMA2dpdJSMCWNvbW1pdF9pZJSMCGNhZmViYWJllIwScmVxdWVzdGVkX3JldmlzaW9ulIwHcmVsZWFzZZR1YowIZGlyX2luZm+UTowMc3ViZGlyZWN0b3J5lIwDbGlilHViLg==', 'expected': {'class': 'packaging.direct_url.DirectUrl', 'fields': {'url': 'https://example.org/repo', 'archive_info': None, 'vcs_info': {'class': 'packaging.direct_url.VcsInfo', 'fields': {'vcs': 'git', 'commit_id': 'cafebabe', 'requested_revision': 'release'}}, 'dir_info': None, 'subdirectory': 'lib'}}}, 'visible_package_vcs': {'class': 'packaging.pylock.PackageVcs', 'blob': 'gASVrwAAAAAAAACMEHBhY2thZ2luZy5weWxvY2uUjApQYWNrYWdlVmNzlJOUKYGUfZQojAR0eXBllIwDZ2l0lIwDdXJslIwcaHR0cHM6Ly9leGFtcGxlLm9yZy9yZXBvLmdpdJSMBHBhdGiUTowScmVxdWVzdGVkX3JldmlzaW9ulIwGc3RhYmxllIwJY29tbWl0X2lklIwIMDEyMzQ1NjeUjAxzdWJkaXJlY3RvcnmUjANwa2eUdWIu', 'expected': {'class': 'packaging.pylock.PackageVcs', 'fields': {'type': 'git', 'url': 'https://example.org/repo.git', 'path': None, 'requested_revision': 'stable', 'commit_id': '01234567', 'subdirectory': 'pkg'}}}, 'visible_pylock_nested': {'class': 'packaging.pylock.Pylock', 'blob': 'gASVSQMAAAAAAACMEHBhY2thZ2luZy5weWxvY2uUjAZQeWxvY2uUk5QpgZR9lCiMDGxvY2tfdmVyc2lvbpSMEXBhY2thZ2luZy52ZXJzaW9ulIwHVmVyc2lvbpSTlCmBlChLAEsBSwCGlE5OTk50lGKMDGVudmlyb25tZW50c5ROjA9yZXF1aXJlc19weXRob26UTowGZXh0cmFzlE6MEWRlcGVuZGVuY3lfZ3JvdXBzlE6MDmRlZmF1bHRfZ3JvdXBzlE6MCmNyZWF0ZWRfYnmUjAdhc2gtcjIzlIwIcGFja2FnZXOUXZQoaACMB1BhY2thZ2WUk5QpgZR9lCiMBG5hbWWUjAZ3aWRnZXSUjAd2ZXJzaW9ulGgIKYGUKEsASwFLAEsAh5ROTk5OdJRijAZtYXJrZXKUTmgNTowMZGVwZW5kZW5jaWVzlE6MA3Zjc5ROjAlkaXJlY3RvcnmUTowHYXJjaGl2ZZROjAVpbmRleJROjAVzZGlzdJROjAZ3aGVlbHOUXZRoAIwMUGFja2FnZVdoZWVslJOUKYGUfZQoaBmMHXdpZGdldC0xLjAuMC1weTMtbm9uZS1hbnkud2hslIwLdXBsb2FkX3RpbWWUTowDdXJslE6MBHBhdGiUTowEc2l6ZZRLgIwGaGFzaGVzlH2UjAZzaGEyNTaUjEBkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRklHN1YmGMFmF0dGVzdGF0aW9uX2lkZW50aXRpZXOUTowEdG9vbJROdWJoFimBlH2UKGgZjAp3aWRnZXQtbGlilGgbaAgpgZQoSwBLAksAhpROTk5OdJRiaB9OaA1OaCBOaCFoAIwKUGFja2FnZVZjc5STlCmBlH2UKIwEdHlwZZSMA2dpdJRoLowcaHR0cHM6Ly9leGFtcGxlLm9yZy9yZXBvLmdpdJRoL06MEnJlcXVlc3RlZF9yZXZpc2lvbpSMBnN0YWJsZZSMCWNvbW1pdF9pZJSMCDAxMjM0NTY3lIwMc3ViZGlyZWN0b3J5lIwDcGtnlHViaCJOaCNOaCROaCVOaCZOaDVOaDZOdWJlaDZOdWIu', 'expected': {'class': 'packaging.pylock.Pylock', 'fields': {'lock_version': {'class': 'packaging.version.Version', 'string': '1.0'}, 'environments': None, 'requires_python': None, 'extras': None, 'dependency_groups': None, 'default_groups': None, 'created_by': 'ash-r23', 'packages': {'sequence': [{'class': 'packaging.pylock.Package', 'fields': {'name': 'widget', 'version': {'class': 'packaging.version.Version', 'string': '1.0.0'}, 'marker': None, 'requires_python': None, 'dependencies': None, 'vcs': None, 'directory': None, 'archive': None, 'index': None, 'sdist': None, 'wheels': {'sequence': [{'class': 'packaging.pylock.PackageWheel', 'fields': {'name': 'widget-1.0.0-py3-none-any.whl', 'upload_time': None, 'url': None, 'path': None, 'size': 128, 'hashes': {'map': {'sha256': 'dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd'}}}}]}, 'attestation_identities': None, 'tool': None}}, {'class': 'packaging.pylock.Package', 'fields': {'name': 'widget-lib', 'version': {'class': 'packaging.version.Version', 'string': '2.0'}, 'marker': None, 'requires_python': None, 'dependencies': None, 'vcs': {'class': 'packaging.pylock.PackageVcs', 'fields': {'type': 'git', 'url': 'https://example.org/repo.git', 'path': None, 'requested_revision': 'stable', 'commit_id': '01234567', 'subdirectory': 'pkg'}}, 'directory': None, 'archive': None, 'index': None, 'sdist': None, 'wheels': None, 'attestation_identities': None, 'tool': None}}]}, 'tool': None}}}, 'visible_vcs_info': {'class': 'packaging.direct_url.VcsInfo', 'blob': 'gASVbgAAAAAAAACMFHBhY2thZ2luZy5kaXJlY3RfdXJslIwHVmNzSW5mb5STlCmBlH2UKIwDdmNzlIwDZ2l0lIwJY29tbWl0X2lklIwIY2FmZWJhYmWUjBJyZXF1ZXN0ZWRfcmV2aXNpb26UjAdyZWxlYXNllHViLg==', 'expected': {'class': 'packaging.direct_url.VcsInfo', 'fields': {'vcs': 'git', 'commit_id': 'cafebabe', 'requested_revision': 'release'}}}}
+
+for name,row in FIXTURES.items():
+    check_payload(name,row)
+
+print("R23_PACKAGING_VISIBLE_OK")
+'''
+
+PACKAGING_LEGACY_DATACLASS_HIDDEN = r'''"""Frozen original-format packaging 26.3 compatibility test. No network."""
+from __future__ import annotations
+import base64
+import dataclasses
+import importlib
+import pickle
+import sys
+from collections.abc import Mapping
+sys.path.insert(0,'src')
+
+def normalize(v):
+    if dataclasses.is_dataclass(v) and not isinstance(v,type):
+        return {'class':f'{type(v).__module__}.{type(v).__qualname__}',
+                'fields':{f.name:normalize(getattr(v,f.name)) for f in dataclasses.fields(v)}}
+    if isinstance(v,Mapping):
+        return {'map':{str(k):normalize(val) for k,val in sorted(v.items(),key=lambda pair:str(pair[0]))}}
+    if isinstance(v,(list,tuple)):
+        return {'sequence':[normalize(x) for x in v]}
+    if v is None or type(v) in (str,int,float,bool):
+        return v
+    if type(v).__module__.startswith('packaging.'):
+        return {'class':f'{type(v).__module__}.{type(v).__qualname__}', 'string':str(v)}
+    raise TypeError(f'unsupported state value {type(v)}')
+
+def check_payload(name,row):
+    module_name,class_name=row['class'].rsplit('.',1)
+    cls=getattr(importlib.import_module(module_name),class_name)
+    value=pickle.loads(base64.b64decode(row['blob'],validate=True))
+    assert type(value) is cls,(name,type(value),cls)
+    observed=normalize(value)
+    assert observed==row['expected'],(name,observed,row['expected'])
+    return value
+
+FIXTURES={'hidden_archive_info': {'class': 'packaging.direct_url.ArchiveInfo', 'blob': 'gASVhwAAAAAAAACMFHBhY2thZ2luZy5kaXJlY3RfdXJslIwLQXJjaGl2ZUluZm+Uk5QpgZR9lIwGaGFzaGVzlH2UjAZzaGEyNTaUjEBhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhlHNzYi4=', 'expected': {'class': 'packaging.direct_url.ArchiveInfo', 'fields': {'hashes': {'map': {'sha256': 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'}}}}}, 'hidden_dir_info': {'class': 'packaging.direct_url.DirInfo', 'blob': 'gASVNwAAAAAAAACMFHBhY2thZ2luZy5kaXJlY3RfdXJslIwHRGlySW5mb5STlCmBlH2UjAhlZGl0YWJsZZSIc2Iu', 'expected': {'class': 'packaging.direct_url.DirInfo', 'fields': {'editable': True}}}, 'hidden_direct_url_archive': {'class': 'packaging.direct_url.DirectUrl', 'blob': 'gASVAQEAAAAAAACMFHBhY2thZ2luZy5kaXJlY3RfdXJslIwJRGlyZWN0VXJslJOUKYGUfZQojAN1cmyUjCJodHRwczovL2ZpbGVzLmV4YW1wbGUub3JnL2Rpc3Qud2hslIwMYXJjaGl2ZV9pbmZvlGgAjAtBcmNoaXZlSW5mb5STlCmBlH2UjAZoYXNoZXOUfZSMBnNoYTI1NpSMQGFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWGUc3NijAh2Y3NfaW5mb5ROjAhkaXJfaW5mb5ROjAxzdWJkaXJlY3RvcnmUTnViLg==', 'expected': {'class': 'packaging.direct_url.DirectUrl', 'fields': {'url': 'https://files.example.org/dist.whl', 'archive_info': {'class': 'packaging.direct_url.ArchiveInfo', 'fields': {'hashes': {'map': {'sha256': 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'}}}}, 'vcs_info': None, 'dir_info': None, 'subdirectory': None}}}, 'hidden_direct_url_directory': {'class': 'packaging.direct_url.DirectUrl', 'blob': 'gASVoQAAAAAAAACMFHBhY2thZ2luZy5kaXJlY3RfdXJslIwJRGlyZWN0VXJslJOUKYGUfZQojAN1cmyUjBJmaWxlOi8vL3Nydi9zb3VyY2WUjAxhcmNoaXZlX2luZm+UTowIdmNzX2luZm+UTowIZGlyX2luZm+UaACMB0RpckluZm+Uk5QpgZR9lIwIZWRpdGFibGWUiHNijAxzdWJkaXJlY3RvcnmUTnViLg==', 'expected': {'class': 'packaging.direct_url.DirectUrl', 'fields': {'url': 'file:///srv/source', 'archive_info': None, 'vcs_info': None, 'dir_info': {'class': 'packaging.direct_url.DirInfo', 'fields': {'editable': True}}, 'subdirectory': None}}}, 'hidden_package_archive': {'class': 'packaging.pylock.PackageArchive', 'blob': 'gASV2QAAAAAAAACMEHBhY2thZ2luZy5weWxvY2uUjA5QYWNrYWdlQXJjaGl2ZZSTlCmBlH2UKIwDdXJslIwZaHR0cHM6Ly9leGFtcGxlLm9yZy9hLndobJSMBHBhdGiUTowEc2l6ZZRLlIwLdXBsb2FkX3RpbWWUTowGaGFzaGVzlH2UjAZzaGEyNTaUjEBiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJilHOMDHN1YmRpcmVjdG9yeZROdWIu', 'expected': {'class': 'packaging.pylock.PackageArchive', 'fields': {'url': 'https://example.org/a.whl', 'path': None, 'size': 148, 'upload_time': None, 'hashes': {'map': {'sha256': 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'}}, 'subdirectory': None}}}, 'hidden_package_direct': {'class': 'packaging.pylock.Package', 'blob': 'gASVnwEAAAAAAACMEHBhY2thZ2luZy5weWxvY2uUjAdQYWNrYWdllJOUKYGUfZQojARuYW1llIwKd2lkZ2V0LWxpYpSMB3ZlcnNpb26UjBFwYWNrYWdpbmcudmVyc2lvbpSMB1ZlcnNpb26Uk5QpgZQoSwBLAksAhpROTk5OdJRijAZtYXJrZXKUTowPcmVxdWlyZXNfcHl0aG9ulE6MDGRlcGVuZGVuY2llc5ROjAN2Y3OUaACMClBhY2thZ2VWY3OUk5QpgZR9lCiMBHR5cGWUjANnaXSUjAN1cmyUjBxodHRwczovL2V4YW1wbGUub3JnL3JlcG8uZ2l0lIwEcGF0aJROjBJyZXF1ZXN0ZWRfcmV2aXNpb26UjAZzdGFibGWUjAljb21taXRfaWSUjAgwMTIzNDU2N5SMDHN1YmRpcmVjdG9yeZSMA3BrZ5R1YowJZGlyZWN0b3J5lE6MB2FyY2hpdmWUTowFaW5kZXiUTowFc2Rpc3SUTowGd2hlZWxzlE6MFmF0dGVzdGF0aW9uX2lkZW50aXRpZXOUTowEdG9vbJROdWIu', 'expected': {'class': 'packaging.pylock.Package', 'fields': {'name': 'widget-lib', 'version': {'class': 'packaging.version.Version', 'string': '2.0'}, 'marker': None, 'requires_python': None, 'dependencies': None, 'vcs': {'class': 'packaging.pylock.PackageVcs', 'fields': {'type': 'git', 'url': 'https://example.org/repo.git', 'path': None, 'requested_revision': 'stable', 'commit_id': '01234567', 'subdirectory': 'pkg'}}, 'directory': None, 'archive': None, 'index': None, 'sdist': None, 'wheels': None, 'attestation_identities': None, 'tool': None}}}, 'hidden_package_directory': {'class': 'packaging.pylock.PackageDirectory', 'blob': 'gASVZgAAAAAAAACMEHBhY2thZ2luZy5weWxvY2uUjBBQYWNrYWdlRGlyZWN0b3J5lJOUKYGUfZQojARwYXRolIwKdmVuZG9yL3NyY5SMCGVkaXRhYmxllImMDHN1YmRpcmVjdG9yeZSMA3NyY5R1Yi4=', 'expected': {'class': 'packaging.pylock.PackageDirectory', 'fields': {'path': 'vendor/src', 'editable': False, 'subdirectory': 'src'}}}, 'hidden_package_nested': {'class': 'packaging.pylock.Package', 'blob': 'gASVvwEAAAAAAACMEHBhY2thZ2luZy5weWxvY2uUjAdQYWNrYWdllJOUKYGUfZQojARuYW1llIwGd2lkZ2V0lIwHdmVyc2lvbpSMEXBhY2thZ2luZy52ZXJzaW9ulIwHVmVyc2lvbpSTlCmBlChLAEsBSwBLAIeUTk5OTnSUYowGbWFya2VylE6MD3JlcXVpcmVzX3B5dGhvbpROjAxkZXBlbmRlbmNpZXOUTowDdmNzlE6MCWRpcmVjdG9yeZROjAdhcmNoaXZllE6MBWluZGV4lE6MBXNkaXN0lE6MBndoZWVsc5RdlGgAjAxQYWNrYWdlV2hlZWyUk5QpgZR9lChoBYwdd2lkZ2V0LTEuMC4wLXB5My1ub25lLWFueS53aGyUjAt1cGxvYWRfdGltZZROjAN1cmyUTowEcGF0aJROjARzaXpllEuAjAZoYXNoZXOUfZSMBnNoYTI1NpSMQGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGSUc3ViYYwWYXR0ZXN0YXRpb25faWRlbnRpdGllc5ROjAR0b29slE51Yi4=', 'expected': {'class': 'packaging.pylock.Package', 'fields': {'name': 'widget', 'version': {'class': 'packaging.version.Version', 'string': '1.0.0'}, 'marker': None, 'requires_python': None, 'dependencies': None, 'vcs': None, 'directory': None, 'archive': None, 'index': None, 'sdist': None, 'wheels': {'sequence': [{'class': 'packaging.pylock.PackageWheel', 'fields': {'name': 'widget-1.0.0-py3-none-any.whl', 'upload_time': None, 'url': None, 'path': None, 'size': 128, 'hashes': {'map': {'sha256': 'dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd'}}}}]}, 'attestation_identities': None, 'tool': None}}}, 'hidden_package_sdist': {'class': 'packaging.pylock.PackageSdist', 'blob': 'gASVyQAAAAAAAACMEHBhY2thZ2luZy5weWxvY2uUjAxQYWNrYWdlU2Rpc3SUk5QpgZR9lCiMBG5hbWWUjBN3aWRnZXQtMS4wLjAudGFyLmd6lIwLdXBsb2FkX3RpbWWUTowDdXJslE6MBHBhdGiUTowEc2l6ZZRLvIwGaGFzaGVzlH2UjAZzaGEyNTaUjEBjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjlHN1Yi4=', 'expected': {'class': 'packaging.pylock.PackageSdist', 'fields': {'name': 'widget-1.0.0.tar.gz', 'upload_time': None, 'url': None, 'path': None, 'size': 188, 'hashes': {'map': {'sha256': 'cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc'}}}}}, 'hidden_package_wheel': {'class': 'packaging.pylock.PackageWheel', 'blob': 'gASV0wAAAAAAAACMEHBhY2thZ2luZy5weWxvY2uUjAxQYWNrYWdlV2hlZWyUk5QpgZR9lCiMBG5hbWWUjB13aWRnZXQtMS4wLjAtcHkzLW5vbmUtYW55LndobJSMC3VwbG9hZF90aW1llE6MA3VybJROjARwYXRolE6MBHNpemWUS4CMBmhhc2hlc5R9lIwGc2hhMjU2lIxAZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZJRzdWIu', 'expected': {'class': 'packaging.pylock.PackageWheel', 'fields': {'name': 'widget-1.0.0-py3-none-any.whl', 'upload_time': None, 'url': None, 'path': None, 'size': 128, 'hashes': {'map': {'sha256': 'dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd'}}}}}}
+
+for name,row in FIXTURES.items():
+    check_payload(name,row)
+
+# Round trips from the NEW format must remain readable, without changing the
+# standard list/tuple state emitted by frozen, slotted dataclasses.
+for name,row in FIXTURES.items():
+    loaded=check_payload(name,row)
+    assert isinstance(loaded.__getstate__(),list),(name,type(loaded.__getstate__()))
+    for protocol in (2,4,pickle.HIGHEST_PROTOCOL):
+        subsequent=pickle.loads(pickle.dumps(loaded,protocol=protocol))
+        assert normalize(subsequent)==row['expected'],name
+
+# A malformed old dict must not get silently misread as a list of field names.
+# The reference explicitly rejects wrong key sets and wrong list lengths.
+from packaging import direct_url,pylock
+for cls in (direct_url.VcsInfo,direct_url.DirectUrl,pylock.PackageVcs,pylock.Pylock):
+    fields=dataclasses.fields(cls)
+    blank=object.__new__(cls)
+    names=[f.name for f in fields]
+    for state,error_type in (
+        ({key:key for key in names[:-1]},TypeError),
+        ({**{key:key for key in names},'unexpected':'junk'},TypeError),
+        (['value']*(len(fields)-1),ValueError),
+        (['value']*(len(fields)+1),ValueError),
+    ):
+        try:
+            blank.__setstate__(state)
+        except error_type:
+            pass
+        else:
+            raise AssertionError(f'{cls.__name__} accepted invalid pickle state {type(state).__name__}')
+
+print("R23_PACKAGING_HIDDEN_OK")
+'''
+
 PACKAGING_PICKLE_VISIBLE = r"""import pickle
 import sys
 sys.path.insert(0, 'src')
@@ -2382,6 +2493,50 @@ PYTEST_MIXED_INDIRECT_HIDDEN_EXPECTED = json.dumps(
 
 
 TASKS = {
+    "packaging-legacy-dataclass-pickles": RepositoryTask(
+        source="pypa/packaging",
+        upstream="https://github.com/pypa/packaging.git",
+        base_sha="0efe21aa398df645c259ee31e54a8a4400b1fc6b",
+        reference_fix_sha="6c838aca5942572ba04a1d1a603f5eaed0694263",
+        editable=frozenset({
+            "src/packaging/_structures.py",
+            "src/packaging/direct_url.py",
+            "src/packaging/pylock.py",
+        }),
+        visible_script="qa_visible.py",
+        visible_source=PACKAGING_LEGACY_DATACLASS_VISIBLE,
+        hidden_source=PACKAGING_LEGACY_DATACLASS_HIDDEN,
+        command_grant="python3 -B qa_visible.py",
+        prompt=(
+            "Repair backward compatibility for old serialized dataclass values "
+            "in this pinned pypa/packaging repository. The older 26.3 version "
+            "serialized pylock and direct_url dataclasses using dictionary "
+            "instance state; current frozen slotted dataclasses can silently "
+            "restore those dictionary keys as field values rather than the "
+            "original data. Deserialize authentic old pickle values accurately "
+            "across the supported nested model types, reject structurally "
+            "invalid states instead of silently mis-restoring fields, and "
+            "preserve round trips and the existing pickle format of current "
+            "slotted dataclasses. Inspect qa_visible.py and the relevant "
+            "production code. You may change only "
+            "src/packaging/_structures.py, src/packaging/direct_url.py, "
+            "and src/packaging/pylock.py. Do not edit tests, packaging metadata, "
+            "or any other file. Run exactly python3 -B qa_visible.py using "
+            "run_command to verify the fix; no other commands are authorized."
+        ),
+        upstream_pr="https://github.com/pypa/packaging/pull/1548",
+        license="Apache-2.0 OR BSD-2-Clause",
+        require_all_editable_changed=False,
+        require_both_oracles_red_green=True,
+        expected_reference_paths=frozenset({
+            "pyproject.toml",
+            "src/packaging/_structures.py",
+            "src/packaging/direct_url.py",
+            "src/packaging/pylock.py",
+            "tests/test_direct_url.py",
+            "tests/test_pylock.py",
+        }),
+    ),
     "pyflakes-functional-typing-fields": RepositoryTask(
         source="PyCQA/pyflakes",
         upstream="https://github.com/PyCQA/pyflakes.git",
