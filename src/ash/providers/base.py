@@ -11,7 +11,7 @@ import inspect
 import json
 from typing import Any, AsyncGenerator, Literal, Protocol, runtime_checkable
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, PrivateAttr, field_validator
 from ash.providers.capabilities import ProviderCapabilities, infer_capabilities
 from ash.providers.messages import CanonicalMessage, CanonicalToolCall, MessageInput
 
@@ -274,6 +274,11 @@ class CompletionOutcome(BaseModel):
     )
     provider_state: list[dict[str, Any]] = Field(default_factory=list, max_length=64)
     provider_context_policy: dict[str, Any] | None = None
+    _provider_state_owner: str | None = PrivateAttr(default=None)
+    _provider_state_credential_profile: str | None = PrivateAttr(default=None)
+    _provider_state_credential_binding: dict[str, Any] | None = PrivateAttr(
+        default=None
+    )
 
     @field_validator("provider_state", mode="before")
     @classmethod

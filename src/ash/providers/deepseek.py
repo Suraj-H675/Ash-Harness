@@ -23,6 +23,7 @@ from ash.providers.base import (
 from ash.providers.capabilities import ProviderCapabilities, deepseek_capabilities
 from ash.providers.messages import CanonicalToolCall, MessageInput
 from ash.providers.openai import (
+    _api_key_replay_identity,
     _owned_openai_http_client,
     _redact_openai_compatible_stream_errors,
     account_openai_compatible_stream_bytes,
@@ -31,9 +32,11 @@ from ash.providers.openai import (
     prepare_openai_messages,
 )
 from ash.providers.replay_state import (
+    ProviderReplayCredentialIdentity,
     ProviderReplayStateCipher,
     ProviderReplayStateError,
 )
+from ash.providers.replay_affinity import verify_provider_replay_identity
 from ash.providers.readiness import (
     normalize_provider_base_url,
     redact_provider_error,
@@ -84,6 +87,15 @@ class DeepSeekProvider(ProviderABC):
     def model_name(self) -> str:
         return self._model_name
 
+    def replay_credential_identity(self) -> ProviderReplayCredentialIdentity:
+        """Return the exact API key used by this provider, in memory only."""
+
+        return _api_key_replay_identity(
+            self._api_key,
+            provider_family=self.provider_family,
+            base_url=self._base_url,
+        )
+
     @property
     def capabilities(self) -> ProviderCapabilities:
         return deepseek_capabilities(self._model_name)
@@ -116,6 +128,12 @@ class DeepSeekProvider(ProviderABC):
         temperature: float = 0.0,
         tools: list[dict[str, Any]] | None = None,
     ) -> AsyncGenerator[StreamChunk, None]:
+        verify_provider_replay_identity(
+            self.replay_credential_identity(),
+            provider_family=self.provider_family,
+            model_name=self.model_name,
+        )
+
         def replay_fields(message: Any) -> dict[str, Any]:
             state_items = message.get("provider_state") or []
             matching = [

@@ -21,6 +21,11 @@ from ash.providers.base import (
 )
 from ash.providers.capabilities import ProviderCapabilities
 from ash.providers.messages import MessageInput, normalize_messages
+from ash.providers.replay_affinity import (
+    resolve_provider_replay_identity,
+    select_provider_replay_profile,
+    verify_provider_replay_identity,
+)
 from ash.providers.retry import (
     ProviderFailure,
     ProviderFailureCategory,
@@ -210,10 +215,18 @@ class CredentialPoolProvider(ProviderABC):
         for index in candidates:
             provider = self.providers[index]
             self.active_index = index
+            profile_id = self.profile_ids[index]
             emitted_output = False
             exposed_terminal = False
             saw_terminal = False
             try:
+                select_provider_replay_profile(profile_id)
+                identity = await resolve_provider_replay_identity(provider)
+                verify_provider_replay_identity(
+                    identity,
+                    provider_family=provider.provider_family,
+                    model_name=provider.model_name,
+                )
                 async with managed_async_stream(
                     provider.stream_chat(
                         messages,

@@ -27,12 +27,14 @@ from ash.providers.messages import (
     MessageInput,
     normalize_messages,
 )
-from ash.providers.openai import _owned_openai_http_client
+from ash.providers.openai import _api_key_replay_identity, _owned_openai_http_client
 from ash.providers.readiness import (
     normalize_provider_base_url,
     redact_provider_error,
     require_secure_provider_transport,
 )
+from ash.providers.replay_state import ProviderReplayCredentialIdentity
+from ash.providers.replay_affinity import verify_provider_replay_identity
 from ash.safe_io import strict_json_loads
 
 
@@ -660,6 +662,15 @@ class OpenAIResponsesProvider(ProviderABC):
     def model_name(self) -> str:
         return self._model_name
 
+    def replay_credential_identity(self) -> ProviderReplayCredentialIdentity:
+        """Return the exact API key used by this provider, in memory only."""
+
+        return _api_key_replay_identity(
+            self._api_key,
+            provider_family=self.provider_family,
+            base_url=self._base_url,
+        )
+
     @property
     def server_side_compaction_enabled(self) -> bool:
         return self._server_side_compaction_enabled
@@ -712,6 +723,11 @@ class OpenAIResponsesProvider(ProviderABC):
         self, messages: Sequence[MessageInput]
     ) -> list[dict[str, Any]]:
         """Create a native reasoning checkpoint (API key access required)."""
+        verify_provider_replay_identity(
+            self.replay_credential_identity(),
+            provider_family=self.provider_family,
+            model_name=self.model_name,
+        )
         try:
             return await compact_openai_responses_history(
                 self._resolve_client(),
@@ -758,6 +774,11 @@ class OpenAIResponsesProvider(ProviderABC):
         temperature: float = 0.0,
         tools: list[dict[str, Any]] | None = None,
     ) -> AsyncGenerator[StreamChunk, None]:
+        verify_provider_replay_identity(
+            self.replay_credential_identity(),
+            provider_family=self.provider_family,
+            model_name=self.model_name,
+        )
         if temperature != 0.0:
             raise ValueError(
                 "current OpenAI Responses reasoning models do not support "

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager
 from typing import Any, AsyncGenerator
@@ -23,9 +24,36 @@ from ash.providers.readiness import (
     redact_provider_error,
     require_secure_provider_transport,
 )
+from ash.providers.replay_state import ProviderReplayCredentialIdentity
+from ash.providers.replay_affinity import (
+    resolve_provider_replay_identity,
+    verify_provider_replay_identity,
+)
 
 
 MAX_OPENAI_COMPATIBLE_STREAM_BYTES = 16 * 1024 * 1024
+
+
+def _api_key_replay_identity(
+    api_key: str,
+    *,
+    provider_family: str,
+    base_url: str | None,
+    extra_scope: Sequence[str] = (),
+) -> ProviderReplayCredentialIdentity:
+    scope = [provider_family, base_url or "provider-default"]
+    if provider_family == "openai":
+        scope.extend(
+            (
+                os.environ.get("OPENAI_ORG_ID", ""),
+                os.environ.get("OPENAI_PROJECT_ID", ""),
+            )
+        )
+    scope.extend(extra_scope)
+    return ProviderReplayCredentialIdentity.from_secret(
+        api_key,
+        scope=tuple(scope),
+    )
 
 
 @asynccontextmanager
@@ -264,6 +292,29 @@ class OpenAIProvider(ProviderABC):
     def model_name(self) -> str:
         return self._model_name
 
+    def replay_credential_identity(self) -> ProviderReplayCredentialIdentity | None:
+        """Return the exact static API key used by this provider, in memory only."""
+
+        if not isinstance(self._api_key, str) or not self._api_key:
+            return None
+        default_headers = self._client_options.get("default_headers") or {}
+        extra_scope_parts: list[str] = []
+        for key, value in sorted(default_headers.items()):
+            extra_scope_parts.extend((str(key).casefold(), str(value)))
+        return _api_key_replay_identity(
+            self._api_key,
+            provider_family=self.provider_family,
+            base_url=self._base_url,
+            extra_scope=tuple(extra_scope_parts),
+        )
+
+    async def resolve_replay_credential_identity(
+        self,
+    ) -> ProviderReplayCredentialIdentity | None:
+        """Resolve this provider's credential identity before dispatch."""
+
+        return self.replay_credential_identity()
+
     def count_tokens(self, text: str) -> int:
         return self._token_counter.count(text)
 
@@ -342,6 +393,12 @@ class OpenAIProvider(ProviderABC):
         temperature: float = 0.0,
         tools: list[dict[str, Any]] | None = None,
     ) -> AsyncGenerator[StreamChunk, None]:
+        identity = await resolve_provider_replay_identity(self)
+        verify_provider_replay_identity(
+            identity,
+            provider_family=self.provider_family,
+            model_name=self.model_name,
+        )
         kwargs: dict[str, Any] = {
             "model": self._model_name,
             "messages": self._prepare_messages(messages),

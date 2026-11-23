@@ -18,6 +18,7 @@ from ash.providers.capabilities import (
 from ash.providers.google_replay import GoogleThoughtSignatureReplay
 from ash.providers.messages import MessageInput
 from ash.providers.openai import OpenAIProvider
+from ash.providers.replay_state import ProviderReplayCredentialIdentity
 from ash.providers.replay_state import ProviderReplayStateCipher
 
 
@@ -83,6 +84,27 @@ class GoogleAdcTokenProvider:
 
     def redaction_secrets(self) -> tuple[str, ...]:
         return tuple(self._recent_tokens)
+
+    async def service_account_principal(self) -> str | None:
+        """Resolve a stable Google service-account principal when available."""
+
+        async with self._lock:
+            if self._credentials is None or self._request is None:
+                await self._load_default_credentials()
+            credentials = self._credentials
+            principal = getattr(credentials, "service_account_email", None)
+            if (
+                not isinstance(principal, str)
+                or not principal
+                or principal.casefold() == "default"
+                or len(principal) > 4096
+                or any(
+                    ord(character) < 33 or ord(character) == 127
+                    for character in principal
+                )
+            ):
+                return None
+            return principal
 
     async def _load_default_credentials(self) -> None:
         try:
@@ -156,6 +178,18 @@ class VertexProvider(OpenAIProvider):
             base_url=vertex_openai_base_url(self.project, self.location),
             error_secrets_supplier=self._adc.redaction_secrets,
             client=client,
+        )
+
+    async def resolve_replay_credential_identity(
+        self,
+    ) -> ProviderReplayCredentialIdentity | None:
+        principal = await self._adc.service_account_principal()
+        if principal is None:
+            return None
+        return ProviderReplayCredentialIdentity.from_verified_subject(
+            "https://accounts.google.com",
+            principal,
+            scope=("vertex", self.project, self.location),
         )
 
     @property

@@ -5559,6 +5559,90 @@ class SessionStore:
 
         return self.provider_replay_state_identity(session_id)[0]
 
+    def provider_replay_binding_scope_id(self, session_id: str) -> str:
+        """Return the stable session-lineage scope used by replay bindings."""
+
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                "SELECT root_session_id FROM sessions WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+        if row is None:
+            raise KeyError(f"Session not found: {session_id}")
+        root_session_id = str(row["root_session_id"] or "")
+        return root_session_id or session_id
+
+    def provider_replay_state_bindings(
+        self,
+        session_id: str,
+    ) -> tuple[Any, ...]:
+        """Load authenticated credential bindings for every stored opaque state."""
+
+        from ash.providers.replay_affinity import ProviderReplayBindingRecord
+
+        owner, profile = self.provider_replay_state_identity(session_id)
+        records: list[ProviderReplayBindingRecord] = []
+        with closing(self._connect()) as conn:
+            for row in conn.execute(
+                "SELECT metadata_json FROM messages "
+                "WHERE session_id = ? AND role = 'assistant'",
+                (session_id,),
+            ):
+                try:
+                    metadata = json.loads(row["metadata_json"] or "{}")
+                except (TypeError, ValueError) as exc:
+                    raise _invalid_stored_data_error(self.db_path) from exc
+                if not isinstance(metadata, dict):
+                    raise _invalid_stored_data_error(self.db_path)
+                state = metadata.get("provider_state")
+                if not state:
+                    continue
+                binding = metadata.get("provider_state_credential_binding")
+                if not isinstance(binding, dict):
+                    raise RuntimeError(
+                        "Opaque provider history has no verified credential "
+                        "binding; use /restart-context with an explicit handoff "
+                        "before continuing."
+                    )
+                if (
+                    metadata.get("provider_state_owner") != owner
+                    or metadata.get("provider_state_credential_profile") != profile
+                ):
+                    raise RuntimeError(
+                        "Opaque provider history has conflicting credential "
+                        "bindings; use /restart-context with an explicit handoff "
+                        "before continuing."
+                    )
+                records.append(
+                    ProviderReplayBindingRecord(
+                        owner=owner or "",
+                        profile=profile,
+                        state=state,
+                        binding=binding,
+                    )
+                )
+        if not records:
+            raise RuntimeError(
+                "Opaque provider history has no durable credential binding; "
+                "use /restart-context with an explicit handoff before continuing."
+            )
+        return tuple(records)
+
+    def provider_replay_state_cipher(self) -> Any:
+        """Return the durable private key store shared with provider replay state."""
+
+        cipher = getattr(self, "_provider_replay_state_cipher", None)
+        if cipher is None:
+            from ash.providers.replay_state import ProviderReplayStateCipher
+
+            database_directory = Path(self.db_path).parent
+            cipher = ProviderReplayStateCipher(
+                database_directory / "provider-replay-state",
+                trusted_root=database_directory.parent,
+            )
+            self._provider_replay_state_cipher = cipher
+        return cipher
+
     def provider_server_compaction_state(
         self,
         session_id: str,
@@ -5913,6 +5997,7 @@ class SessionStore:
         _native_checkpoint: list[dict[str, Any]] | None = None,
         _native_checkpoint_owner: str | None = None,
         _native_checkpoint_credential_profile: str | None = None,
+        _native_checkpoint_credential_binding: dict[str, Any] | None = None,
         _expected_parent_messages: int | None = None,
         _expected_parent_revision: str | None = None,
         _expected_parent_model: str | None = None,
@@ -5967,6 +6052,14 @@ class SessionStore:
                     )
                 metadata["provider_state_credential_profile"] = (
                     _native_checkpoint_credential_profile
+                )
+            if _native_checkpoint_credential_binding is not None:
+                if not isinstance(_native_checkpoint_credential_binding, dict):
+                    raise ValueError(
+                        "native checkpoint has an invalid credential binding"
+                    )
+                metadata["provider_state_credential_binding"] = (
+                    _native_checkpoint_credential_binding
                 )
             checkpoint_metadata = json.dumps(metadata, sort_keys=True, allow_nan=False)
         if _restart_handoff is not None:
@@ -6695,6 +6788,8 @@ class SessionStore:
         checkpoint: list[dict[str, Any]],
         checkpoint_owner: str,
         checkpoint_credential_profile: str | None = None,
+        checkpoint_credential_binding: dict[str, Any] | None = None,
+        child_session_id: str | None = None,
     ) -> Session:
         """Atomically install a provider-generated opaque checkpoint in a child."""
         return self.fork_session(
@@ -6706,6 +6801,8 @@ class SessionStore:
             _native_checkpoint=checkpoint,
             _native_checkpoint_owner=checkpoint_owner,
             _native_checkpoint_credential_profile=checkpoint_credential_profile,
+            _native_checkpoint_credential_binding=checkpoint_credential_binding,
+            _child_session_id=child_session_id,
             _expected_parent_messages=expected_parent_messages,
             _expected_parent_revision=expected_parent_revision,
             _expected_parent_model=expected_parent_model,
@@ -7012,6 +7109,17 @@ class SessionStore:
             metadata = record.get("metadata", {})
             if not isinstance(metadata, dict):
                 raise ValueError("imported message metadata must be an object")
+            if role == "assistant":
+                # Transcript imports are untrusted data, not authenticated
+                # provider-continuity records. Preserve ordinary conversation
+                # metadata but never import opaque replay or compaction authority.
+                metadata = {
+                    key: value
+                    for key, value in metadata.items()
+                    if key != "provider_state"
+                    and not key.startswith("provider_state_")
+                    and not key.startswith("provider_server_compaction_")
+                }
             message = Message(
                 role=role,
                 content=message_content,

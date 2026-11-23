@@ -25,6 +25,11 @@ from ash.providers.retry import (
     ProviderFailureCategory,
     classify_provider_failure,
 )
+from ash.providers.replay_affinity import (
+    resolve_provider_replay_identity,
+    verify_provider_replay_identity,
+)
+from ash.providers.replay_state import ProviderReplayCredentialIdentity
 from ash.safety.environment import build_scrubbed_environment, resolve_host_executable
 from ash.safety.path_scope import is_relative_to
 from ash.sandbox.process_utils import (
@@ -283,6 +288,12 @@ class CredentialHelperProvider(ProviderABC):
     def count_tokens(self, text: str) -> int:
         return self._active.count_tokens(text)
 
+    async def replay_credential_identity(
+        self,
+    ) -> ProviderReplayCredentialIdentity | None:
+        provider = await self._resolve_provider()
+        return await resolve_provider_replay_identity(provider)
+
     def configure_max_tokens(self, max_tokens: int) -> None:
         super().configure_max_tokens(max_tokens)
         self._configured_max_tokens = max_tokens
@@ -343,6 +354,12 @@ class CredentialHelperProvider(ProviderABC):
             exposed_terminal = False
             saw_terminal = False
             try:
+                identity = await resolve_provider_replay_identity(provider)
+                verify_provider_replay_identity(
+                    identity,
+                    provider_family=provider.provider_family,
+                    model_name=provider.model_name,
+                )
                 async with managed_async_stream(
                     provider.stream_chat(
                         messages,

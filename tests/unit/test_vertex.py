@@ -17,9 +17,16 @@ from ash.providers.vertex import (
 
 
 class _Credentials:
-    def __init__(self, *, token: str | None = None, valid: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        token: str | None = None,
+        valid: bool = False,
+        service_account_email: str | None = None,
+    ) -> None:
         self.token = token
         self.valid = valid
+        self.service_account_email = service_account_email
         self.expiry = datetime.now(timezone.utc) - timedelta(seconds=1)
         self.refresh_count = 0
 
@@ -93,6 +100,56 @@ async def test_vertex_adc_refresh_is_serialized_and_cached() -> None:
     assert tokens == ["adc-token-1"] * 3
     assert credentials.refresh_count == 1
     assert provider.redaction_secrets() == ("adc-token-1", "adc-token-1")
+
+
+@pytest.mark.asyncio
+async def test_vertex_replay_identity_survives_access_token_rotation_for_same_service_account() -> None:
+    credentials = _Credentials(
+        token="access-before",
+        valid=True,
+        service_account_email="agent@project.iam.gserviceaccount.com",
+    )
+    credentials.expiry = datetime.now(timezone.utc) + timedelta(hours=1)
+    token_provider = GoogleAdcTokenProvider(
+        credentials=credentials,
+        request="request",
+    )
+    provider = VertexProvider(
+        "google/gemini-test",
+        project="project-123",
+        location="us-central1",
+        token_provider=token_provider,
+        client=SimpleNamespace(),
+    )
+
+    identity_before_refresh = await provider.resolve_replay_credential_identity()
+    credentials.token = "access-after-refresh"
+    identity_after_refresh = await provider.resolve_replay_credential_identity()
+
+    assert credentials.token != "access-before"
+    assert identity_before_refresh is not None
+    assert identity_before_refresh == identity_after_refresh
+    credentials.service_account_email = "replacement@project.iam.gserviceaccount.com"
+    replacement_identity = await provider.resolve_replay_credential_identity()
+    assert replacement_identity is not None
+    assert replacement_identity != identity_before_refresh
+    assert credentials.token not in repr(identity_before_refresh)
+
+
+@pytest.mark.asyncio
+async def test_vertex_user_adc_without_verified_principal_has_no_replay_identity() -> None:
+    provider = VertexProvider(
+        "google/gemini-test",
+        project="project-123",
+        location="global",
+        token_provider=GoogleAdcTokenProvider(
+            credentials=_Credentials(token="opaque-token", valid=True),
+            request="request",
+        ),
+        client=SimpleNamespace(),
+    )
+
+    assert await provider.resolve_replay_credential_identity() is None
 
 
 @pytest.mark.asyncio
@@ -193,6 +250,10 @@ async def test_vertex_seals_and_replays_gemini_thought_signature(tmp_path) -> No
         "google/gemini-3.8-flash",
         project="project-123",
         location="global",
+        token_provider=GoogleAdcTokenProvider(
+            credentials=_Credentials(token="test-token", valid=True),
+            request="request",
+        ),
         replay_state_cipher=ProviderReplayStateCipher(
             state_dir,
             trusted_root=tmp_path,
@@ -241,6 +302,10 @@ async def test_vertex_seals_and_replays_gemini_thought_signature(tmp_path) -> No
         "google/gemini-3.8-flash",
         project="project-123",
         location="global",
+        token_provider=GoogleAdcTokenProvider(
+            credentials=_Credentials(token="test-token", valid=True),
+            request="request",
+        ),
         replay_state_cipher=ProviderReplayStateCipher(
             state_dir,
             trusted_root=tmp_path,
@@ -281,6 +346,10 @@ async def test_vertex_gemini3_tool_history_fails_closed_without_signature_state(
         "google/gemini-3.8-flash",
         project="project-123",
         location="global",
+        token_provider=GoogleAdcTokenProvider(
+            credentials=_Credentials(token="test-token", valid=True),
+            request="request",
+        ),
         client=SimpleNamespace(chat=SimpleNamespace(completions=Completions())),
     )
     history = [

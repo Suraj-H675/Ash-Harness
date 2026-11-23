@@ -24,6 +24,8 @@ from ash.providers.openai_responses import (
     prepare_openai_responses_input,
     stream_openai_responses,
 )
+from ash.providers.replay_affinity import verify_provider_replay_identity
+from ash.providers.replay_state import ProviderReplayCredentialIdentity
 
 
 _RETRYABLE_CHATGPT_RESPONSE_FAILURES = frozenset(
@@ -77,6 +79,19 @@ class OpenAIChatGPTProvider(ProviderABC):
     def count_tokens(self, text: str) -> int:
         return self._token_counter.count(text)
 
+    def replay_credential_identity(self) -> ProviderReplayCredentialIdentity | None:
+        resolve_identity = getattr(
+            self._auth_session,
+            "verified_account_identity",
+            None,
+        )
+        account_identity = resolve_identity() if callable(resolve_identity) else None
+        if account_identity is None:
+            return None
+        return ProviderReplayCredentialIdentity.from_verified_subject(
+            *account_identity
+        )
+
     def configure_max_tokens(self, max_tokens: int) -> None:
         # ChatGPT-plan preview currently rejects max_output_tokens. Retain
         # validation because the Ash loop calls this provider-neutral hook.
@@ -127,7 +142,25 @@ class OpenAIChatGPTProvider(ProviderABC):
         del temperature
         if self._closed:
             raise RuntimeError("ChatGPT provider has been closed")
-        access_token = await self._auth_session.access_token()
+        resolve_token_identity = getattr(
+            self._auth_session,
+            "access_token_with_identity",
+            None,
+        )
+        if callable(resolve_token_identity):
+            access_token, issuer, subject = await resolve_token_identity()
+            identity = ProviderReplayCredentialIdentity.from_verified_subject(
+                issuer,
+                subject,
+            )
+        else:
+            access_token = await self._auth_session.access_token()
+            identity = None
+        verify_provider_replay_identity(
+            identity,
+            provider_family=self.provider_family,
+            model_name=self.model_name,
+        )
         client = self._new_client(access_token)
         request_options: dict[str, Any] = {}
         if self.configured_reasoning_effort is not None:

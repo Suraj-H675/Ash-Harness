@@ -258,6 +258,43 @@ real-provider combinations remain unverified; provider failover remains
 with 18/18 jobs green; this credential-profile follow-up must be judged against
 its own hosted run on the exact follow-up commit, not inherit the earlier pass.
 
+**Credential-material replay affinity (2026-11-22, implementation candidate):**
+The stable-profile gap is now guarded with a second, private proof. Ash derives
+a domain-separated HMAC key from the existing permission-restricted provider
+replay key, then binds each durable opaque state item to the credential identity
+that produced it, its provider/model route, logical profile, exact state, and
+session lineage. The database stores only a versioned nonce and keyed tag; raw
+credentials and unkeyed credential hashes are never stored. The tag is removed
+by structured redaction, including session exports. Forked sessions share their
+root-lineage scope so a valid branch keeps the original replay behavior.
+Transcript imports preserve ordinary messages and tool-call records, but
+strip untrusted provider replay and compaction authority. They therefore
+continue as stateless imported history rather than attempting opaque replay.
+
+First-party API-key routes compare the in-memory key material with endpoint and
+provider scope before dispatch. ChatGPT-plan credentials use the validated
+issuer and subject from Ash's auth store, so access-token refresh for the same
+account remains replayable. Vertex can use a stable service-account principal
+when Google ADC exposes one; ADC sources without a verified principal remain
+unbound. Other providers or custom adapters without a reliable identity can
+still complete stateless turns, but any newly returned opaque state from them
+will require `/restart-context` before it can be replayed. Changing a key or
+helper result behind an unchanged profile is refused before provider dispatch;
+legacy state without a binding is preserved but also requires an explicit
+restart handoff. Server-side compaction's route binding remains a separate
+mechanism.
+
+The source includes a two-process real-CLI test against a local HTTP provider
+that uses the actual fake API-key material as its provider identity and request
+authorization. It checks same-key resume and changed-key refusal, including
+preserved session state and audit integrity. The restricted Codex sandbox could not bind the test server, but the chief's
+trusted-host run on 2026-11-23 passed both positive and negative two-process
+HTTP cases. A separate, independently authored real-credential holdout also
+passed both cases against the candidate after implementing the documented
+provider identity hook. The chief independently verified imported untrusted
+metadata is stripped at import, without losing ordinary conversation content.
+No live provider request or model spend is part of this validation.
+
 **Later coding evidence (2026-11-10):** The first ChatGPT-plan coding replay
 passed the synthetic two-file fixture with GPT-6 Luna and the synthetic
 three-module `event-log` fixture with GPT-6.1 Sol. The intervening Luna

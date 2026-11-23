@@ -4,12 +4,18 @@ from __future__ import annotations
 
 import base64
 import binascii
+from dataclasses import dataclass, field
+import hashlib
+import hmac
+import json
 import os
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Literal, Mapping
 
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.hazmat.primitives.hashes import SHA256
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
 from ash.safety.private_store import PrivateStore, PrivateStoreError
 
@@ -19,6 +25,90 @@ _KEY_MAGIC = b"ash-provider-replay-v1\x00"
 _KEY_BYTES = 32
 _NONCE_BYTES = 12
 MAX_REPLAY_PLAINTEXT_BYTES = 3_000_000
+_CREDENTIAL_BINDING_DOMAIN = b"ash-provider-replay-credential-binding-v1"
+_CREDENTIAL_BINDING_SALT = b"ash-provider-replay-affinity-hkdf-v1"
+_CREDENTIAL_BINDING_NONCE_BYTES = 16
+_CREDENTIAL_BINDING_TAG_BYTES = 32
+
+
+@dataclass(frozen=True, repr=False)
+class ProviderReplayCredentialIdentity:
+    """In-memory proof material for a credential that actually made a request."""
+
+    kind: Literal["secret", "verified_subject"]
+    _value: bytes = field(repr=False)
+
+    def __post_init__(self) -> None:
+        if (
+            self.kind not in {"secret", "verified_subject"}
+            or not isinstance(self._value, bytes)
+            or not self._value
+            or len(self._value) > 65_536
+        ):
+            raise ValueError("provider credential identity is unavailable")
+
+    @classmethod
+    def from_secret(
+        cls,
+        secret: str,
+        *,
+        scope: tuple[str, ...] = (),
+    ) -> "ProviderReplayCredentialIdentity":
+        if (
+            not isinstance(secret, str)
+            or not secret
+            or not isinstance(scope, tuple)
+            or any(not isinstance(item, str) for item in scope)
+        ):
+            raise ValueError("provider credential identity is unavailable")
+        try:
+            value = _frame(
+                (
+                    secret.encode("utf-8"),
+                    *(item.encode("utf-8") for item in scope),
+                )
+            )
+        except UnicodeEncodeError as exc:
+            raise ValueError("provider credential identity is unavailable") from exc
+        except AttributeError as exc:
+            raise ValueError("provider credential identity is unavailable") from exc
+        if len(value) > 65_536:
+            raise ValueError("provider credential identity is unavailable")
+        return cls("secret", value)
+
+    @classmethod
+    def from_verified_subject(
+        cls,
+        issuer: str,
+        subject: str,
+        *,
+        scope: tuple[str, ...] = (),
+    ) -> "ProviderReplayCredentialIdentity":
+        if (
+            not isinstance(issuer, str)
+            or not issuer
+            or not isinstance(subject, str)
+            or not subject
+            or not isinstance(scope, tuple)
+            or any(not isinstance(item, str) for item in scope)
+        ):
+            raise ValueError("provider credential identity is unavailable")
+        try:
+            value = _frame(
+                (
+                    issuer.encode("utf-8"),
+                    subject.encode("utf-8"),
+                    *(item.encode("utf-8") for item in scope),
+                )
+            )
+        except UnicodeEncodeError as exc:
+            raise ValueError("provider credential identity is unavailable") from exc
+        if len(value) > 8192:
+            raise ValueError("provider credential identity is unavailable")
+        return cls("verified_subject", value)
+
+    def __repr__(self) -> str:
+        return f"ProviderReplayCredentialIdentity(kind={self.kind!r}, value=<redacted>)"
 
 
 class ProviderReplayStateError(RuntimeError):
@@ -117,6 +207,82 @@ class ProviderReplayStateCipher:
                 "provider replay state is not valid UTF-8"
             ) from exc
 
+    def bind_credential_identity(
+        self,
+        identity: ProviderReplayCredentialIdentity,
+        *,
+        session_scope_id: str,
+        owner: str,
+        profile: str | None,
+        state: Any,
+    ) -> dict[str, Any]:
+        """Create a keyed, non-secret binding for one durable opaque state value."""
+
+        nonce = os.urandom(_CREDENTIAL_BINDING_NONCE_BYTES)
+        payload = _credential_binding_payload(
+            identity,
+            session_scope_id=session_scope_id,
+            owner=owner,
+            profile=profile,
+            state=state,
+            nonce=nonce,
+        )
+        key = _derive_credential_binding_key(self._load_or_create_key())
+        tag = hmac.new(key, payload, hashlib.sha256).digest()
+        return {
+            "version": 1,
+            "kind": identity.kind,
+            "nonce": _encode(nonce),
+            "tag": _encode(tag),
+        }
+
+    def verify_credential_identity(
+        self,
+        binding: Mapping[str, Any],
+        identity: ProviderReplayCredentialIdentity,
+        *,
+        session_scope_id: str,
+        owner: str,
+        profile: str | None,
+        state: Any,
+    ) -> bool:
+        """Verify a stored binding without creating or replacing the private key."""
+
+        if not isinstance(binding, Mapping) or set(binding) != {
+            "version",
+            "kind",
+            "nonce",
+            "tag",
+        }:
+            return False
+        if (
+            type(binding.get("version")) is not int
+            or binding.get("version") != 1
+            or binding.get("kind") != identity.kind
+        ):
+            return False
+        try:
+            nonce = _decode(binding.get("nonce"), label="credential nonce")
+            tag = _decode(binding.get("tag"), label="credential tag")
+            if (
+                len(nonce) != _CREDENTIAL_BINDING_NONCE_BYTES
+                or len(tag) != _CREDENTIAL_BINDING_TAG_BYTES
+            ):
+                return False
+            payload = _credential_binding_payload(
+                identity,
+                session_scope_id=session_scope_id,
+                owner=owner,
+                profile=profile,
+                state=state,
+                nonce=nonce,
+            )
+            key = _derive_credential_binding_key(self._load_existing_key())
+        except (ProviderReplayStateError, TypeError, ValueError, UnicodeError):
+            return False
+        expected = hmac.new(key, payload, hashlib.sha256).digest()
+        return hmac.compare_digest(tag, expected)
+
     def _load_existing_key(self) -> bytes:
         if self._key is not None:
             return self._key
@@ -185,6 +351,63 @@ def _bounded_label(value: str, *, label: str) -> str:
 
 def _associated_data(provider: str, kind: str) -> bytes:
     return f"ash-provider-replay:v1:{provider}:{kind}".encode("ascii")
+
+
+def _derive_credential_binding_key(key: bytes) -> bytes:
+    return HKDF(
+        algorithm=SHA256(),
+        length=32,
+        salt=_CREDENTIAL_BINDING_SALT,
+        info=_CREDENTIAL_BINDING_DOMAIN,
+    ).derive(key)
+
+
+def _credential_binding_payload(
+    identity: ProviderReplayCredentialIdentity,
+    *,
+    session_scope_id: str,
+    owner: str,
+    profile: str | None,
+    state: Any,
+    nonce: bytes,
+) -> bytes:
+    if not isinstance(identity, ProviderReplayCredentialIdentity):
+        raise ProviderReplayStateError("provider replay credential identity is invalid")
+    try:
+        serialized_state = json.dumps(
+            state,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+        fields = (
+            _CREDENTIAL_BINDING_DOMAIN,
+            identity.kind.encode("ascii"),
+            session_scope_id.encode("utf-8"),
+            owner.encode("utf-8"),
+            b"\x00" if profile is None else b"\x01" + profile.encode("utf-8"),
+            serialized_state,
+            nonce,
+            identity._value,
+        )
+    except (AttributeError, TypeError, ValueError, UnicodeError) as exc:
+        raise ProviderReplayStateError(
+            "provider replay credential binding is invalid"
+        ) from exc
+    if (
+        not session_scope_id
+        or not owner
+        or len(serialized_state) > MAX_REPLAY_PLAINTEXT_BYTES
+    ):
+        raise ProviderReplayStateError(
+            "provider replay credential binding is invalid"
+        )
+    return _frame(fields)
+
+
+def _frame(fields: tuple[bytes, ...]) -> bytes:
+    return b"".join(len(value).to_bytes(8, "big") + value for value in fields)
 
 
 def _encode(value: bytes) -> str:

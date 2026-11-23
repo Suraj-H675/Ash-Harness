@@ -821,6 +821,9 @@ def _is_secret_field(key: object, value: Any) -> bool:
     ):
         return True
 
+    if _normalize_field_name(key) == "provider_state_credential_binding":
+        return True
+
     components = normalized.split("_")
     if any(
         component in _ADDITIONAL_SECRET_FIELD_COMPONENTS

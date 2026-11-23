@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import secrets
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any, AsyncGenerator
@@ -16,6 +17,16 @@ from ash.providers.credential_helper import (
 )
 from ash.providers.credential_pool import CredentialPoolProvider
 from ash.providers.messages import MessageInput
+from ash.providers.replay_affinity import (
+    ProviderReplayAffinityError,
+    ProviderReplayAttempt,
+    ProviderReplayBindingRecord,
+    provider_replay_attempt,
+)
+from ash.providers.replay_state import (
+    ProviderReplayCredentialIdentity,
+    ProviderReplayStateCipher,
+)
 from ash.providers.retry import (
     ProviderFailureCategory,
     classify_provider_failure,
@@ -353,6 +364,188 @@ async def test_helper_provider_force_refreshes_once_on_auth_failure(
     assert [item.max_tokens for item in created] == [123, 123]
     assert created[0].closed == 1
     assert counter.read_text(encoding="utf-8") == "2"
+
+
+@pytest.mark.asyncio
+async def test_helper_refresh_cannot_send_replay_to_changed_secret(
+    tmp_path: Path,
+) -> None:
+    secret_a = secrets.token_urlsafe(48)
+    secret_b = secrets.token_urlsafe(48)
+
+    class RotatingSource:
+        generation = 0
+
+        async def resolve(self, *, force_refresh: bool = False) -> str:
+            if self.generation == 0:
+                self.generation = 1
+                return secret_a
+            if force_refresh and self.generation == 1:
+                self.generation = 2
+                return secret_b
+            return secret_a if self.generation == 1 else secret_b
+
+    class IdentityProvider(FakeProvider):
+        def replay_credential_identity(self) -> ProviderReplayCredentialIdentity:
+            return ProviderReplayCredentialIdentity.from_secret(
+                self.credential,
+                scope=("openai", "helper-refresh-test"),
+            )
+
+    dispatched: list[str] = []
+
+    def factory(credential: str) -> ProviderABC:
+        label = "source-a" if credential == secret_a else "source-b"
+        outcome: list[BaseException | list[StreamChunk]] = (
+            [APIError("invalid credential", 401)]
+            if credential == secret_a
+            else [[StreamChunk(content="ok"), StreamChunk(is_done=True)]]
+        )
+        provider = IdentityProvider(credential, outcome)
+        original_stream_chat = provider.stream_chat
+
+        async def record_dispatch(
+            messages: Sequence[MessageInput],
+            temperature: float = 0.0,
+            tools: list[dict[str, Any]] | None = None,
+        ) -> AsyncGenerator[StreamChunk, None]:
+            dispatched.append(label)
+            async for chunk in original_stream_chat(
+                messages,
+                temperature=temperature,
+                tools=tools,
+            ):
+                yield chunk
+
+        provider.stream_chat = record_dispatch  # type: ignore[method-assign]
+        return provider
+
+    helper = CredentialHelperProvider(
+        FakeProvider("prototype", []),
+        factory,
+        RotatingSource(),  # type: ignore[arg-type]
+    )
+    profile = "HELPER_PROFILE"
+    pool = CredentialPoolProvider([helper], [profile])
+    state = [
+        {
+            "type": "reasoning",
+            "id": "rs-helper-refresh-test",
+            "summary": [],
+            "encrypted_content": "opaque-fixture",
+        }
+    ]
+    cipher = ProviderReplayStateCipher(
+        tmp_path / "provider-replay-state",
+        trusted_root=tmp_path,
+    )
+    identity_a = ProviderReplayCredentialIdentity.from_secret(
+        secret_a,
+        scope=("openai", "helper-refresh-test"),
+    )
+    binding = cipher.bind_credential_identity(
+        identity_a,
+        session_scope_id="helper-replay-session",
+        owner="openai/model-a",
+        profile=profile,
+        state=state,
+    )
+    attempt = ProviderReplayAttempt(
+        cipher=cipher,
+        session_scope_id="helper-replay-session",
+        expected_owner="openai/model-a",
+        expected_profile=profile,
+        expected_records=(
+            ProviderReplayBindingRecord(
+                owner="openai/model-a",
+                profile=profile,
+                state=state,
+                binding=binding,
+            ),
+        ),
+    )
+
+    with provider_replay_attempt(attempt):
+        with pytest.raises(ProviderReplayAffinityError, match="/restart-context"):
+            [
+                chunk
+                async for chunk in pool.stream_chat(
+                    [
+                        {
+                            "role": "assistant",
+                            "content": "",
+                            "provider_state": state,
+                        }
+                    ],
+                    replay_profile=profile,
+                )
+            ]
+
+    assert dispatched == ["source-a"]
+
+
+@pytest.mark.asyncio
+async def test_helper_refresh_still_works_for_stateless_requests() -> None:
+    secret_a = secrets.token_urlsafe(48)
+    secret_b = secrets.token_urlsafe(48)
+
+    class RotatingSource:
+        generation = 0
+
+        async def resolve(self, *, force_refresh: bool = False) -> str:
+            if self.generation == 0:
+                self.generation = 1
+                return secret_a
+            if force_refresh and self.generation == 1:
+                self.generation = 2
+                return secret_b
+            return secret_a if self.generation == 1 else secret_b
+
+    class IdentityProvider(FakeProvider):
+        def replay_credential_identity(self) -> ProviderReplayCredentialIdentity:
+            return ProviderReplayCredentialIdentity.from_secret(
+                self.credential,
+                scope=("openai", "helper-refresh-test"),
+            )
+
+    dispatched: list[str] = []
+
+    def factory(credential: str) -> ProviderABC:
+        label = "source-a" if credential == secret_a else "source-b"
+        outcome: list[BaseException | list[StreamChunk]] = (
+            [APIError("invalid credential", 401)]
+            if credential == secret_a
+            else [[StreamChunk(content="ok"), StreamChunk(is_done=True)]]
+        )
+        provider = IdentityProvider(credential, outcome)
+        original_stream_chat = provider.stream_chat
+
+        async def record_dispatch(
+            messages: Sequence[MessageInput],
+            temperature: float = 0.0,
+            tools: list[dict[str, Any]] | None = None,
+        ) -> AsyncGenerator[StreamChunk, None]:
+            dispatched.append(label)
+            async for chunk in original_stream_chat(
+                messages,
+                temperature=temperature,
+                tools=tools,
+            ):
+                yield chunk
+
+        provider.stream_chat = record_dispatch  # type: ignore[method-assign]
+        return provider
+
+    helper = CredentialHelperProvider(
+        FakeProvider("prototype", []),
+        factory,
+        RotatingSource(),  # type: ignore[arg-type]
+    )
+
+    chunks = [chunk async for chunk in helper.stream_chat([])]
+
+    assert chunks[0].content == "ok"
+    assert dispatched == ["source-a", "source-b"]
 
 
 @pytest.mark.asyncio

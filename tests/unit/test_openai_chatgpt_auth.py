@@ -138,9 +138,14 @@ async def test_chatgpt_refresh_rotates_token_without_resending_scope(
         transport=httpx.MockTransport(handler),
         follow_redirects=False,
     ) as client:
-        token = await ChatGPTAuthSession(store=store, http_client=client).access_token()
+        token, issuer, subject = await ChatGPTAuthSession(
+            store=store,
+            http_client=client,
+        ).access_token_with_identity()
 
     assert token == "access-new"
+    assert issuer == CHATGPT_ISSUER
+    assert subject == "subject-1"
     assert seen_form["grant_type"] == ["refresh_token"]
     assert seen_form["client_id"] == ["oaiapp_test-client"]
     assert seen_form["refresh_token"] == ["refresh-old"]
@@ -664,3 +669,34 @@ async def test_logout_serializes_with_refresh_lease(
     assert cleared is not None
     assert cleared.signed_in is False
     assert events == ["claim", "get", "revoke", "clear", "release"]
+
+
+@pytest.mark.asyncio
+async def test_concurrent_refresh_registration_replacement_never_misattributes_token(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = ChatGPTCredentialStore(tmp_path / "credentials")
+    original = _account(expires_at=time.time() - 1)
+    replacement = ChatGPTAccount(
+        **{
+            **original.__dict__,
+            "subject": "different-verified-subject",
+            "access_token": "different-subject-access-token",
+            "refresh_token": "different-subject-refresh-token",
+            "expires_at": time.time() + 3600,
+        }
+    )
+    store.save(original)
+
+    def competing_refresh(_client_id: str, _lease_id: str, *, now: float) -> bool:
+        del now
+        store.save(replacement)
+        return False
+
+    monkeypatch.setattr(store, "claim_refresh", competing_refresh)
+    token, issuer, subject = await ChatGPTAuthSession(
+        store=store,
+    ).access_token_with_identity()
+    assert token == replacement.access_token
+    assert issuer == replacement.issuer
+    assert subject == replacement.subject

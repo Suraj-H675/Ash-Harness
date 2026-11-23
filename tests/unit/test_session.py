@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import secrets
 import sqlite3
 import subprocess
 import sys
@@ -165,6 +166,102 @@ def test_provider_replay_identity_retains_one_consistent_logical_profile(
         "openai/gpt-test",
         "OPENAI_BACKUP",
     )
+
+
+def test_provider_replay_bindings_load_from_durable_metadata(
+    tmp_path: Path,
+) -> None:
+    from ash.providers.openai import OpenAIProvider
+
+    store = SessionStore(tmp_path / "bound-replay-identity.db")
+    session = store.create_session(str(tmp_path))
+    state = [{
+        "type": "reasoning",
+        "id": "rs-bound-session",
+        "summary": [],
+        "encrypted_content": "opaque-session-fixture",
+    }]
+    secret = secrets.token_urlsafe(48)
+    identity = OpenAIProvider(
+        model_name="gpt-test",
+        api_key=secret,
+    ).replay_credential_identity()
+    assert identity is not None
+    binding = store.provider_replay_state_cipher().bind_credential_identity(
+        identity,
+        session_scope_id=store.provider_replay_binding_scope_id(
+            session.session_id
+        ),
+        owner="openai/gpt-test",
+        profile=None,
+        state=state,
+    )
+    store.save_message(
+        session.session_id,
+        Message(
+            role="assistant",
+            content="prior",
+            timestamp=datetime.now(timezone.utc),
+            metadata={
+                "provider_state": state,
+                "provider_state_owner": "openai/gpt-test",
+                "provider_state_credential_binding": binding,
+            },
+        ),
+    )
+
+    records = SessionStore.open_existing(store.db_path).provider_replay_state_bindings(
+        session.session_id
+    )
+    assert len(records) == 1
+    assert records[0].owner == "openai/gpt-test"
+    assert records[0].profile is None
+    assert records[0].state == state
+    assert records[0].binding == binding
+    assert secret not in json.dumps(records[0].binding)
+
+    child = store.fork_session(session.session_id)
+    reopened = SessionStore.open_existing(store.db_path)
+    assert child.root_session_id == session.session_id
+    child_records = reopened.provider_replay_state_bindings(child.session_id)
+    assert child_records == records
+    child_scope_id = reopened.provider_replay_binding_scope_id(child.session_id)
+    assert reopened.provider_replay_state_cipher().verify_credential_identity(
+        binding,
+        identity,
+        session_scope_id=child_scope_id,
+        owner="openai/gpt-test",
+        profile=None,
+        state=state,
+    )
+    assert binding["tag"] not in store.export_session(session.session_id)
+
+
+def test_legacy_provider_replay_state_requires_explicit_restart(
+    tmp_path: Path,
+) -> None:
+    store = SessionStore(tmp_path / "legacy-replay-identity.db")
+    session = store.create_session(str(tmp_path))
+    store.save_message(
+        session.session_id,
+        Message(
+            role="assistant",
+            content="prior",
+            timestamp=datetime.now(timezone.utc),
+            metadata={
+                "provider_state": [{
+                    "type": "reasoning",
+                    "id": "rs-legacy-session",
+                    "summary": [],
+                    "encrypted_content": "opaque-legacy-fixture",
+                }],
+                "provider_state_owner": "openai/gpt-test",
+            },
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="verified credential binding.*/restart-context"):
+        store.provider_replay_state_bindings(session.session_id)
 
 
 @pytest.mark.parametrize(

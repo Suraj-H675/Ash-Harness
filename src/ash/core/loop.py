@@ -101,6 +101,15 @@ from ash.providers.base import (
     stream_chunk_commits_provider,
 )
 from ash.providers.failover import FailoverProvider
+from ash.providers.replay_affinity import (
+    ProviderReplayAffinityError,
+    ProviderReplayAttempt,
+    enter_provider_replay_attempt,
+    leave_provider_replay_attempt,
+    resolve_provider_replay_identity,
+    verify_provider_replay_identity,
+)
+from ash.providers.replay_state import ProviderReplayStateError
 from ash.providers.capabilities import ProviderCapabilities
 from ash.providers.identifiers import parse_model_string
 from ash.providers.messages import (
@@ -4696,12 +4705,7 @@ class AshLoop:
                 },
             )
 
-            # Persist the assistant turn.
-            replay_credential_profile, _ = (
-                _provider_credential_context(self.provider)
-                if model_completion.provider_state
-                else (None, 0)
-            )
+            # Persist the assistant turn using request-local provider provenance.
             assistant_message = Message(
                 role="assistant",
                 content=assistant_text,
@@ -4714,17 +4718,24 @@ class AshLoop:
                         else {}
                     ),
                     **(
-                        {"provider_state_owner": self.active_model_id}
-                        if model_completion.provider_state
+                        {
+                            "provider_state_owner": (
+                                model_completion._provider_state_owner
+                            )
+                        }
+                        if model_completion._provider_state_owner is not None
                         else {}
                     ),
                     **(
                         {
                             "provider_state_credential_profile": (
-                                replay_credential_profile
+                                model_completion._provider_state_credential_profile
                             )
                         }
-                        if replay_credential_profile is not None
+                        if (
+                            model_completion._provider_state_credential_profile
+                            is not None
+                        )
                         else {}
                     ),
                     **(
@@ -4740,6 +4751,10 @@ class AshLoop:
             )
             persisted_metadata = redact_value(assistant_message.metadata)
             assert isinstance(persisted_metadata, dict)
+            if model_completion._provider_state_credential_binding is not None:
+                persisted_metadata["provider_state_credential_binding"] = (
+                    model_completion._provider_state_credential_binding
+                )
             if tool_calls:
                 persisted_metadata["tool_calls"] = (
                     self._redact_tool_calls_for_persistence(tool_calls)
@@ -5706,6 +5721,11 @@ class AshLoop:
                 "Opaque provider reasoning state has no durable session identity; "
                 "use /restart-context with an explicit handoff."
             )
+        replay_scope_id = (
+            self.session_store.provider_replay_binding_scope_id(session_id)
+            if session_id is not None
+            else None
+        )
         replay_owner, replay_profile = (
             self.session_store.provider_replay_state_identity(session_id)
             if has_replay and session_id is not None
@@ -5716,6 +5736,17 @@ class AshLoop:
                 "Opaque provider reasoning state has no verified model owner; "
                 "use /restart-context with an explicit handoff."
             )
+        replay_bindings = (
+            self.session_store.provider_replay_state_bindings(session_id)
+            if has_replay and session_id is not None
+            else ()
+        )
+        replay_cipher = None
+        if replay_bindings:
+            try:
+                replay_cipher = self.session_store.provider_replay_state_cipher()
+            except ProviderReplayStateError:
+                raise ProviderReplayAffinityError from None
         if (
             replay_owner is not None
             and not isinstance(self.provider, FailoverProvider)
@@ -5781,6 +5812,7 @@ class AshLoop:
         active_request_attempt = 0
         active_provider_stream: Any | None = None
         stream_to_close: Any | None = None
+        completed_replay_attempt: ProviderReplayAttempt | None = None
         configured_model = (
             getattr(self._config, "model", None) if self._config is not None else None
         )
@@ -5847,6 +5879,16 @@ class AshLoop:
                         MODEL_FIRST_OUTPUT_NOTICE_SECONDS,
                         report_slow_first_output,
                     )
+                    replay_attempt = ProviderReplayAttempt(
+                        cipher=replay_cipher,
+                        session_scope_id=replay_scope_id,
+                        expected_owner=replay_owner,
+                        expected_profile=replay_profile,
+                        expected_records=replay_bindings,
+                    )
+                    replay_attempt_token = enter_provider_replay_attempt(
+                        replay_attempt
+                    )
                     try:
                         attempt_started = asyncio.get_running_loop().time()
                         deadline = attempt_started + request_timeout
@@ -5874,6 +5916,14 @@ class AshLoop:
                                 replay_profile=replay_profile,
                             )
                         else:
+                            identity = await resolve_provider_replay_identity(
+                                self.provider
+                            )
+                            verify_provider_replay_identity(
+                                identity,
+                                provider_family=self.provider.provider_family,
+                                model_name=self.provider.model_name,
+                            )
                             active_provider_stream = self.provider.stream_chat(
                                 canonical_messages,
                                 tools=openai_tools,
@@ -6174,6 +6224,7 @@ class AshLoop:
                             raise ProviderIncompleteStreamError(
                                 "provider stream ended before a terminal chunk"
                             )
+                        completed_replay_attempt = replay_attempt
                         break
                     except asyncio.CancelledError:
                         raise
@@ -6286,6 +6337,7 @@ class AshLoop:
                         attempt += 1
                     finally:
                         notice_handle.cancel()
+                        leave_provider_replay_attempt(replay_attempt_token)
                 stop_category = completion_stop_category(terminal_stop_reason)
                 if stop_category != CompletionStopCategory.COMPLETE:
                     detail = terminal_stop_reason or stop_category.value
@@ -6466,7 +6518,36 @@ class AshLoop:
                 "tool-free model completion attempted a tool call"
             )
 
-        return CompletionOutcome(
+        replay_state_owner = None
+        replay_state_profile = None
+        replay_state_binding = None
+        if provider_state and completed_replay_attempt is not None:
+            replay_state_owner = completed_replay_attempt.owner
+            replay_state_profile = completed_replay_attempt.selected_profile
+            if replay_state_owner is None:
+                replay_state_owner = _provider_request_identity(
+                    self.provider,
+                    configured_model,
+                )[1]
+            if (
+                completed_replay_attempt.cipher is None
+                and completed_replay_attempt.identity is not None
+                and session_id is not None
+            ):
+                try:
+                    completed_replay_attempt.cipher = (
+                        self.session_store.provider_replay_state_cipher()
+                    )
+                except ProviderReplayStateError:
+                    pass
+            try:
+                replay_state_binding = completed_replay_attempt.output_binding(
+                    provider_state
+                )
+            except ProviderReplayStateError:
+                replay_state_binding = None
+
+        completion = CompletionOutcome(
             text="".join(text_chunks),
             tool_calls=[CanonicalToolCall.model_validate(call) for call in tool_calls],
             prompt_tokens=prompt_tokens,
@@ -6479,6 +6560,10 @@ class AshLoop:
             provider_state=provider_state,
             provider_context_policy=server_compaction_policy,
         )
+        completion._provider_state_owner = replay_state_owner
+        completion._provider_state_credential_profile = replay_state_profile
+        completion._provider_state_credential_binding = replay_state_binding
+        return completion
 
     def _handle_event(
         self,
@@ -8593,6 +8678,33 @@ class AshLoop:
                 "The resident session differs from durable history; "
                 "reload before native compaction"
             )
+        has_replay = any(
+            message.role == "assistant" and message.metadata.get("provider_state")
+            for message in durable
+        )
+        replay_owner, replay_profile = (
+            self.session_store.provider_replay_state_identity(source.session_id)
+            if has_replay
+            else (None, None)
+        )
+        if has_replay and replay_owner != self.active_model_id:
+            raise ProviderReplayAffinityError
+        if replay_profile is not None:
+            raise RuntimeError(
+                "Native compaction cannot select the credential profile that owns "
+                "opaque history; use /restart-context with an explicit handoff."
+            )
+        replay_bindings = (
+            self.session_store.provider_replay_state_bindings(source.session_id)
+            if has_replay
+            else ()
+        )
+        replay_cipher = None
+        if replay_bindings:
+            try:
+                replay_cipher = self.session_store.provider_replay_state_cipher()
+            except ProviderReplayStateError:
+                raise ProviderReplayAffinityError from None
         history_revision = self.session_store.session_history_revision(
             source.session_id
         )
@@ -8618,7 +8730,46 @@ class AshLoop:
                     raise RuntimeError("Cannot compact an unmatched tool result")
                 message["tool_call_id"] = call_id
             history.append(message)
-        checkpoint = await compact_history(history)
+        child_session_id = str(uuid4())
+        replay_attempt = ProviderReplayAttempt(
+            cipher=replay_cipher,
+            session_scope_id=(
+                self.session_store.provider_replay_binding_scope_id(
+                    source.session_id
+                )
+            ),
+            expected_owner=replay_owner,
+            expected_profile=replay_profile,
+            expected_records=replay_bindings,
+        )
+        replay_attempt_token = enter_provider_replay_attempt(replay_attempt)
+        try:
+            identity = await resolve_provider_replay_identity(self.provider)
+            verify_provider_replay_identity(
+                identity,
+                provider_family=self.provider.provider_family,
+                model_name=self.provider.model_name,
+            )
+            checkpoint = await compact_history(history)
+        finally:
+            leave_provider_replay_attempt(replay_attempt_token)
+        if replay_attempt.identity is None or replay_attempt.owner is None:
+            raise ProviderReplayAffinityError
+        if replay_attempt.cipher is None:
+            try:
+                replay_attempt.cipher = self.session_store.provider_replay_state_cipher()
+            except ProviderReplayStateError:
+                raise ProviderReplayAffinityError from None
+        try:
+            checkpoint_binding = replay_attempt.cipher.bind_credential_identity(
+                replay_attempt.identity,
+                session_scope_id=replay_attempt.session_scope_id or "",
+                owner=replay_attempt.owner,
+                profile=replay_attempt.selected_profile,
+                state=checkpoint,
+            )
+        except ProviderReplayStateError:
+            raise ProviderReplayAffinityError from None
         return self.session_store.install_native_context_checkpoint(
             source.session_id,
             expected_project_path=self.project_root,
@@ -8627,10 +8778,10 @@ class AshLoop:
             expected_parent_model=source.model,
             expected_parent_permission_mode=source.permission_mode,
             checkpoint=checkpoint,
-            checkpoint_owner=self.active_model_id,
-            checkpoint_credential_profile=(
-                _provider_credential_context(self.provider)[0]
-            ),
+            checkpoint_owner=replay_attempt.owner,
+            checkpoint_credential_profile=replay_attempt.selected_profile,
+            checkpoint_credential_binding=checkpoint_binding,
+            child_session_id=child_session_id,
         )
 
     # --- provider switching -------------------------------------------------

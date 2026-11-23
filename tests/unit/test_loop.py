@@ -3063,6 +3063,14 @@ async def test_provider_replay_state_persists_and_returns_to_next_request(tmp_pa
         def count_tokens(self, text):
             return len(str(text).split())
 
+        def replay_credential_identity(self):
+            from ash.providers.replay_state import ProviderReplayCredentialIdentity
+
+            return ProviderReplayCredentialIdentity.from_secret(
+                "fixture-replay-state-key",
+                scope=("replay-state-test",),
+            )
+
         async def stream_chat(self, messages, temperature=0.0, tools=None):
             del temperature, tools
             self.calls += 1
@@ -3186,6 +3194,7 @@ async def test_native_compaction_installs_replayable_child_and_preserves_source(
     assert child.messages[0].role == "assistant"
     assert "OPAQUE_REPLAY_CHECKPOINT" in repr(child.messages[0].metadata)
     assert child.messages[0].metadata["provider_state_owner"] == loop.active_model_id
+    assert len(store.provider_replay_state_bindings(child.session_id)) == 1
     assert store.load_session(source.session_id).messages == original
     assert store.verify_audit_log(source.session_id) == []
     assert store.verify_audit_log(child.session_id) == []
@@ -10073,6 +10082,13 @@ async def test_opaque_backup_replay_resumes_on_actual_owner_not_primary(
 
         def count_tokens(self, text):
             return max(1, len(text) // 4)
+
+        def replay_credential_identity(self):
+            from ash.providers.replay_state import ProviderReplayCredentialIdentity
+
+            return ProviderReplayCredentialIdentity.from_secret(
+                f"fixture-{self.provider_family}-{self._model_name}"
+            )
 
         async def stream_chat(self, messages, temperature=0.0, tools=None):
             self.calls += 1

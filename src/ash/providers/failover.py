@@ -21,6 +21,10 @@ from ash.providers.base import (
 )
 from ash.providers.capabilities import ProviderCapabilities
 from ash.providers.messages import MessageInput, normalize_messages
+from ash.providers.replay_affinity import (
+    resolve_provider_replay_identity,
+    verify_provider_replay_identity,
+)
 from ash.providers.reasoning import ReasoningEffortSpec
 
 
@@ -210,6 +214,12 @@ class FailoverProvider(ProviderABC):
                         replay_profile=replay_profile,
                     )
                 else:
+                    identity = await resolve_provider_replay_identity(provider)
+                    verify_provider_replay_identity(
+                        identity,
+                        provider_family=provider.provider_family,
+                        model_name=provider.model_name,
+                    )
                     child_stream = provider.stream_chat(
                         messages, temperature=temperature, tools=tools
                     )

@@ -1447,7 +1447,23 @@ class ChatGPTAuthSession:
         self.http_client = http_client
         self._lock = asyncio.Lock()
 
+    def verified_account_identity(self) -> tuple[str, str] | None:
+        """Return the validated issuer and subject for the selected account."""
+
+        account = self.store.active()
+        if account is None or not account.signed_in:
+            return None
+        if account.issuer != CHATGPT_ISSUER or not account.subject:
+            return None
+        return account.issuer, account.subject
+
     async def access_token(self) -> str:
+        token, _, _ = await self.access_token_with_identity()
+        return token
+
+    async def access_token_with_identity(self) -> tuple[str, str, str]:
+        """Return one usable token and its verified account snapshot together."""
+
         async with self._lock:
             account = self.store.active()
             if account is None or not account.signed_in:
@@ -1460,12 +1476,34 @@ class ChatGPTAuthSession:
                     "reauthorize it or use an OpenAI API key."
                 )
             if account.access_usable():
-                return account.access_token
-            if not account.refresh_token:
+                access_token = account.access_token
+            elif not account.refresh_token:
                 raise ChatGPTLoginRequired(
                     "ChatGPT credentials expired; sign in again."
                 )
-            return await self._refresh(account)
+            else:
+                # _refresh may return a token produced by a different process.
+                # Re-read the active registration and bind its principal to that
+                # exact token; never attribute another account's token to the
+                # stale pre-refresh account snapshot.
+                access_token = await self._refresh(account)
+                effective_account = self.store.active()
+                if (
+                    effective_account is None
+                    or effective_account.client_id != account.client_id
+                    or not effective_account.signed_in
+                    or not secrets.compare_digest(
+                        effective_account.access_token, access_token
+                    )
+                ):
+                    raise ChatGPTAuthError(
+                        "ChatGPT credentials changed during refresh; "
+                        "select the intended account and retry."
+                    )
+                account = effective_account
+            if account.issuer != CHATGPT_ISSUER or not account.subject:
+                raise ChatGPTAuthError("ChatGPT account identity is unavailable")
+            return access_token, account.issuer, account.subject
 
     async def _refresh(self, account: ChatGPTAccount) -> str:
         now = time.time()

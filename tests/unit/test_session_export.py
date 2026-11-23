@@ -445,3 +445,39 @@ def test_session_jsonl_import_accepts_valid_tool_call_round_trip(tmp_path) -> No
     assert len(imported.messages) == 2
     assert imported.messages[0].metadata["tool_calls"][0]["call_id"] == "call-1"
     assert imported.messages[1].metadata["call_id"] == "call-1"
+
+
+def test_imported_transcript_cannot_promote_provider_replay_authority(tmp_path) -> None:
+    store = SessionStore(tmp_path / "sessions.db")
+    metadata = {
+        "provider_state": [
+            {"type": "reasoning", "id": "fake", "summary": [],
+             "encrypted_content": "SIMULATED_EXTERNAL_STATE"}
+        ],
+        "provider_state_owner": "openai/gpt-example",
+        "provider_state_credential_profile": "FICTITIOUS_PROFILE",
+        "provider_state_credential_binding": {
+            "version": 1, "kind": "secret", "nonce": "forged", "tag": "forged"
+        },
+        "provider_server_compaction_policy": {"enabled": True},
+        "imported_annotation": "preserve this ordinary metadata",
+    }
+    jsonl = "\n".join(
+        json.dumps(item) for item in (
+            {"schema_version": 1, "type": "session", "title": "External",
+             "model": "openai/gpt-example"},
+            {"schema_version": 1, "type": "message", "role": "assistant",
+             "content": "External answer", "timestamp": "2026-01-01T00:00:00+00:00",
+             "metadata": metadata},
+        )
+    ) + "\n"
+    imported = store.import_session_jsonl(
+        jsonl, project_path=str(tmp_path / "imported"),
+        session_model="openai/gpt-example",
+    )
+    assert len(imported.messages) == 1
+    assert imported.messages[0].metadata == {
+        "imported_annotation": "preserve this ordinary metadata",
+    }
+    assert store.provider_replay_state_identity(imported.session_id) == (None, None)
+    assert store.verify_audit_log(imported.session_id) == []

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import secrets
 import subprocess
 import sys
 import textwrap
@@ -12,15 +13,31 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from ash.core.session import SessionStore
 
 
-def test_backup_replay_resumes_on_exact_model_and_credential_profile_process(
+@pytest.mark.parametrize(
+    "rotate_owner_secret",
+    [False, True],
+    ids=["same-secret-resumes", "changed-secret-refuses-before-http"],
+)
+def test_backup_replay_credential_material_is_pinned_across_processes(
     tmp_path: Path,
+    rotate_owner_secret: bool,
 ) -> None:
     requests: list[dict[str, Any]] = []
     phase = {"value": 1}
     lock = threading.Lock()
+    primary_key = secrets.token_urlsafe(32)
+    owner_key_a = secrets.token_urlsafe(32)
+    owner_key_b = secrets.token_urlsafe(32)
+    credential_labels = {
+        primary_key: "primary-key",
+        owner_key_a: "owner-key-a",
+        owner_key_b: "owner-key-b",
+    }
 
     class Provider(BaseHTTPRequestHandler):
         def log_message(self, *_args: object) -> None:
@@ -35,6 +52,9 @@ def test_backup_replay_resumes_on_exact_model_and_credential_profile_process(
             request = {
                 "model": payload["model"],
                 "profile": self.headers.get("X-Test-Credential-Profile"),
+                "credential": self._credential_label(
+                    self.headers.get("Authorization")
+                ),
                 "messages": payload["messages"],
                 "phase": phase["value"],
             }
@@ -84,6 +104,12 @@ def test_backup_replay_resumes_on_exact_model_and_credential_profile_process(
             self.end_headers()
             self.wfile.write(encoded)
 
+        @staticmethod
+        def _credential_label(authorization: str | None) -> str | None:
+            if not authorization or not authorization.startswith("Bearer "):
+                return None
+            return credential_labels.get(authorization[len("Bearer ") :])
+
     workspace = tmp_path / "workspace"
     home = tmp_path / "home"
     workspace.mkdir()
@@ -103,6 +129,8 @@ def test_backup_replay_resumes_on_exact_model_and_credential_profile_process(
             from ash.providers.capabilities import ProviderCapabilities
             from ash.providers.credential_pool import CredentialPoolProvider
             from ash.providers.registry import get_provider_registry
+            from ash.providers.replay_affinity import verify_provider_replay_identity
+            from ash.providers.replay_state import ProviderReplayCredentialIdentity
             from ash.providers.retry import ProviderHTTPError
 
             class ReplayProvider(ProviderABC):
@@ -111,9 +139,10 @@ def test_backup_replay_resumes_on_exact_model_and_credential_profile_process(
                     native_tools=True, reasoning=True, context_window=32768
                 )
 
-                def __init__(self, model_name, profile=None):
+                def __init__(self, model_name, profile=None, api_key=None):
                     self._model_name = model_name
                     self.profile = profile
+                    self._api_key = api_key
 
                 @property
                 def model_name(self):
@@ -122,6 +151,14 @@ def test_backup_replay_resumes_on_exact_model_and_credential_profile_process(
                 @property
                 def capabilities(self):
                     return self._ash_declared_capabilities
+
+                def replay_credential_identity(self):
+                    if not self._api_key:
+                        return None
+                    return ProviderReplayCredentialIdentity.from_secret(
+                        self._api_key,
+                        scope=("replaytest", os.environ["ASH_REPLAY_TEST_URL"]),
+                    )
 
                 def count_tokens(self, text):
                     return max(1, len(str(text)) // 4)
@@ -132,11 +169,18 @@ def test_backup_replay_resumes_on_exact_model_and_credential_profile_process(
 
                 async def stream_chat(self, messages, temperature=0.0, tools=None):
                     del temperature, tools
+                    verify_provider_replay_identity(
+                        self.replay_credential_identity(),
+                        provider_family=self.provider_family,
+                        model_name=self.model_name,
+                    )
                     payload = json.dumps({
                         "model": self.model_name,
                         "messages": list(messages),
                     }).encode("utf-8")
                     headers = {"Content-Type": "application/json"}
+                    if self._api_key is not None:
+                        headers["Authorization"] = f"Bearer {self._api_key}"
                     if self.profile is not None:
                         headers["X-Test-Credential-Profile"] = self.profile
                     request = urllib.request.Request(
@@ -168,8 +212,16 @@ def test_backup_replay_resumes_on_exact_model_and_credential_profile_process(
                 if model_name == "backup":
                     return CredentialPoolProvider(
                         [
-                            ReplayProvider("backup", "REPLAYTEST_PRIMARY"),
-                            ReplayProvider("backup", "REPLAYTEST_OWNER"),
+                            ReplayProvider(
+                                "backup",
+                                "REPLAYTEST_PRIMARY",
+                                os.environ["ASH_REPLAYTEST_PRIMARY_KEY"],
+                            ),
+                            ReplayProvider(
+                                "backup",
+                                "REPLAYTEST_OWNER",
+                                os.environ["ASH_REPLAYTEST_OWNER_KEY"],
+                            ),
                         ],
                         ["REPLAYTEST_PRIMARY", "REPLAYTEST_OWNER"],
                     )
@@ -221,6 +273,8 @@ def test_backup_replay_resumes_on_exact_model_and_credential_profile_process(
             }
         ),
         "ASH_REPLAY_TEST_URL": f"http://127.0.0.1:{server.server_port}/complete",
+        "ASH_REPLAYTEST_PRIMARY_KEY": primary_key,
+        "ASH_REPLAYTEST_OWNER_KEY": owner_key_a,
         "NO_PROXY": "127.0.0.1,localhost",
         "no_proxy": "127.0.0.1,localhost",
     }
@@ -269,25 +323,61 @@ def test_backup_replay_resumes_on_exact_model_and_credential_profile_process(
         )
 
         assert [
-            (item["model"], item["profile"], item["phase"]) for item in requests
+            (
+                item["model"],
+                item["profile"],
+                item["credential"],
+                item["phase"],
+            )
+            for item in requests
         ] == [
-            ("primary", None, 1),
-            ("backup", "REPLAYTEST_PRIMARY", 1),
-            ("backup", "REPLAYTEST_OWNER", 1),
+            ("primary", None, None, 1),
+            ("backup", "REPLAYTEST_PRIMARY", "primary-key", 1),
+            ("backup", "REPLAYTEST_OWNER", "owner-key-a", 1),
         ]
 
         phase["value"] = 2
+        if rotate_owner_secret:
+            audit_before = [
+                (item.log_id, item.previous_hash, item.sha256_hash)
+                for item in store.iter_audit_logs(session_id)
+            ]
+            assert store.verify_audit_log(session_id) == []
+            environment["ASH_REPLAYTEST_OWNER_KEY"] = owner_key_b
+            refused = cli("--continue", "-p", "Continue the existing reasoning")
+            assert refused.returncode != 0, (refused.stdout, refused.stderr)
+            assert "/restart-context" in refused.stdout + refused.stderr
+            assert len(requests) == 3
+            preserved = SessionStore(database / "sessions.db").load_session(session_id)
+            assert any(
+                message.metadata.get("provider_state")
+                for message in preserved.messages
+            )
+            assert len(
+                SessionStore(database / "sessions.db").provider_replay_state_bindings(
+                    session_id
+                )
+            ) == 1
+            after_failure = SessionStore(database / "sessions.db")
+            assert [
+                (item.log_id, item.previous_hash, item.sha256_hash)
+                for item in after_failure.iter_audit_logs(session_id)
+            ] == audit_before
+            assert after_failure.verify_audit_log(session_id) == []
+            return
+
         resumed = cli("--continue", "-p", "Continue the existing reasoning")
         assert resumed.returncode == 0, (resumed.stdout, resumed.stderr)
         resumed_result = json.loads(resumed.stdout)
         assert resumed_result["session_id"] == session_id
         assert resumed_result["response"] == "BACKUP-RESUMED"
         assert len(requests) == 4
-        assert (requests[3]["model"], requests[3]["profile"], requests[3]["phase"]) == (
-            "backup",
-            "REPLAYTEST_OWNER",
-            2,
-        )
+        assert (
+            requests[3]["model"],
+            requests[3]["profile"],
+            requests[3]["credential"],
+            requests[3]["phase"],
+        ) == ("backup", "REPLAYTEST_OWNER", "owner-key-a", 2)
         replayed = [
             item.get("provider_state")
             for item in requests[3]["messages"]
@@ -298,6 +388,7 @@ def test_backup_replay_resumes_on_exact_model_and_credential_profile_process(
         assert all(
             "provider_state_owner" not in item
             and "provider_state_credential_profile" not in item
+            and "provider_state_credential_binding" not in item
             for item in requests[3]["messages"]
         )
     finally:
