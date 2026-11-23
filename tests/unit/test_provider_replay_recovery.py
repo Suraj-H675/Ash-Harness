@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from typing import Any
 
@@ -9,7 +10,7 @@ import pytest
 
 from ash.config import AshConfig
 from ash.core.loop import AshLoop
-from ash.core.session import SessionStore
+from ash.core.session import SessionStore, SessionStorageError
 from ash.exceptions import ErrorCategory, classify_exception
 from ash.hooks.registry import HookRegistry, LifecycleHook
 from ash.providers.base import ProviderABC, StreamChunk
@@ -487,5 +488,127 @@ async def test_binding_failure_keeps_completed_effect_and_blocks_replay(
             for entry in store.iter_audit_logs(session.session_id)
         ] == parent_audit
         assert store.verify_audit_log(session.session_id) == []
+    finally:
+        await loop.aclose()
+
+
+@pytest.mark.asyncio
+async def test_post_model_cancellation_preserves_unbound_evidence(
+    tmp_path: Path,
+) -> None:
+    """External cancellation of a slow observer must not lose streamed output."""
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def slow_post_model(_payload: dict[str, Any]) -> None:
+        entered.set()
+        await release.wait()
+
+    hooks = HookRegistry()
+    hooks.register_lifecycle(LifecycleHook("post_model", slow_post_model))
+    database = tmp_path / "db" / "sessions.db"
+    store = SessionStore(database)
+    (database.parent / "provider-replay-state").write_text("not a directory")
+    provider = OpaqueStateProvider()
+    ui = CapturingUI()
+    loop = AshLoop(
+        store, provider, SafetyGuard(tmp_path), ui, tmp_path,
+        hooks=hooks,
+        config=AshConfig(
+            model="replaytest/unbound-test", workspace_root=tmp_path,
+            db_directory=database.parent, memory_backend="off",
+            provider_max_attempts=1,
+        ),
+    )
+    try:
+        session = await loop.start_session()
+        running = asyncio.create_task(loop.run_turn("Return an opaque response"))
+        await asyncio.wait_for(entered.wait(), timeout=5)
+        running.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(running, timeout=5)
+        stored = store.load_session(session.session_id)
+        assistant = [
+            message for message in stored.messages
+            if message.role == "assistant" and message.content == "VISIBLE_SUCCESS"
+        ]
+        assert len(assistant) == 1
+        assert assistant[0].metadata.get("provider_state")
+        assert not assistant[0].metadata.get("provider_state_credential_binding")
+        assert store.verify_audit_log(session.session_id) == []
+        assert not any(event.get("type") == "turn.completed" for event in ui.events)
+    finally:
+        release.set()
+        await loop.aclose()
+
+
+@pytest.mark.asyncio
+async def test_secondary_tool_record_failure_does_not_hide_primary_binding_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Partial ledger persistence retains the primary error and secondary cause."""
+    class TwoProposals(OpaqueStateProvider):
+        async def stream_chat(
+            self, messages: list[dict[str, Any]],
+            temperature: float = 0.0,
+            tools: list[dict[str, Any]] | None = None,
+        ):
+            del messages, temperature, tools
+            self.calls += 1
+            yield StreamChunk(
+                content="VISIBLE_SUCCESS",
+                native_tool_calls=[
+                    {"id": "proposal-1", "name": "fictional_tool", "arguments": {}},
+                    {"id": "proposal-2", "name": "fictional_tool", "arguments": {}},
+                ],
+                provider_state=[{
+                    "type": "reasoning", "id": "fake", "summary": [],
+                    "encrypted_content": "fictional-opaque-reasoning",
+                }],
+                is_done=True, stop_reason="tool_calls",
+            )
+
+    database = tmp_path / "db" / "sessions.db"
+    store = SessionStore(database)
+    (database.parent / "provider-replay-state").write_text("not a directory")
+    provider = TwoProposals()
+    ui = CapturingUI()
+    loop = AshLoop(
+        store, provider, SafetyGuard(tmp_path), ui, tmp_path,
+        config=AshConfig(
+            model="replaytest/unbound-test", workspace_root=tmp_path,
+            db_directory=database.parent, memory_backend="off",
+            provider_max_attempts=1,
+        ),
+    )
+    original = store.finalize_tool_call_with_message
+    attempted: list[str] = []
+
+    def fail_second(*args: Any, **kwargs: Any) -> bool:
+        attempted.append(args[1].call_id)
+        if len(attempted) == 2:
+            raise SessionStorageError("fictional disk-full on second record")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(store, "finalize_tool_call_with_message", fail_second)
+    try:
+        session = await loop.start_session()
+        with pytest.raises(
+            ProviderReplayAffinityError, match="ledger may be incomplete"
+        ) as failure:
+            await loop.run_turn("Propose two effects without dispatch")
+        assert isinstance(failure.value.__cause__, SessionStorageError)
+        assert attempted == ["proposal-1", "proposal-2"]
+        assert provider.calls == 1
+        persisted = store.load_session(session.session_id)
+        assert len(persisted.tool_calls) == 1
+        assert not persisted.tool_calls[0].dispatched
+        assert not persisted.tool_calls[0].executed
+        assert store.verify_audit_log(session.session_id) == []
+        event = next(item for item in ui.events if item.get("type") == "turn.error")
+        assert event.get("stop_reason") == "provider_replay_binding"
+        assert "ledger may be incomplete" in event.get("error", "")
+        assert not any(item.get("type") == "turn.completed" for item in ui.events)
     finally:
         await loop.aclose()

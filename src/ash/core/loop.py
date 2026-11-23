@@ -4696,6 +4696,82 @@ class AshLoop:
             replay_binding_error = (
                 model_completion._provider_state_credential_binding_error
             )
+            completed_turn_id = self.turn_context.turn_id
+
+            def persist_assistant_evidence() -> None:
+                """Durably save the streamed answer before cancellable failure hooks."""
+                # Persist the assistant turn using request-local provider provenance.
+                assistant_message = Message(
+                    role="assistant",
+                    content=assistant_text,
+                    timestamp=_utc_now(),
+                    metadata={
+                        **({"tool_calls": tool_calls} if tool_calls else {}),
+                        **(
+                            {"provider_state": model_completion.provider_state}
+                            if model_completion.provider_state
+                            else {}
+                        ),
+                        **(
+                            {
+                                "provider_state_owner": (
+                                    model_completion._provider_state_owner
+                                )
+                            }
+                            if model_completion._provider_state_owner is not None
+                            else {}
+                        ),
+                        **(
+                            {
+                                "provider_state_credential_profile": (
+                                    model_completion._provider_state_credential_profile
+                                )
+                            }
+                            if (
+                                model_completion._provider_state_credential_profile
+                                is not None
+                            )
+                            else {}
+                        ),
+                        **(
+                            {
+                                "provider_server_compaction_policy": (
+                                    model_completion.provider_context_policy
+                                )
+                            }
+                            if model_completion.provider_context_policy is not None
+                            else {}
+                        ),
+                    },
+                )
+                persisted_metadata = redact_value(assistant_message.metadata)
+                assert isinstance(persisted_metadata, dict)
+                if model_completion._provider_state_credential_binding is not None:
+                    persisted_metadata["provider_state_credential_binding"] = (
+                        model_completion._provider_state_credential_binding
+                    )
+                if tool_calls:
+                    persisted_metadata["tool_calls"] = (
+                        self._redact_tool_calls_for_persistence(tool_calls)
+                    )
+                self.session_store.save_message(
+                    session.session_id,
+                    assistant_message.model_copy(
+                        update={
+                            "content": redact_text(assistant_message.content),
+                            "metadata": persisted_metadata,
+                        }
+                    ),
+                    turn_id=completed_turn_id,
+                )
+                session.messages.append(assistant_message)
+
+            if replay_binding_error is not None:
+                # The provider finished, but this turn cannot be resumable.
+                # Preserve answer evidence synchronously before an observer can
+                # be suspended or externally cancelled.
+                persist_assistant_evidence()
+
             await self._fire_hook_lifecycle(
                 "post_model",
                 {
@@ -4718,83 +4794,29 @@ class AshLoop:
                 },
             )
 
-            # Persist the assistant turn using request-local provider provenance.
-            assistant_message = Message(
-                role="assistant",
-                content=assistant_text,
-                timestamp=_utc_now(),
-                metadata={
-                    **({"tool_calls": tool_calls} if tool_calls else {}),
-                    **(
-                        {"provider_state": model_completion.provider_state}
-                        if model_completion.provider_state
-                        else {}
-                    ),
-                    **(
-                        {
-                            "provider_state_owner": (
-                                model_completion._provider_state_owner
-                            )
-                        }
-                        if model_completion._provider_state_owner is not None
-                        else {}
-                    ),
-                    **(
-                        {
-                            "provider_state_credential_profile": (
-                                model_completion._provider_state_credential_profile
-                            )
-                        }
-                        if (
-                            model_completion._provider_state_credential_profile
-                            is not None
-                        )
-                        else {}
-                    ),
-                    **(
-                        {
-                            "provider_server_compaction_policy": (
-                                model_completion.provider_context_policy
-                            )
-                        }
-                        if model_completion.provider_context_policy is not None
-                        else {}
-                    ),
-                },
-            )
-            persisted_metadata = redact_value(assistant_message.metadata)
-            assert isinstance(persisted_metadata, dict)
-            if model_completion._provider_state_credential_binding is not None:
-                persisted_metadata["provider_state_credential_binding"] = (
-                    model_completion._provider_state_credential_binding
-                )
-            if tool_calls:
-                persisted_metadata["tool_calls"] = (
-                    self._redact_tool_calls_for_persistence(tool_calls)
-                )
-            self.session_store.save_message(
-                session.session_id,
-                assistant_message.model_copy(
-                    update={
-                        "content": redact_text(assistant_message.content),
-                        "metadata": persisted_metadata,
-                    }
-                ),
-                turn_id=self.turn_context.turn_id,
-            )
-            session.messages.append(assistant_message)
+            if replay_binding_error is None:
+                # Keep normal successful-turn lifecycle ordering unchanged.
+                persist_assistant_evidence()
 
             if replay_binding_error is not None:
                 if tool_calls:
-                    self._persist_unexecuted_tool_calls(
-                        session=session,
-                        calls=tool_calls,
-                        reason=(
-                            "Tool call was not approved or dispatched because "
-                            "the provider's opaque reasoning state could not be "
-                            "bound to its credential."
-                        ),
-                    )
+                    try:
+                        self._persist_unexecuted_tool_calls(
+                            session=session,
+                            calls=tool_calls,
+                            reason=(
+                                "Tool call was not approved or dispatched because "
+                                "the provider's opaque reasoning state could not be "
+                                "bound to its credential."
+                            ),
+                        )
+                    except Exception as ledger_exc:
+                        # Keep the primary credential-affinity refusal visible;
+                        # chain the secondary storage failure for diagnosis.
+                        # Missing terminal records are not proof of dispatch.
+                        raise ProviderReplayAffinityError(
+                            incomplete_tool_ledger=True
+                        ) from ledger_exc
                 raise replay_binding_error
 
             used_tokens = total_prompt_tokens + total_completion_tokens

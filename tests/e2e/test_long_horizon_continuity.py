@@ -20,6 +20,7 @@ from ash.core.loop import AshLoop
 from ash.core.session import SessionStore, ToolCallRecord
 from ash.providers.base import ProviderABC, StreamChunk
 from ash.providers.capabilities import ProviderCapabilities
+from ash.providers.replay_state import ProviderReplayCredentialIdentity
 from ash.safety.guard import SafetyGuard
 from ash.tools.command import RunCommandTool
 from ash.tools.filesystem import ReadFileTool, ReplaceFileContentTool
@@ -174,7 +175,19 @@ async def test_cli_context_restart_continues_verified_multi_file_work(
             ],
         )
 
-    original_provider = ScriptedProvider([read_pair, initial_check, first_edit])
+    class ReplayIdentifiedScriptedProvider(ScriptedProvider):
+        # Only this source path returns opaque reasoning state. Its fictional
+        # credential must have a stable, verifiable replay identity.
+        provider_family = "custom"
+
+        def replay_credential_identity(self) -> ProviderReplayCredentialIdentity:
+            return ProviderReplayCredentialIdentity.from_secret(
+                "synthetic-long-horizon-key", scope=("custom", "scripted", "offline")
+            )
+
+    original_provider = ReplayIdentifiedScriptedProvider(
+        [read_pair, initial_check, first_edit]
+    )
     stream = io.StringIO()
     first = coding_loop(config, store, original_provider, stream)
     try:

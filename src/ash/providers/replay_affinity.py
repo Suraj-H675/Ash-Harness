@@ -29,8 +29,15 @@ class ProviderReplayAffinityError(RuntimeError):
 
     retriable = False
 
-    def __init__(self) -> None:
-        super().__init__(_RESTART_GUIDANCE)
+    def __init__(self, *, incomplete_tool_ledger: bool = False) -> None:
+        guidance = _RESTART_GUIDANCE
+        if incomplete_tool_ledger:
+            guidance += (
+                " Some proposed tool-call records could not be persisted; "
+                "the ledger may be incomplete. Inspect session recovery "
+                "and independently resolve unknown outcomes before restarting."
+            )
+        super().__init__(guidance)
 
 
 @dataclass(frozen=True)
