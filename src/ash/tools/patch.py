@@ -87,7 +87,7 @@ class ApplyPatchTool(BaseTool):
             else:
                 paths = extract_patch_paths(args.patch, self.safety_guard)
         except (ValueError, SafetyViolation) as exc:
-            return ToolResult(success=False, output="", error=f"Invalid patch: {exc}")
+            return ToolResult(success=False, output="", error=f"Invalid patch: {exc}; no files changed by this patch.")
 
         def materialize() -> str:
             if operations is None:
@@ -108,7 +108,7 @@ class ApplyPatchTool(BaseTool):
                     check=True,
                 )
             except (ValueError, SafetyViolation, ScopedIOError, OSError) as exc:
-                return ToolResult(success=False, output="", error=f"Invalid patch: {exc}")
+                return ToolResult(success=False, output="", error=f"Invalid patch: {exc}; no files changed by this patch.")
             except asyncio.TimeoutError as exc:
                 return _patch_timeout_result(exc, mutation_may_have_started=False)
             if check[0] != 0:
@@ -128,7 +128,7 @@ class ApplyPatchTool(BaseTool):
                     patch_to_apply = materialize()
                 except (ValueError, SafetyViolation, ScopedIOError, OSError) as exc:
                     return ToolResult(
-                        success=False, output="", error=f"Invalid patch: {exc}"
+                        success=False, output="", error=f"Invalid patch: {exc}; no files changed by this patch."
                     )
                 check = await _git_apply(
                     self.safety_guard.project_root,

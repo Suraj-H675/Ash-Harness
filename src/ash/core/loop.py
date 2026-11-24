@@ -1558,6 +1558,9 @@ class AshLoop:
             set_activation_budget(
                 self._search_activation_fits,
                 compact_result=self._compact_search_result,
+                schemas_in_declarations=lambda: _provider_capabilities(
+                    self.provider
+                ).native_tools,
             )
         self._plugin_tool_names = {
             name
@@ -5860,6 +5863,26 @@ class AshLoop:
         baseline = HistoryCompactor._count(projected, count_tokens) + native_schema_tokens
         input_limit = request_budget.input_limit
         follow_up_reserve = max(128, min(2_048, input_limit // 12))
+        if input_limit >= 24_576:
+            # Opaque replay state can grow by thousands of estimated tokens in
+            # one completion. Reserve room for the next navigation refusal,
+            # a failed edit, its repair, and verification. Count recent actual
+            # assistant messages without inspecting or rewriting replay data.
+            # This is a bounded planning margin, not a guarantee about future
+            # model output. Keep the compact-window policy unchanged.
+            recent_assistants = [
+                message for message in projected
+                if message.get("role") == "assistant" and message.get("provider_state")
+            ][-3:]
+            if recent_assistants:
+                replay_growth = max(
+                    HistoryCompactor._count([message], count_tokens)
+                    for message in recent_assistants
+                )
+                follow_up_reserve = max(
+                    follow_up_reserve,
+                    min(input_limit // 3, follow_up_reserve + 4 * replay_growth),
+                )
         # Side-effectful results cannot be safely reduced after dispatch.
         # Reserve modest room for them; only read-only navigation is bounded.
         other_result_reserve = non_navigation_count * max(

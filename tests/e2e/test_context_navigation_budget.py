@@ -890,3 +890,144 @@ async def test_single_read_early_error_fits_budget_before_tool_result_history(
     assert not result.success and result.truncated
     assert "context budget" in (result.error or "").lower()
     assert not (tmp_path / missing).exists()
+
+
+@pytest.mark.asyncio
+async def test_growing_opaque_state_leaves_room_for_patch_repair_and_test(
+    tmp_path: Path,
+) -> None:
+    """A failed exact patch must leave a useful, safe path to finish coding."""
+    from ash.tools.patch import ApplyPatchTool
+
+    for index in range(1, 17):
+        (tmp_path / f"module_{index:02}.py").write_text(
+            "".join(f"# module {index} line {line:03} " + "x" * 78 + "\n"
+                    for line in range(160)), encoding="utf-8",
+        )
+    first = tmp_path / "first.py"
+    second = tmp_path / "second.py"
+    first.write_text("FIRST = 1\n", encoding="utf-8")
+    second.write_text("SECOND = 2\n", encoding="utf-8")
+    command = shlex.quote(sys.executable) + " -c " + shlex.quote(
+        "from pathlib import Path; "
+        "assert Path('first.py').read_text() == 'FIRST = 10\\n'; "
+        "assert Path('second.py').read_text() == 'SECOND = 20\\n'; "
+        "print('REPAIR_OK')"
+    )
+
+    class Provider(ProviderABC):
+        model_name = "recovery-runway-fixture"
+        _ash_declared_capabilities = ProviderCapabilities(
+            native_tools=True, context_window=65_536,
+            max_input_tokens=61_536, max_output_tokens=4_000,
+        )
+
+        def __init__(self) -> None:
+            self.states: list[list[dict[str, Any]]] = []
+            self.requests: list[int] = []
+            self.phase = 0
+
+        def count_tokens(self, value: str) -> int:
+            return max(1, (len(value) + 2) // 3)
+
+        def replay_credential_identity(self) -> ProviderReplayCredentialIdentity:
+            return ProviderReplayCredentialIdentity.from_secret(
+                "only-fixture-state", scope=("recovery-runway",),
+            )
+
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            index = len(self.requests) + 1
+            self.requests.append(HistoryCompactor._count(messages, self.count_tokens))
+            assert [m["provider_state"] for m in messages
+                    if m.get("role") == "assistant" and m.get("provider_state")] == self.states
+            history = json.dumps(messages)
+            calls: list[dict[str, Any]] = []
+            if "not dispatched because the remaining context budget" in history.lower():
+                self.phase += 1
+                if self.phase in (1, 2):
+                    if self.phase == 2:
+                        assert "second.py: hunk 1:" in history
+                        assert "no files changed by this patch" in history
+                        assert first.read_text() == "FIRST = 1\n"
+                        assert second.read_text() == "SECOND = 2\n"
+                    old = "SECOND = 99" if self.phase == 1 else "SECOND = 2"
+                    patch = (
+                        "*** Begin Patch\n*** Update File: first.py\n@@\n"
+                        "-FIRST = 1\n+FIRST = 10\n*** Update File: second.py\n@@\n"
+                        f"-{old}\n+SECOND = 20\n*** End Patch"
+                    )
+                    calls = [{"id": f"patch-{self.phase}", "name": "apply_patch",
+                              "arguments": {"patch": patch}}]
+                elif self.phase == 3:
+                    assert first.read_text() == "FIRST = 10\n"
+                    assert second.read_text() == "SECOND = 20\n"
+                    calls = [{"id": "check-edit", "name": "run_command",
+                              "arguments": {"command_line": command}}]
+                else:
+                    assert self.phase == 4 and "REPAIR_OK" in history
+                    yield StreamChunk(content="Repaired and verified.", is_done=True)
+                    return
+            else:
+                assert index <= 16, "Expected bounded navigation refusal"
+                calls = [{"id": f"nav-{index}", "name": "read_file",
+                          "arguments": {"file_path": f"module_{index:02}.py",
+                                        "max_chars": 16_000}}]
+                if index == 1:
+                    calls.extend(
+                        {"id": f"initial-{path}", "name": "read_file",
+                         "arguments": {"file_path": path}}
+                        for path in ("first.py", "second.py")
+                    )
+            state = [{"type": "reasoning", "id": f"opaque-{index}", "summary": [],
+                      "status": "completed", "encrypted_content": "A" * 9_000}]
+            self.states.append(state)
+            yield StreamChunk(native_tool_calls=calls, provider_state=state, is_done=True)
+
+    approvals: list[str] = []
+
+    async def approve(name: str, arguments: dict[str, object]) -> bool:
+        approvals.append(name)
+        return name in {"read_file", "apply_patch", "run_command"}
+
+    guard = SafetyGuard(tmp_path)
+    store = SessionStore(tmp_path / "session.db")
+    provider = Provider()
+    loop = AshLoop(
+        store, provider, guard, HeadlessUI(output_format="text", stream=io.StringIO()),
+        tmp_path, tools={
+            "read_file": ReadFileTool(guard),
+            "apply_patch": ApplyPatchTool(guard),
+            "run_command": RunCommandTool(guard, project_root=tmp_path),
+        }, config=AshConfig(
+            model="custom/recovery-runway-fixture", workspace_root=tmp_path,
+            db_directory=tmp_path / "db", memory_backend="off",
+            max_context_tokens=65_536, max_completion_tokens=4_000,
+        ), on_tool_approval=approve,
+    )
+
+    def checkpoint_context() -> tuple[str, str, str] | None:
+        if loop.current_session is None or loop.turn_context is None:
+            return None
+        return (loop.current_session.session_id, loop.turn_context.turn_id,
+                str(loop.turn_context.get("tool_call_id", "")))
+
+    loop.tool_middlewares.extend([
+        FileCheckpointMiddleware(store, guard, checkpoint_context),
+        SecretRedactionMiddleware(),
+    ])
+    try:
+        session = await loop.start_session()
+        result = await loop.run_turn(
+            "Inspect the source, coordinate the two edits and verify them with the permitted test."
+        )
+        assert result == "Repaired and verified." and provider.phase == 4
+        calls = store.load_session(session.session_id).tool_calls
+        assert sum(c.tool_name == "apply_patch" and c.success == 1 for c in calls) == 1
+        assert sum(c.tool_name == "apply_patch" and c.success == 0 for c in calls) == 1
+        assert sum(c.tool_name == "run_command" and c.success == 1 for c in calls) == 1
+        assert approvals.count("apply_patch") == 2 and approvals.count("run_command") == 1
+        assert any(c.tool_name == "read_file" and not c.dispatched and not c.approved
+                   and not c.executed for c in calls)
+        assert not store.verify_audit_log(session.session_id)
+    finally:
+        await loop.aclose()

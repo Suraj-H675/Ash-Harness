@@ -145,11 +145,12 @@ reported total.
 `search_tools` indexes the complete live built-in, plugin, skill, and MCP tool
 catalog. When the catalog exceeds `tool_search_threshold` (32 by default), Ash
 sends only a compact essential set and `search_tools` to the provider. A search
-returns the names, descriptions, and exact input schemas of the best matches
-that can actually be activated for the next model iteration. For effective
-input limits of 4,096 tokens or less, the result omits duplicate argument
-schemas, which are still provided in the **next provider request** with
-unchanged runtime validation.
+returns the names and descriptions of the best matches that can actually be
+activated for the next model iteration. Native-tool providers receive the
+exact argument schemas in the **next provider request**, not a duplicate
+copy in the search result. Non-native discovery retains schema metadata
+except under the existing compact-result policy for effective input limits
+of 4,096 tokens or less. Runtime validation is unchanged.
 
 The runtime bounds the combined incremental schema and discovery-result token
 cost against the effective provider input limit. When matches cannot fit, the
@@ -173,14 +174,22 @@ deferred discovery is active, Ash also exposes the existing read-only
 `git_diff` schema directly. The generated system prompt includes concise
 coding guidance for focused inspection, coordinated edits and authorized
 testing. This does not grant shell access or alter any tool permissions.
-Ordinary `read_file` calls now default to **8,192 source characters** instead
-of 32,768. This reduces the amount of source content retained in subsequent
+Ordinary `read_file` calls default to **4,096 source characters**. This
+reduces the amount of source content retained in subsequent
 model requests, particularly when opaque provider reasoning state prevents
 history compaction. The result still includes numbered lines, file SHA-256,
 encoding and exact line/column continuation. Models and users may explicitly
 request larger `max_chars` values (up to the existing hard limit) when a
 fuller inspection is actually necessary. This is a context-economy default,
 not a proven increase in independent coding benchmark pass rates.
+For opaque reasoning history, Ash budgets built-in read-only navigation
+results before they enter protected history. At effective input limits of
+at least 24,576 tokens, it also reserves additional room based on recent
+assistant-message sizes for a possible failed edit, repair and verification.
+The additional margin is bounded and may shorten or refuse navigation sooner;
+it cannot guarantee room for arbitrary future completions or tool output.
+Ash does not discard or rewrite opaque replay state. Unknown middleware or
+registered hooks retain the conservative non-projected behavior.
 `search_text` also supports optional `context_lines=1..5` for nearby source
 lines around each match without a separate read request. Adjacent windows are
 merged, and the match count still controls `max_results`. Matching lines keep
@@ -224,6 +233,10 @@ When discovered, `apply_patch` accepts Git unified diffs and a bounded
 `*** Begin Patch` / `*** Update File` model-oriented form. Both paths retain
 the same permission, checkpoint and ambiguous-result contracts. Support for
 the additional input syntax does not by itself establish fewer model steps.
+A rejected model-oriented patch identifies the failing file and hunk for
+context-matching failures. When translation or validation fails before any
+write, Ash reports that this patch changed no files. An apply attempt with
+an uncertain write outcome still requires inspection before retrying.
 For explicit requests to edit several files or modules together, `search_tools`
 prioritizes the deferred multi-file `apply_patch` tool. Read-only grouped
 source requests still favor `read_files`, and multiple ranges within one

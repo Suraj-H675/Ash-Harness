@@ -192,34 +192,37 @@ def _find_unique(lines: list[str], block: tuple[str, ...], start: int) -> int:
     return matches[0]
 
 
-def _updated_content(content: bytes, chunks: tuple[_Chunk, ...]) -> str:
+def _updated_content(content: bytes, chunks: tuple[_Chunk, ...], *, path: str) -> str:
     source_lines, newline, ended = _source_lines(content)
     result: list[str] = []
     cursor = 0
-    for chunk in chunks:
-        minimum = cursor
-        if chunk.anchor is not None:
-            anchors = [
-                index
-                for index in range(cursor, len(source_lines))
-                if source_lines[index].strip() == chunk.anchor
-            ]
-            if len(anchors) != 1:
-                raise ValueError("patch @@ anchor was missing or ambiguous")
-            minimum = anchors[0]
-            if not chunk.old or chunk.old[0] != source_lines[minimum]:
-                minimum += 1
+    for hunk_index, chunk in enumerate(chunks, start=1):
+        try:
+            minimum = cursor
+            if chunk.anchor is not None:
+                anchors = [
+                    index
+                    for index in range(cursor, len(source_lines))
+                    if source_lines[index].strip() == chunk.anchor
+                ]
+                if len(anchors) != 1:
+                    raise ValueError("patch @@ anchor was missing or ambiguous")
+                minimum = anchors[0]
+                if not chunk.old or chunk.old[0] != source_lines[minimum]:
+                    minimum += 1
 
-        if chunk.old:
-            position = _find_unique(source_lines, chunk.old, minimum)
-            if chunk.end_of_file and position + len(chunk.old) != len(source_lines):
-                raise ValueError("patch *** End of File does not match the file tail")
-        elif chunk.end_of_file:
-            position = len(source_lines)
-        elif chunk.anchor is not None:
-            position = minimum
-        else:
-            raise ValueError("unanchored insertion; include an @@ anchor or context")
+            if chunk.old:
+                position = _find_unique(source_lines, chunk.old, minimum)
+                if chunk.end_of_file and position + len(chunk.old) != len(source_lines):
+                    raise ValueError("patch *** End of File does not match the file tail")
+            elif chunk.end_of_file:
+                position = len(source_lines)
+            elif chunk.anchor is not None:
+                position = minimum
+            else:
+                raise ValueError("unanchored insertion; include an @@ anchor or context")
+        except ValueError as exc:
+            raise ValueError(f"{path}: hunk {hunk_index}: {exc}") from exc
         result.extend(source_lines[cursor:position])
         result.extend(chunk.new)
         cursor = position + len(chunk.old)
@@ -274,7 +277,7 @@ def model_patch_as_unified_diff(
             after = (
                 None
                 if operation.action == "delete"
-                else _updated_content(raw, operation.chunks)
+                else _updated_content(raw, operation.chunks, path=operation.path)
             )
         if before == after:
             raise ValueError(f"patch made no changes to {operation.path}")

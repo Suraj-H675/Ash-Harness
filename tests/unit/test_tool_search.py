@@ -1104,11 +1104,12 @@ async def test_default_runtime_discovers_tools_for_natural_language_intents(
                 "apply_patch"
             ]
             assert search_result["omitted_matches"] > 0
-        if context_window == 4_096:
-            assert "input_schema" not in matched
-            assert "schema_summary" not in matched
-        elif "schema_truncated" not in matched:
-            assert matched["input_schema"] == catalog[expected_tool].search_schema()
+        # This scripted native provider receives the exact schema above on
+        # the next iteration, for every effective context size. Do not also
+        # retain a duplicate in the persisted discovery response.
+        assert "input_schema" not in matched
+        assert "schema_summary" not in matched
+        assert "schema_truncated" not in matched
     assert "search_tools" in provider.initial_system_prompt
     assert "next provider iteration" in provider.initial_system_prompt.casefold()
     assert "concrete tool actions" in provider.initial_system_prompt.casefold()
@@ -1190,4 +1191,27 @@ async def test_one_term_name_fallback_does_not_pollute_stronger_matches(
     result = await search.run(query="inspect history of changes")
     assert [item["name"] for item in json.loads(result.output)["tools"]] == [
         "audit_lookup"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_discovery_schema_omission_tracks_provider_declarations(tmp_path: Path) -> None:
+    guard = SafetyGuard(tmp_path)
+    catalog: dict[str, BaseTool] = {}
+    search = SearchToolsTool(guard, lambda: catalog, threshold=1)
+    tool = DummyTool(guard, "database_query", "Run a SQL database query.")
+    catalog.update({search.name: search, tool.name: tool})
+    native = True
+    search.set_activation_budget(lambda _active, _preview: True,
+                                 schemas_in_declarations=lambda: native)
+    result = await search.run(query=tool.name, limit=1)
+    assert json.loads(result.output)["tools"] == [
+        {"name": tool.name, "description": tool.description}
+    ]
+    assert tool.name in search.visible_tools(catalog)
+    native = False
+    result = await search.run(query=tool.name, limit=1)
+    assert json.loads(result.output)["tools"] == [
+        {"name": tool.name, "description": tool.description,
+         "input_schema": tool.json_schema()}
     ]

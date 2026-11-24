@@ -112,17 +112,20 @@ class SearchToolsTool(BaseTool):
         self._activation_order: deque[str] = deque()
         self._activation_fits: Callable[[set[str], str], bool] | None = None
         self._compact_result: Callable[[], bool] | None = None
+        self._schemas_in_declarations: Callable[[], bool] | None = None
 
     def set_activation_budget(
         self,
         fits: Callable[[set[str], str], bool],
         *,
         compact_result: Callable[[], bool] | None = None,
+        schemas_in_declarations: Callable[[], bool] | None = None,
     ) -> None:
         """Bind the owning provider's schema and search-result token budget."""
 
         self._activation_fits = fits
         self._compact_result = compact_result
+        self._schemas_in_declarations = schemas_in_declarations
 
     async def run(self, **kwargs: Any) -> ToolResult:
         args = SearchToolsArgs(**kwargs)
@@ -136,6 +139,13 @@ class SearchToolsTool(BaseTool):
         query = redact_text(args.query)
         deferred_catalog = self.threshold > 0 and len(catalog) > self.threshold
         compact_result = bool(self._compact_result and self._compact_result())
+        # Native calls receive exact declarations on the following request.
+        # Avoid retaining a second copy in immutable tool-result history, even
+        # in a large context window. The tiny-window match limit below is a
+        # separate concern; do not silently discard useful larger-window matches.
+        omit_schema = compact_result or bool(
+            self._schemas_in_declarations and self._schemas_in_declarations()
+        )
         if (
             deferred_catalog
             and compact_result
@@ -147,14 +157,7 @@ class SearchToolsTool(BaseTool):
             omitted = max(0, len(matches) - 1)
             matches = matches[:1]
         for name, tool, _ in matches:
-            metadata = _search_result_tool(name, tool)
-            if compact_result:
-                # The exact schema is sent separately in the next provider
-                # tool declarations. Duplicating it in protected conversation
-                # history needlessly exhausts small model input windows.
-                metadata.pop("input_schema", None)
-                metadata.pop("schema_summary", None)
-                metadata.pop("schema_truncated", None)
+            metadata = _search_result_tool(name, tool, include_schema=not omit_schema)
             candidate_order = deque(item for item in order if item != name)
             candidate_order.append(name)
             preview = (
@@ -392,10 +395,15 @@ def _bounded_schema_search_text(schema: Any) -> str:
     return " ".join(pieces).casefold()
 
 
-def _search_result_tool(name: str, tool: BaseTool) -> dict[str, Any]:
+def _search_result_tool(
+    name: str, tool: BaseTool, *, include_schema: bool = True
+) -> dict[str, Any]:
     description = str(getattr(tool, "description", ""))[
         :MAX_TOOL_SEARCH_DESCRIPTION_CHARS
     ]
+    result: dict[str, Any] = {"name": name, "description": description}
+    if not include_schema:
+        return result
     schema = tool.search_schema()
     encoded = json.dumps(
         schema,
@@ -404,7 +412,6 @@ def _search_result_tool(name: str, tool: BaseTool) -> dict[str, Any]:
         separators=(",", ":"),
         default=str,
     )
-    result: dict[str, Any] = {"name": name, "description": description}
     if len(encoded.encode("utf-8")) <= MAX_TOOL_SEARCH_EXACT_SCHEMA_BYTES:
         result["input_schema"] = schema
         return result

@@ -2499,3 +2499,31 @@ async def test_auto_commit_refuses_staged_secret_without_echoing_value(
     assert result.output == "Changes remain staged for inspection."
     status = await GitStatusTool(SafetyGuard(tmp_path)).run()
     assert "A  config.env" in status.output
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("dry_run", [False, True])
+@pytest.mark.parametrize("bad_context", ["stale", "ambiguous"])
+async def test_model_patch_names_failed_file_and_hunk_without_mutation(
+    tmp_path: Path, dry_run: bool, bad_context: str,
+) -> None:
+    first = tmp_path / "first.py"
+    second = tmp_path / "second.py"
+    first.write_text("first = 1\n")
+    original = "start = 1\nvalue = 2\nvalue = 2\n"
+    second.write_text(original)
+    missing = "not_present = 3" if bad_context == "stale" else "value = 2"
+    result = await ApplyPatchTool(SafetyGuard(tmp_path)).run(
+        patch=("*** Begin Patch\n*** Update File: first.py\n@@\n"
+               "-first = 1\n+first = 10\n*** Update File: second.py\n@@\n"
+               f"-start = 1\n+start = 10\n@@\n-{missing}\n+value = 20\n*** End Patch"),
+        dry_run=dry_run,
+    )
+    assert not result.success
+    error = result.error or ""
+    assert "second.py" in error and "hunk 2" in error
+    assert "no files changed" in error.lower()
+    assert ("not found" if bad_context == "stale" else "ambiguous") in error.lower()
+    assert missing not in error
+    assert first.read_text() == "first = 1\n"
+    assert second.read_text() == original
