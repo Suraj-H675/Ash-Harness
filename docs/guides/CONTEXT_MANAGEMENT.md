@@ -439,6 +439,11 @@ automatically retries an edit nor bypasses filesystem safeguards.
 The new turn is instructed to inspect the actual workspace state and verify
 the task before reporting completion; any tool execution in the new turn
 still passes normal permissions, sandbox and audit checks.
+When durable checkpoints record successful local edits, the automatic
+handoff may also include a short list of workspace-relative paths. Those
+paths are untrusted historical hints, not authorization or proof that current
+file contents are correct. The child must inspect the workspace before
+deciding what remains. Explicit user-authored restart handoffs stay unchanged.
 
 This option does not resolve context limits automatically in every case. It
 does not extend the outer process deadline, retries neither provider outages

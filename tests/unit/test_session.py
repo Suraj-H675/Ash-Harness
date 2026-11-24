@@ -2291,6 +2291,9 @@ def test_context_restart_accepts_only_reconciled_interrupted_turn(
     assert child.tool_calls == []
     assert len(child.messages) == 1
     assert "Inspect existing changes" in child.messages[0].content
+    assert "Recorded successful local-edit checkpoint paths" not in (
+        child.messages[0].content
+    )
     assert "not imported or authorized for replay" in child.messages[0].content.lower()
     assert "SENSITIVE-OPAQUE-STATE" not in repr(child)
     assert before.messages == store.load_session(source.session_id).messages
