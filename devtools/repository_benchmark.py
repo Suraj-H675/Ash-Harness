@@ -2759,7 +2759,142 @@ print('BEARTYPE_FORWARD_SCOPES_HIDDEN_OK')
 """
 
 
+MARKDOWN_DEFLIST_VISIBLE = r"""import sys
+from html.parser import HTMLParser
+
+import markdown
+from markdown.extensions.def_list import DefListExtension
+
+
+class TextCollector(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.text = []
+
+    def handle_data(self, data):
+        self.text.append(data)
+
+
+def render(source):
+    return markdown.markdown(source, extensions=[DefListExtension()])
+
+
+assert render('Term\n: meaning') == '<dl>\n<dt>Term</dt>\n<dd>meaning</dd>\n</dl>'
+limit = sys.getrecursionlimit()
+try:
+    sys.setrecursionlimit(150)
+    source = ''.join(f'Term{i:04}X\n: Meaning{i:04}X\n' for i in range(180))
+    output = render(source)
+    assert sys.getrecursionlimit() == 150
+finally:
+    sys.setrecursionlimit(limit)
+assert '<dl>' in output and output.count('<dl>') == output.count('</dl>')
+parser = TextCollector()
+parser.feed(output)
+words = ' '.join(parser.text).split()
+for i in range(180):
+    assert words.count(f'Term{i:04}X') == 1
+    assert words.count(f'Meaning{i:04}X') == 1
+assert render('Term\n: meaning') == '<dl>\n<dt>Term</dt>\n<dd>meaning</dd>\n</dl>'
+print('MARKDOWN_DEFLIST_VISIBLE_OK')
+"""
+
+
+MARKDOWN_DEFLIST_HIDDEN = r"""import re
+import sys
+import xml.etree.ElementTree as ET
+
+import markdown
+from markdown.extensions.def_list import DefListExtension
+
+
+def check_deep(md, count):
+    source = ''.join(f'KEY{i:05}Z\n: VAL{i:05}Z\n' for i in range(count))
+    before = sys.getrecursionlimit()
+    html = md.convert(source)
+    assert sys.getrecursionlimit() == before
+    root = ET.fromstring('<root>' + html + '</root>')
+    assert root.find('dl') is not None
+    assert root.find('.//dd') is not None
+    actual = re.findall(r'(?:KEY|VAL)\d{5}Z', ' '.join(root.itertext()))
+    expected = [token for i in range(count) for token in (f'KEY{i:05}Z', f'VAL{i:05}Z')]
+    assert actual == expected, 'input must survive in order without loss or duplication'
+    assert root.findall('.//dl'), 'do not disable definition-list parsing'
+    md.reset()
+
+
+def check_shallow(md):
+    for source, expected in (
+        ('One\n: first\n: second', '<dl><dt>One</dt><dd>first</dd><dd>second</dd></dl>'),
+        ('Apple\n: fruit\n\nCarrot\n: vegetable',
+         '<dl><dt>Apple</dt><dd>fruit</dd><dt>Carrot</dt><dd>vegetable</dd></dl>'),
+        ('Outer\n: description\n\n    Inner\n    : nested',
+         '<dl><dt>Outer</dt><dd><p>description</p><dl><dt>Inner</dt><dd>nested</dd></dl></dd></dl>'),
+        ('normal paragraph\n\nTerm\n: meaning',
+         '<p>normal paragraph</p><dl><dt>Term</dt><dd>meaning</dd></dl>'),
+    ):
+        actual = re.sub(r'>\s+<', '><', md.convert(source))
+        assert actual == expected, (source, actual)
+        md.reset()
+
+
+md = markdown.Markdown(extensions=[DefListExtension()])
+check_shallow(md)
+# Test under the ordinary interpreter limit and under a smaller caller-owned
+# limit. Do not prescribe the cutoff depth or the implementation of the guard.
+check_deep(md, 650)
+limit = sys.getrecursionlimit()
+try:
+    for lowered in (120, 180):
+        sys.setrecursionlimit(lowered)
+        check_deep(md, 240)
+        check_shallow(md)
+finally:
+    sys.setrecursionlimit(limit)
+check_shallow(md)
+print('MARKDOWN_DEFLIST_HIDDEN_OK')
+"""
+
+
 TASKS = {
+    "markdown-definition-list-recursion": RepositoryTask(
+        source="python-markdown/markdown",
+        upstream="https://github.com/python-markdown/markdown.git",
+        base_sha="86d1e46b40673a85b68b75bb88a96d553647d07c",
+        reference_fix_sha="26e43de464fb2d682df917d4fcaf4d376f767564",
+        editable=frozenset({"markdown/extensions/def_list.py"}),
+        visible_script="qa_visible.py",
+        visible_source=MARKDOWN_DEFLIST_VISIBLE,
+        hidden_source=MARKDOWN_DEFLIST_HIDDEN,
+        command_grant="python3 -B qa_visible.py",
+        prompt=(
+            'Repair the definition-list extension in this pinned Python-Markdown '
+            'repository. Long runs of adjacent term/definition pairs without blank lines '
+            'can cause unbounded recursive block parsing and an uncaught RecursionError, '
+            'even for modest input sizes. Make this parsing safe at the current '
+            'interpreter recursion limit, including when a caller deliberately uses a '
+            'lower limit. Preserve all input content in order when nesting must stop, '
+            'allowing excess markers to remain ordinary text rather than dropping '
+            'content. Preserve normal shallow definition-list rendering, multiple '
+            'definitions, nested lists, ordinary paragraphs, and parser reuse. Do not '
+            'change the interpreter recursion limit, disable the extension, truncate '
+            'input, or hide crashes by returning incomplete output. You may change only '
+            'markdown/extensions/def_list.py. Inspect qa_visible.py and relevant '
+            'production code. Do not edit tests, metadata or other files. Run exactly '
+            'python3 -B qa_visible.py as the only permitted test command; you may repeat '
+            'that exact command after edits. Read-only source inspection commands are '
+            'allowed. Do not run other tests or shell commands that modify files.'
+        ),
+        upstream_pr="https://github.com/python-markdown/markdown/pull/1701",
+        license="BSD-3-Clause",
+        expected_reference_paths=frozenset({
+            "docs/changelog.md",
+            "markdown/extensions/def_list.py",
+            "tests/test_syntax/extensions/test_def_list.py",
+        }),
+        require_both_oracles_red_green=True,
+        require_each_editable_ablation_red=True,
+    ),
     "beartype-forward-reference-namespace-isolation": RepositoryTask(
         source="beartype/beartype",
         upstream="https://github.com/beartype/beartype.git",

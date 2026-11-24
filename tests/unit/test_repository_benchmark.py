@@ -2060,3 +2060,35 @@ def test_beartype_forward_scope_task_has_frozen_semantic_oracles() -> None:
     assert bench.task_evidence_classification(task) == "source-backed-task"
     compile(task.visible_source, "<visible>", "exec")
     compile(task.hidden_source, "<hidden>", "exec")
+
+
+def test_markdown_definition_list_recursion_task_has_frozen_semantic_oracles() -> None:
+    task = bench.TASKS["markdown-definition-list-recursion"]
+    assert task.source == "python-markdown/markdown"
+    assert task.upstream == "https://github.com/python-markdown/markdown.git"
+    assert task.upstream_pr == "https://github.com/python-markdown/markdown/pull/1701"
+    assert task.base_sha == "86d1e46b40673a85b68b75bb88a96d553647d07c"
+    assert task.reference_fix_sha == "26e43de464fb2d682df917d4fcaf4d376f767564"
+    assert task.license == "BSD-3-Clause" and task.runtime is None
+    assert task.editable == frozenset({"markdown/extensions/def_list.py"})
+    assert task.expected_reference_paths == task.editable | {
+        "docs/changelog.md", "tests/test_syntax/extensions/test_def_list.py",
+    }
+    assert task.require_both_oracles_red_green and task.require_each_editable_ablation_red
+    assert task.diagnostic_retake_of is None
+    assert task.command_grant == "python3 -B qa_visible.py"
+    assert task.visible_script == "qa_visible.py"
+    assert hashlib.sha256(task.visible_source.encode()).hexdigest() == (
+        "08f27673e84e0310939e69da02a972e16cc1efd12f0356e00bddf62bbe519f68"
+    )
+    assert hashlib.sha256(task.hidden_source.encode()).hexdigest() == (
+        "dee329894350cb2bbf49b661ad2c26aad6017b4447becbcac0efaf525b2e1a84"
+    )
+    assert hashlib.sha256(bench.shared_user_prompt(task).encode()).hexdigest() == (
+        "70687f8c0af23d65f327cd392d4184c78deba83442d185c721aa66307cf71091"
+    )
+    assert bench.shared_user_prompt(task) == task.prompt
+    assert bench.task_evidence_classification(task) == "source-backed-task"
+    assert task.hidden_source not in task.prompt and task.reference_fix_sha not in task.prompt
+    compile(task.visible_source, "<visible>", "exec")
+    compile(task.hidden_source, "<hidden>", "exec")
