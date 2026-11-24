@@ -194,6 +194,22 @@ If no compatible v20 backup exists, keep the newer release installed or
 restore another known-good v20 backup. Do not start 0.4.6 against a v21
 database.
 
+For **0.5.1 → 0.6.0**, the session schema advances from v21 to v23.
+Ash creates `sessions.db.before-v23-migration.<timestamp>.backup` before
+migrating the existing database. The installed upgrade gate exercises a
+session created by the published v0.5.1 wheel, resumes it after upgrading,
+and verifies the pre-migration backup, durable messages, tool calls, audit
+chain, and one-time command execution.
+
+To return to v0.5.1 after opening a session database with v0.6.0, stop all
+Ash processes using that profile, preserve newer work separately, restore
+the compatible v21 backup using `ash storage restore /path/to/backup --yes`
+while v0.6.0 is still installed, and immediately install the immutable
+v0.5.1 package. Do not start v0.6.0 against the restored database before
+rolling back the package. If no compatible v21 backup exists, keep the newer
+release installed or recover from another known-good compatible backup.
+Session rollback does not restore other profile databases or newer work.
+
 ## Reset selected default-profile state
 
 Ash reset is deliberately selective:

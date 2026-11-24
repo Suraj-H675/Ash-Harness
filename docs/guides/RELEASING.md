@@ -92,6 +92,13 @@ databases. Opening one with 0.4.0 automatically backs it up as
 Returning to 0.3.1 requires restoring that v18 backup **before** rolling the
 package back; installing 0.3.1 alone cannot open the migrated v19 database.
 
+For the 0.6.0 upgrade, the published 0.5.1 release creates schema-v21
+session databases. Opening one with 0.6.0 creates a validated
+`before-v23-migration` backup before migrating to schema v23. To return to
+0.5.1, preserve newer work separately, restore that compatible v21 backup
+while 0.6.0 is installed, and immediately install the older immutable
+package. See the [maintenance procedure](MAINTENANCE.md#roll-back-across-a-session-schema-migration).
+
 ## Verify a published release
 
 GitHub CLI can verify both the release attestation and an individual downloaded

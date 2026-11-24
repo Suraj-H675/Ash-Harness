@@ -281,13 +281,20 @@ jobs:
         env:
           ASH_FIRST_USE_WHEEL_PYTHON: ${{ github.workspace }}/.upgrade-venv/bin/python
           ASH_FIRST_USE_OLD_WHEEL: ${{ runner.temp }}/ash-upgrade/ash_ai-0.5.1-py3-none-any.whl
-          ASH_FIRST_USE_UPGRADE_WHEEL: ${{ github.workspace }}/dist/ash_ai-0.5.1-py3-none-any.whl
           ASH_FIRST_USE_UPGRADE_UV: uv
           UV_OFFLINE: "1"
-        run: >-
-          uv run --locked pytest -s -q
-          tests/e2e/test_cli_terminal_fallbacks.py::test_fresh_cli_setup_reaches_approved_edit_test_and_safe_resume
-          --timeout=120 --timeout-method=thread
+        shell: bash
+        run: |
+          set -eu
+          set -- "$GITHUB_WORKSPACE"/dist/ash_ai-*.whl
+          if [ "$#" -ne 1 ] || [ ! -f "$1" ]; then
+            echo >&2 "Expected exactly one Ash candidate wheel"
+            exit 1
+          fi
+          export ASH_FIRST_USE_UPGRADE_WHEEL="$1"
+          uv run --locked pytest -s -q \
+            tests/e2e/test_cli_terminal_fallbacks.py::test_fresh_cli_setup_reaches_approved_edit_test_and_safe_resume \
+            --timeout=120 --timeout-method=thread
 
   minimum-dependencies:
     runs-on: ubuntu-latest

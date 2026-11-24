@@ -12,6 +12,7 @@ import subprocess
 import sys
 import threading
 import time
+import tomllib
 import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -1229,7 +1230,13 @@ def test_fresh_cli_setup_reaches_approved_edit_test_and_safe_resume(
             candidate_version, candidate_digest = _assert_wheel_is_installed(
                 python_executable, upgrade_wheel
             )
-            assert candidate_version == "0.5.1", candidate_version
+            # The candidate must match the checkout's intended package version,
+            # not the deliberately pinned public upgrade baseline.
+            project_file = Path(__file__).resolve().parents[2] / "pyproject.toml"
+            expected_version = tomllib.loads(project_file.read_text(encoding="utf-8"))[
+                "project"
+            ]["version"]
+            assert candidate_version == expected_version, candidate_version
             assert candidate_digest != old_digest
             print(
                 "installed upgrade fingerprints: "
@@ -1246,7 +1253,7 @@ def test_fresh_cli_setup_reaches_approved_edit_test_and_safe_resume(
                 check=False,
             )
             assert version_result.returncode == 0, version_result.stderr
-            assert version_result.stdout.strip() == "ash 0.5.1"
+            assert version_result.stdout.strip() == f"ash {expected_version}"
 
             resumed = subprocess.run(
                 [

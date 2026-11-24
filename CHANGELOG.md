@@ -6,6 +6,39 @@ All notable changes to Ash are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-11-24
+
+### Added
+- Ash Crew v1: persistent, owner-scoped coworkers, governed responsibilities,
+  scheduled and signed-event investigations, an activity inbox, and exact
+  owner-approved workspace corrections. Model execution and access remain
+  explicitly scoped; unattended workers do not inherit unrestricted tools.
+- Guarded model-oriented multi-file patches, targeted file discovery,
+  bounded background-process output waits, and inspectable coding activity.
+- Explicit long-horizon context continuation and opt-in OpenAI Responses
+  server-side compaction on supported provider routes.
+
+### Changed
+- Improved coding tool discovery, source-navigation budgets, patch error
+  diagnostics, and verification headroom under context pressure.
+- Bound opaque reasoning replay to compatible model routes and effective
+  credential identity. Refuse incompatible replay rather than discard state.
+- Strengthened durable tool-call state transitions, interruption recovery,
+  checkpoint inspection and approval previews. Opted-in continuation can
+  recover from attested harmless navigation refusals without replaying tools.
+- Expanded installed-wheel first-use, upgrade/resume, sandbox, terminal and
+  protocol verification on supported Linux and macOS hosts.
+
+### Upgrade notes
+- Opening a v0.5.1 session database (schema v21) with v0.6.0 migrates it to
+  schema v23 after creating a validated `before-v23-migration` backup. Package
+  rollback alone does not reverse this migration. To return to v0.5.1,
+  preserve newer work, restore the compatible v21 backup while v0.6.0 is
+  installed, and then install the older immutable release. See the
+  [maintenance guide](docs/guides/MAINTENANCE.md#roll-back-across-a-session-schema-migration).
+- Automatic context continuation remains opt-in; live comparative coding
+  reliability is still being evaluated.
+
 ## [0.5.1] - 2026-10-24
 
 ### Fixed
@@ -497,7 +530,10 @@ All notable changes to Ash are documented here. The format follows
 - Fixed duplicate `project.urls` tables so the distribution builds with modern
   `setuptools`; expanded CI across Python 3.11 and 3.12.
 
-[Unreleased]: https://github.com/Suraj-H675/Ash-Harness/compare/ash-v0.4.6...HEAD
+[Unreleased]: https://github.com/Suraj-H675/Ash-Harness/compare/ash-v0.6.0...HEAD
+[0.6.0]: https://github.com/Suraj-H675/Ash-Harness/compare/ash-v0.5.1...ash-v0.6.0
+[0.5.1]: https://github.com/Suraj-H675/Ash-Harness/compare/ash-v0.5.0...ash-v0.5.1
+[0.5.0]: https://github.com/Suraj-H675/Ash-Harness/compare/ash-v0.4.6...ash-v0.5.0
 [0.4.6]: https://github.com/Suraj-H675/Ash-Harness/compare/ash-v0.4.5...ash-v0.4.6
 [0.4.5]: https://github.com/Suraj-H675/Ash-Harness/compare/ash-v0.4.4...ash-v0.4.5
 [0.4.4]: https://github.com/Suraj-H675/Ash-Harness/compare/ash-v0.4.3...ash-v0.4.4
