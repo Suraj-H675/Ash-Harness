@@ -9,6 +9,7 @@ from typing import Protocol
 CHARS_PER_TOKEN_HEURISTIC = 4
 ASCII_CHARS_PER_TOKEN_ESTIMATE = 3
 DEFAULT_OPENAI_FALLBACK_ENCODING = "cl100k_base"
+_NON_ASCII_BYTES = bytes(range(128, 256))
 
 
 class TokenCounter(Protocol):
@@ -70,8 +71,15 @@ def estimate_text_tokens(text: str) -> int:
     severe character-count underestimate.
     """
 
-    ascii_chars = sum(character.isascii() for character in text)
-    non_ascii_bytes = len(text.encode("utf-8")) - ascii_chars
+    # str.isascii() uses the string's native representation; ordinary source
+    # code and serialized ASCII history need neither a per-character scan nor
+    # a UTF-8 allocation. In mixed text, each ASCII character is exactly one
+    # byte, and every byte of a non-ASCII UTF-8 sequence is >= 128.
+    if text.isascii():
+        return (len(text) + ASCII_CHARS_PER_TOKEN_ESTIMATE - 1) // ASCII_CHARS_PER_TOKEN_ESTIMATE
+    encoded = text.encode("utf-8")
+    ascii_chars = len(encoded.translate(None, _NON_ASCII_BYTES))
+    non_ascii_bytes = len(encoded) - ascii_chars
     ascii_tokens = (
         ascii_chars + ASCII_CHARS_PER_TOKEN_ESTIMATE - 1
     ) // ASCII_CHARS_PER_TOKEN_ESTIMATE

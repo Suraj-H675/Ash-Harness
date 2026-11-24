@@ -1,5 +1,6 @@
 """Tests for token counting and rate limiting (Sprint 5)."""
 
+import random
 import time
 
 import pytest
@@ -7,6 +8,7 @@ import pytest
 from ash.context.tokens import (
     AnthropicTokenCounter,
     OpenAITokenCounter,
+    estimate_text_tokens,
     get_token_counter,
 )
 from ash.providers.rate_limiter import TokenBucketRateLimiter
@@ -189,3 +191,33 @@ async def test_rate_limiter_acquire_rejects_overcapacity_request() -> None:
 
     with pytest.raises(ValueError, match="exceeds bucket capacity"):
         await limiter.acquire(10)
+
+
+def test_offline_estimate_matches_previous_formula_for_mixed_unicode() -> None:
+    def previous(text: str) -> int:
+        ascii_chars = sum(character.isascii() for character in text)
+        return (ascii_chars + 2) // 3 + len(text.encode("utf-8")) - ascii_chars
+
+    corpus = [
+        "", "a", "ab", "abc", "abcd", "\x00\r\n\x7f", "\u0080\u07ff\u0800",
+        "e\u0301", "漢字🙂\u200d🧑\ufe0f", "abc日本語", "a🙂b🙂c🙂d",
+        "def f(x):\n    return x + 1\n" * 1000,
+        "# café 中文🙂\n" * 1000,
+        "".join(chr(i) for i in range(128)),
+    ]
+    rng = random.Random(33)
+    for _ in range(250):
+        length = rng.randrange(256)
+        codepoints = (rng.randrange(0x110000) for _ in range(length))
+        corpus.append("".join(chr(cp) for cp in codepoints if not 0xD800 <= cp <= 0xDFFF))
+        corpus.append("".join(rng.choices("abc\t\n\x00é漢🙂\u0301", k=length)))
+        corpus.append("".join(chr(rng.randrange(128)) for _ in range(length)))
+    for text in corpus:
+        assert estimate_text_tokens(text) == previous(text)
+
+
+def test_offline_estimate_does_not_silently_replace_invalid_utf8() -> None:
+    # Preserve the previous behavior rather than admitting malformed text by
+    # counting a replacement character that was never in the request.
+    with pytest.raises(UnicodeEncodeError):
+        estimate_text_tokens("prefix\ud800suffix")
