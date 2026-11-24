@@ -182,6 +182,11 @@ def parse_slash_command(text: str) -> tuple[SlashCommand, list[str]] | None:
 
     if not text.startswith("/"):
         return None
+    # A reasoning-window handoff is user-authored prose/code, not a shell
+    # argument list. Keep its quotes, backslashes and internal whitespace.
+    head = text[1:].split(maxsplit=1)
+    if head and head[0].casefold() == "restart-context":
+        return _COMMAND_LOOKUP["restart-context"], head[1:]
     try:
         parts = shlex.split(text[1:])
     except ValueError as exc:

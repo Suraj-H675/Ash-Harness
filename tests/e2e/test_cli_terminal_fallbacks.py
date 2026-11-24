@@ -521,7 +521,8 @@ def test_restart_context_in_real_repl_preserves_parent_and_permission_mode(
 
     try:
         _read_until(master, process, captured, b"> ", timeout=30)
-        os.write(master, b"/restart-context Verify the current code before edits\r")
+        handoff = r'''Don't change "quoted  text" or r"\d+"; verify before edits.'''
+        os.write(master, ("/restart-context " + handoff + "\r").encode())
         _read_until(
             master, process, captured,
             b"Started a new reasoning window", timeout=30,
@@ -537,7 +538,7 @@ def test_restart_context_in_real_repl_preserves_parent_and_permission_mode(
         assert child.context_summary == ""
         assert len(child.messages) == 1
         assert child.messages[0].role == "user"
-        assert "Verify the current code before edits" in child.messages[0].content
+        assert child.messages[0].content.endswith(handoff)
         assert "Prior conversation" not in child.messages[0].content
         assert store.load_session(parent.session_id).messages == parent_before.messages
 

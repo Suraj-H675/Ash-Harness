@@ -19,9 +19,6 @@ def test_parse_alias_and_quoted_argument() -> None:
 
     alias, _ = parse_slash_command("/clear")
     assert alias.name == "new"
-    command, arguments = parse_slash_command('/restart-context "Fix the two-module issue next"')
-    assert command.name == "restart-context"
-    assert arguments == ["Fix the two-module issue next"]
     native, native_args = parse_slash_command("/compact-native")
     assert native.name == "compact-native"
     assert native_args == []
@@ -37,6 +34,29 @@ def test_parse_alias_and_quoted_argument() -> None:
     for text, canonical in expected_aliases.items():
         parsed, _ = parse_slash_command(text)
         assert parsed.name == canonical
+
+
+
+@pytest.mark.parametrize("handoff", [
+    "Don't repeat the previous command.",
+    'Preserve "quoted  text" and the  spaces.',
+    r'Inspect r"\d+" and C:\example\file.',
+    '"Fix the two-module issue next"',
+    "Unmatched quote: '",
+    "First line\nSecond line\twith tab",
+])
+def test_restart_context_parses_literal_handoff(handoff: str) -> None:
+    command, arguments = parse_slash_command("/ReStArT-CoNtExT " + handoff)
+    assert command.name == "restart-context"
+    assert arguments == [handoff]
+
+
+def test_restart_context_empty_handoff_and_other_command_syntax() -> None:
+    command, arguments = parse_slash_command("/restart-context  ")
+    assert command.name == "restart-context"
+    assert arguments == []
+    with pytest.raises(ValueError, match="Invalid command syntax"):
+        parse_slash_command("/rename unmatched '")
 
 
 def test_unknown_command_has_helpful_error() -> None:

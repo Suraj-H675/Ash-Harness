@@ -366,6 +366,10 @@ whole coding task finished.
 
 Inspect the workspace and any recovery warnings before opening a new reasoning
 window. In the interactive terminal, use `/restart-context <explicit handoff>`.
+Enter the handoff as literal text: quotes, backslashes, and internal whitespace
+are retained, rather than interpreted as shell argument syntax. There is no
+need to wrap the whole handoff in quotes. The stored handoff still passes the
+normal size, control-character, and secret-redaction checks.
 From the source workspace, the equivalent one-shot workflow is:
 
 ```bash
