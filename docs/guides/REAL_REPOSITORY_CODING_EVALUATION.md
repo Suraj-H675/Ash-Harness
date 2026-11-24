@@ -242,6 +242,24 @@ A correct repair with a green oracle but an unfinished/timed-out turn remains
 engine outcomes. `comparison_verified` verifies comparability of the recorded
 inputs and provenance, not that either coding task succeeded.
 
+New Ash receipts (`completion_evidence_version: 1`) additionally require a
+recorded successful terminal sequence. Ordinary completion, explicitly
+requested command checkpoints, and bounded context recovery each have distinct
+accepted terminal sequences; an absent event, incomplete stop, or inconsistent
+restart count cannot prove completion. The comparator checks this evidence
+rather than trusting the claimed grade. Older receipts retain their original
+rubric and report unknown completion verification.
+
+`observed_edit_after_passing_test` is diagnostic only: `true` means an observed
+successful edit follows the last passing exact QA command in the recorded
+order, `false` means none was observed, and `null` means no passing test or
+usable trace. Ash reports recorded edit-tool calls; native Codex reports
+completed `file_change` items. Native shell commands can also modify files,
+and neither signal attests the tested file hashes. The independent graders
+still test the final source. This field does not alter scores, impose a new
+asymmetric requirement, or claim final-source test freshness from absence of
+an observed edit.
+
 The flag authorizes **every Ash and Codex model run in the selected batch**
 (up to six pairs), not merely one child. Never reuse it without a fresh
 correspondingly scoped owner approval. Missing authorization fails without

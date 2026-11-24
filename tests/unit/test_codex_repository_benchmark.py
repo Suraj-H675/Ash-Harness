@@ -1367,3 +1367,27 @@ def test_unrecognized_or_nested_tool_trace_is_not_evidence_of_isolation(tmp_path
     trace.write_text(json.dumps(event) + "\n")
     with pytest.raises(ValueError):
         summarize_codex_events(trace, "python3 -B qa_visible.py")
+
+
+@pytest.mark.parametrize("sequence,expected", [
+    (["edit"], None), (["edit", "test"], False), (["edit", "test", "edit"], True),
+    (["test", "edit", "test"], False), (["test", "edit", "failed-test"], True),
+    (["test", "failed-edit"], False), (["test", "shell"], False),
+])
+def test_native_observed_edit_after_passing_test(tmp_path, sequence, expected) -> None:
+    log = tmp_path / "trace.jsonl"
+    events = []
+    for i, step in enumerate(sequence):
+        item = {"id": str(i), "status": "completed"}
+        if step in {"edit", "failed-edit"}:
+            item.update(type="file_change", changes=[{"path": "module.py", "kind": "update"}])
+            if step == "failed-edit":
+                item["status"] = "failed"
+        else:
+            item.update(type="command_execution", command=("python3 -B qa_visible.py"
+                        if step != "shell" else "python arbitrary.py"),
+                        exit_code=1 if step == "failed-test" else 0)
+        events.append({"type": "item.completed", "item": item})
+    log.write_text("\n".join(map(json.dumps, events)) + "\n")
+    assert summarize_codex_events(log, "python3 -B qa_visible.py")[
+        "observed_edit_after_passing_test"] is expected

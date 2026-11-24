@@ -4544,6 +4544,49 @@ def _stop_evaluation_child(child: subprocess.Popen[bytes]) -> int:
     return child.wait(timeout=5)
 
 
+def ash_completion_verified(receipt: dict[str, object]) -> bool:
+    """Require a supported terminal sequence for a new, versioned receipt."""
+    requested = receipt.get("requested_context_continuations")
+    restarts = receipt.get("context_continuations")
+    sessions = receipt.get("session_count")
+    if (
+        type(requested) is not int or requested not in (0, 1, 2)
+        or type(restarts) is not int or not 0 <= restarts <= requested
+        or type(sessions) is not int or sessions != restarts + 1
+    ):
+        return False
+    terminals = receipt.get("terminal_events")
+    reason = receipt.get("terminal_stop_reason")
+    prefix = ["turn.error"] * restarts
+    if terminals == prefix + ["turn.completed"]:
+        return reason == "completed" or (
+            reason == "owner_command_checkpoint"
+            and receipt.get("requested_report_after_visible_check") is True
+        )
+    return (
+        restarts < requested
+        and terminals == prefix + ["turn.error", "turn.finalized.tool_free"]
+        and reason == "tool_free_finalization"
+    )
+
+
+def observed_edit_after_passing_test(
+    calls: list[dict[str, object]], exact_test: str,
+) -> bool | None:
+    """Observed tool-call order, not a hash attestation of the tested bytes."""
+    after_test: bool | None = None
+    for call in calls:
+        if call.get("executed") is not True or call.get("success") is not True:
+            continue
+        if (call.get("tool") == "run_command" and call.get("command") == exact_test
+                and type(call.get("exit_code")) is int and call["exit_code"] == 0):
+            after_test = False
+        elif (after_test is not None and isinstance(call.get("tool"), str)
+              and call["tool"] in EDIT_TOOL_NAMES):
+            after_test = True
+    return after_test
+
+
 def collect_coding_session_receipts(
     store: SessionStore, workspace: Path,
 ) -> dict[str, object]:
@@ -4587,11 +4630,22 @@ def collect_coding_session_receipts(
         usage["completion_tokens"] += used.completion_tokens
         events.extend(store.list_runtime_events(session.session_id, limit=10_000))
     events.sort(key=lambda entry: entry.sequence)
-    terminals = [
-        str(row.event.get("type"))
-        for row in events
-        if row.event.get("type") in {"turn.completed", "turn.cancelled", "turn.error"}
+    terminal_rows = [
+        row.event for row in events
+        if row.event.get("type") in {
+            "turn.completed", "turn.cancelled", "turn.error", "turn.finalized.tool_free",
+        }
     ]
+    terminals = [str(event["type"]) for event in terminal_rows]
+    terminal_stop_reason = None
+    if terminal_rows:
+        last = terminal_rows[-1]
+        if last["type"] == "turn.completed" and isinstance(last.get("stop_reason"), str):
+            terminal_stop_reason = last["stop_reason"]
+        elif (last["type"] == "turn.finalized.tool_free"
+              and type(last.get("tool_calls_executed")) is int
+              and last["tool_calls_executed"] == 0):
+            terminal_stop_reason = "tool_free_finalization"
     return {
         "calls": calls,
         "audit_ok": audit_ok,
@@ -4601,6 +4655,7 @@ def collect_coding_session_receipts(
         "usage": usage,
         "events": summarize_operational_events(events),
         "terminals": terminals,
+        "terminal_stop_reason": terminal_stop_reason,
     }
 
 
@@ -4839,6 +4894,11 @@ def run_task(
             "visible_test_command_count": visible_test_command_count,
             "audit_ok": audit_ok,
             "terminal_events": terminals,
+            "terminal_stop_reason": aggregated["terminal_stop_reason"],
+            "completion_evidence_version": 1,
+            "observed_edit_after_passing_test": observed_edit_after_passing_test(
+                calls, task.command_grant,
+            ),
             "usage": usage,
             "tool_calls": calls,
             "performance": event_stats,
@@ -4857,6 +4917,8 @@ def run_task(
                 and audit_ok
             ),
         }
+        result["completion_verified"] = ash_completion_verified(result)
+        result["passed"] = bool(result["passed"] and result["completion_verified"])
         (evidence / "result.json").write_text(json.dumps(result, indent=2) + "\n")
     result["scratch_removed"] = True
     result["credential_home_removed"] = True

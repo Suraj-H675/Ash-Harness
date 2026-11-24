@@ -345,8 +345,9 @@ def summarize_codex_events(log: Path, exact_test: str | None) -> dict[str, Any]:
     routing_errors = 0
     substantive_events = 0
     host_connector_event_count = 0
+    last_file_change = -1
     with log.open(encoding="utf-8") as stream:
-        for line in stream:
+        for sequence, line in enumerate(stream):
             event = json.loads(line)
             if not isinstance(event, dict):
                 raise ValueError("Codex event was not an object")
@@ -392,6 +393,10 @@ def summarize_codex_events(log: Path, exact_test: str | None) -> dict[str, Any]:
             if isinstance(item, dict) and item.get("type") != "error":
                 if kind in {"item.started", "item.updated", "item.completed", "item.failed"}:
                     substantive_events += 1
+            if (kind == "item.completed" and isinstance(item, dict)
+                    and item.get("type") == "file_change" and item.get("status") == "completed"
+                    and isinstance(item.get("changes"), list) and item["changes"]):
+                last_file_change = sequence
             if (
                 kind not in {"item.started", "item.updated", "item.completed", "item.failed"}
                 or not isinstance(item, dict)
@@ -444,6 +449,7 @@ def summarize_codex_events(log: Path, exact_test: str | None) -> dict[str, Any]:
                     completed=True,
                     status=item.get("status"),
                     exit_code=item.get("exit_code"),
+                    completion_sequence=sequence,
                 )
 
     test_records = (
@@ -454,12 +460,17 @@ def summarize_codex_events(log: Path, exact_test: str | None) -> dict[str, Any]:
         if exact_test is not None
         else []
     )
-    visible_test_command_passed = any(
-        item["completed"]
-        and item["status"] == "completed"
-        and type(item["exit_code"]) is int
-        and item["exit_code"] == 0
-        for item in test_records
+    passing_tests = [
+        item for item in test_records
+        if item["completed"] and item["status"] == "completed"
+        and type(item["exit_code"]) is int and item["exit_code"] == 0
+    ]
+    visible_test_command_passed = bool(passing_tests)
+    # Native shell commands can also mutate files. This is only an observed
+    # file_change completion; absence is not proof of final-source freshness.
+    observed_edit_after_test = (
+        last_file_change > max(item["completion_sequence"] for item in passing_tests)
+        if passing_tests else None
     )
     command_count = len(command_items)
     return {
@@ -467,6 +478,7 @@ def summarize_codex_events(log: Path, exact_test: str | None) -> dict[str, Any]:
         "shell_non_test_commands": command_count - len(test_records),
         "visible_test_command_executed": bool(test_records),
         "visible_test_command_passed": visible_test_command_passed,
+        "observed_edit_after_passing_test": observed_edit_after_test,
         "visible_test_command_count": len(test_records),
         "host_connector_invocation_observed": host_connector_event_count > 0,
         "host_connector_event_count": host_connector_event_count,
@@ -902,6 +914,7 @@ def run_task(
                 "shell_non_test_commands": None,
                 "visible_test_command_executed": None,
                 "visible_test_command_passed": None,
+                "observed_edit_after_passing_test": None,
                 "visible_test_command_count": None,
                 "host_connector_invocation_observed": None,
                 "host_connector_event_count": None,

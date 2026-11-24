@@ -393,6 +393,8 @@ def test_pair_alternates_order_and_validates_external_receipts(
             "correct_source": True,
             "visible_test_command_executed": True,
             "visible_test_command_passed": True,
+            "observed_edit_after_passing_test": None,
+            "completion_verified": None,
             "cli_complete": True,
             "timed_out": False,
             "scored_pass": True,
@@ -401,6 +403,7 @@ def test_pair_alternates_order_and_validates_external_receipts(
             "correct_source": True,
             "visible_test_command_executed": True,
             "visible_test_command_passed": True,
+            "observed_edit_after_passing_test": False,
             "host_connector_isolation_verified": True,
             "host_connector_invocation_observed": False,
             "score_eligible": True,
@@ -465,6 +468,8 @@ def test_pair_preserves_correct_code_and_test_but_failed_completion(
             "correct_source": False,
             "visible_test_command_executed": False,
             "visible_test_command_passed": False,
+            "observed_edit_after_passing_test": None,
+            "completion_verified": None,
             "cli_complete": False,
             "timed_out": False,
             "scored_pass": False,
@@ -473,6 +478,7 @@ def test_pair_preserves_correct_code_and_test_but_failed_completion(
             "correct_source": True,
             "visible_test_command_executed": True,
             "visible_test_command_passed": True,
+            "observed_edit_after_passing_test": False,
             "host_connector_isolation_verified": True,
             "host_connector_invocation_observed": False,
             "score_eligible": True,
@@ -727,3 +733,42 @@ def test_r23b_rejects_inconsistent_evidence_without_model(tmp_path: Path, fault:
     result = run_pair(task, 1, tmp_path, 300, 32768, invoke=fake_invoke, authorize_model_trial=True)
     assert result["comparison_verified"] is False
     assert result["score_eligible"] is False
+
+
+@pytest.mark.parametrize("fault,eligible", [
+    ("none", True), ("missing_terminal", False), ("contradictory_terminal", False),
+    ("invalid_version", False), ("missing_claim", False), ("genuine_incomplete", True),
+])
+def test_versioned_ash_completion_evidence_in_pair(tmp_path: Path, fault: str, eligible: bool) -> None:
+    task = "h11-chunk-footer"
+
+    def fake_invoke(_argv: list[str], evidence: Path) -> int:
+        _emit_receipt(task, evidence)
+        if evidence.name != "ash":
+            return 0
+        path = evidence / "result.json"
+        data = json.loads(path.read_text())
+        data.update(completion_evidence_version=1, completion_verified=True,
+                    terminal_events=["turn.completed"], terminal_stop_reason="completed",
+                    requested_context_continuations=0, context_continuations=0, session_count=1)
+        if fault == "missing_terminal":
+            data.pop("terminal_events")
+        elif fault == "contradictory_terminal":
+            data["terminal_stop_reason"] = "iteration_limit"
+        elif fault == "invalid_version":
+            data["completion_evidence_version"] = True
+        elif fault == "missing_claim":
+            data.pop("completion_verified")
+        elif fault == "genuine_incomplete":
+            data.update(passed=False, exit_code=1, terminal_events=["turn.error"],
+                        terminal_stop_reason=None, completion_verified=False)
+        path.write_text(json.dumps(data))
+        return 1 if fault == "genuine_incomplete" else 0
+
+    result = run_pair(task, 1, tmp_path, 300, 32768, invoke=fake_invoke, authorize_model_trial=True)
+    assert result["comparison_verified"] is eligible
+    assert result["score_eligible"] is eligible
+    if fault == "genuine_incomplete":
+        assert result["ash_pass"] is False
+        assert result["engine_outcomes"]["ash"]["completion_verified"] is False
+        assert result["engine_outcomes"]["ash"]["cli_complete"] is False

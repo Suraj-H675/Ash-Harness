@@ -17,7 +17,9 @@ from codex_repository_benchmark import (
 )
 from repository_benchmark import (
     TASKS,
+    ash_completion_verified,
     hidden_oracle_sha256,
+    observed_edit_after_passing_test,
     shared_user_prompt,
     task_evidence_classification,
 )
@@ -415,8 +417,32 @@ def compare(ash_dir: Path, codex_dir: Path) -> dict[str, Any]:
     # evidence is not a failure score, it is ineligible for comparison.
     codex_claimed_pass = _recorded_bool(codex, "passed")
     ash_claimed_pass = _recorded_bool(ash, "passed")
+    # Old receipts retain their original rubric. A versioned receipt cannot
+    # claim completion merely by supplying a successful subprocess exit.
+    completion_version = ash.get("completion_evidence_version")
+    completion_verified = (
+        ash_completion_verified(ash)
+        if type(completion_version) is int and completion_version == 1 else None
+    )
+    legacy_completion = (
+        "completion_evidence_version" not in ash
+        and "completion_verified" not in ash
+    )
+    completion_consistent = legacy_completion or (
+        completion_verified is not None
+        and _recorded_bool(ash, "completion_verified") is completion_verified
+        and (not ash_claimed_pass or completion_verified)
+    )
+    ash_calls = ash.get("tool_calls")
+    observed_ash_edit = (
+        observed_edit_after_passing_test(ash_calls, exact_test)
+        if isinstance(exact_test, str) and exact_test
+        and isinstance(ash_calls, list) and all(isinstance(c, dict) for c in ash_calls)
+        else None
+    )
     score_claims_consistent = bool(
-        codex_claimed_pass is not None and ash_claimed_pass is not None
+        completion_consistent
+        and codex_claimed_pass is not None and ash_claimed_pass is not None
         and (
             not codex_claimed_pass
             or (
@@ -510,7 +536,10 @@ def compare(ash_dir: Path, codex_dir: Path) -> dict[str, Any]:
             "visible_test_command_passed": _recorded_bool(
                 ash, "visible_test_command_passed"
             ),
-            "cli_complete": ash.get("exit_code") == 0 and ash.get("timed_out") is False,
+            "completion_verified": completion_verified,
+            "observed_edit_after_passing_test": observed_ash_edit,
+            "cli_complete": ash.get("exit_code") == 0 and ash.get("timed_out") is False
+            and (legacy_completion or completion_verified is True),
             "timed_out": _recorded_bool(ash, "timed_out"),
             "scored_pass": ash.get("passed") is True,
             "elapsed_seconds": _numeric(ash, "elapsed_seconds"),
@@ -528,6 +557,10 @@ def compare(ash_dir: Path, codex_dir: Path) -> dict[str, Any]:
                 event_trace.get("visible_test_command_passed")
                 if event_trace_valid and event_trace is not None
                 else _recorded_bool(codex, "visible_test_command_passed")
+            ),
+            "observed_edit_after_passing_test": (
+                event_trace.get("observed_edit_after_passing_test")
+                if event_trace_valid and event_trace is not None else None
             ),
             "recorded_visible_test_command_executed": _recorded_bool(
                 codex, "visible_test_command_executed"

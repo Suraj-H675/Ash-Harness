@@ -219,6 +219,7 @@ def run_pair(
                     for field in (
                         "correct_source", "visible_test_command_executed",
                         "visible_test_command_passed",
+                        "observed_edit_after_passing_test", "completion_verified",
                         "host_connector_isolation_verified",
                         "host_connector_invocation_observed", "score_eligible",
                         "shell_command_policy_enforced",

@@ -1403,8 +1403,16 @@ def test_r17_preflight_records_exact_reference_paths_and_provenance(
         bench.preflight(task, tmp_path / "partial-red")
 
 
+@pytest.mark.parametrize("terminals,stop_reason,expected", [
+    (["turn.completed"], "completed", True),
+    ([], None, False),
+    (["turn.error"], None, False),
+    (["turn.completed"], "iteration_limit", False),
+    (["turn.completed", "turn.completed"], "completed", False),
+])
 def test_r17_ash_fake_grade_accepts_one_semantic_source_repair(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    terminals: list[str], stop_reason: str | None, expected: bool,
 ) -> None:
     task_name = "pytest-mixed-indirect-fixture-precedence"
     task = bench.TASKS[task_name]
@@ -1497,7 +1505,8 @@ def test_r17_ash_fake_grade_accepts_one_semantic_source_repair(
             "lineage_ok": True,
             "events": {},
             "usage": {"prompt_tokens": 100, "completion_tokens": 20},
-            "terminals": ["turn.completed"],
+            "terminals": terminals,
+            "terminal_stop_reason": stop_reason,
             "context_continuations": 0,
             "session_count": 1,
         },
@@ -1523,7 +1532,7 @@ def test_r17_ash_fake_grade_accepts_one_semantic_source_repair(
         context_tokens=32768,
         turn_token_budget=0,
     )
-    assert result["passed"] is True, result
+    assert result["passed"] is expected, result
     assert result["protected_files_unchanged"] is True
     assert result["required_sources_changed"] is True
     assert result["required_tools_succeeded"] is True
@@ -2092,3 +2101,87 @@ def test_markdown_definition_list_recursion_task_has_frozen_semantic_oracles() -
     assert task.hidden_source not in task.prompt and task.reference_fix_sha not in task.prompt
     compile(task.visible_source, "<visible>", "exec")
     compile(task.hidden_source, "<hidden>", "exec")
+
+
+@pytest.mark.parametrize("updates,expected", [
+    ({}, True),
+    ({"terminal_events": [], "terminal_stop_reason": None}, False),
+    ({"terminal_stop_reason": "token_budget"}, False),
+    ({"terminal_events": ["turn.error", "turn.completed"]}, False),
+    ({"terminal_events": ["turn.cancelled", "turn.completed"]}, False),
+    ({"terminal_events": ["turn.error", "turn.completed"],
+      "requested_context_continuations": 1, "context_continuations": 1, "session_count": 2}, True),
+    ({"terminal_events": ["turn.error", "turn.completed"],
+      "requested_context_continuations": 0, "context_continuations": 1, "session_count": 2}, False),
+    ({"session_count": 2}, False),
+    ({"context_continuations": True}, False),
+    ({"terminal_stop_reason": "owner_command_checkpoint"}, False),
+    ({"terminal_stop_reason": "owner_command_checkpoint",
+      "requested_report_after_visible_check": True}, True),
+    ({"terminal_events": ["turn.error", "turn.finalized.tool_free"],
+      "terminal_stop_reason": "tool_free_finalization", "requested_context_continuations": 1}, True),
+    ({"terminal_events": ["turn.error", "turn.finalized.tool_free"],
+      "terminal_stop_reason": "tool_free_finalization"}, False),
+    ({"terminal_events": ["turn.finalized.tool_free"],
+      "terminal_stop_reason": "tool_free_finalization", "requested_context_continuations": 1}, False),
+    ({"terminal_events": ["turn.error", "turn.error", "turn.finalized.tool_free"],
+      "terminal_stop_reason": "tool_free_finalization", "requested_context_continuations": 2,
+      "context_continuations": 1, "session_count": 2}, True),
+])
+def test_completion_requires_supported_terminal_sequence(updates, expected) -> None:
+    receipt = {"terminal_events": ["turn.completed"], "terminal_stop_reason": "completed",
+               "requested_context_continuations": 0, "context_continuations": 0,
+               "session_count": 1, "requested_report_after_visible_check": False}
+    receipt.update(updates)
+    assert bench.ash_completion_verified(receipt) is expected
+
+
+def test_observed_edit_after_passing_test_uses_last_successful_exact_command() -> None:
+    edit = {"tool": "replace_file_content", "success": True, "executed": True}
+    passing = {"tool": "run_command", "success": True, "executed": True,
+               "exit_code": 0, "command": "python3 -B qa_visible.py"}
+    command = passing["command"]
+    assert bench.observed_edit_after_passing_test([edit], command) is None
+    assert bench.observed_edit_after_passing_test([edit, passing], command) is False
+    assert bench.observed_edit_after_passing_test([edit, passing, edit], command) is True
+    assert bench.observed_edit_after_passing_test([edit, passing, edit, passing], command) is False
+    assert bench.observed_edit_after_passing_test([
+        passing, edit, {**passing, "exit_code": 1, "success": False},
+        {**passing, "command": "other command"}, {**passing, "exit_code": False},
+    ], command) is True
+    assert bench.observed_edit_after_passing_test([
+        passing, {**edit, "executed": False}, {**edit, "success": False},
+        {"tool": [], "success": True, "executed": True},
+    ], command) is False
+
+
+@pytest.mark.parametrize("event,reason,expected", [
+    ({"type": "turn.completed", "stop_reason": "completed"}, "completed", True),
+    ({"type": "turn.completed", "stop_reason": "iteration_limit"}, "iteration_limit", False),
+    ({"type": "turn.finalized.tool_free", "tool_calls_executed": 0}, "tool_free_finalization", True),
+    ({"type": "turn.finalized.tool_free", "tool_calls_executed": False}, None, False),
+    ({"type": "turn.finalized.tool_free", "tool_calls_executed": 1}, None, False),
+])
+def test_completion_receipt_reads_durable_terminal_evidence(tmp_path, event, reason, expected) -> None:
+    from ash.core.session import SessionStore
+
+    store = SessionStore(tmp_path / "session.db")
+    session = store.create_session(str(tmp_path))
+    store.start_turn(session.session_id, "original", "repair")
+    tool_free = event["type"] == "turn.finalized.tool_free"
+    if tool_free:
+        store.interrupt_turn("original")
+        store.save_runtime_events([{"type": "turn.error", "session_id": session.session_id,
+                                    "turn_id": "original"}])
+        store.start_turn(session.session_id, "final", "report")
+    turn_id = "final" if tool_free else "original"
+    store.complete_turn(turn_id)
+    store.save_runtime_events([{**event, "session_id": session.session_id, "turn_id": turn_id}])
+    data = bench.collect_coding_session_receipts(store, tmp_path)
+    assert data["terminal_stop_reason"] == reason
+    assert data["terminals"] == (["turn.error"] if tool_free else []) + [event["type"]]
+    assert bench.ash_completion_verified({
+        "terminal_events": data["terminals"], "terminal_stop_reason": data["terminal_stop_reason"],
+        "requested_context_continuations": int(tool_free),
+        "context_continuations": data["context_continuations"], "session_count": data["session_count"],
+    }) is expected
