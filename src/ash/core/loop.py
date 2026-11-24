@@ -7263,15 +7263,50 @@ class AshLoop:
             }
             self._emit_event({"type": "tool.requested", **event_base})
 
+            def can_attest_navigation_rejection() -> bool:
+                if not self._safe_edit_preflight or tool is None or tool.name != tool_name:
+                    return False
+                from ash.hooks.registry import HookRegistry
+                from ash.tools.filesystem import ReadFileTool, ReadFilesTool
+                from ash.tools.search import GlobFilesTool, ListDirectoryTool, SearchTextTool
+
+                hooks = self._active_hooks()
+                return (
+                    type(tool) in (
+                        ReadFileTool, ReadFilesTool, GlobFilesTool,
+                        ListDirectoryTool, SearchTextTool,
+                    )
+                    and (hooks is None or (
+                        type(hooks) is HookRegistry and not hooks.has_registered_hooks
+                    ))
+                    and self.on_tool_approval is None
+                    and not self.ui.has_approval_callback
+                )
+
             async def reject_invalid_call(
                 *,
                 error: str,
                 provider_error: str | None = None,
                 breaker_failure: bool = True,
+                navigation_rejection: Literal[
+                    "invalid_arguments", "invalid_search", "navigation_budget"
+                ] | None = None,
             ) -> None:
                 """Persist a pre-dispatch refusal without granting approval."""
 
                 record.error = error
+                safe_rejection = (
+                    navigation_rejection is not None
+                    and can_attest_navigation_rejection()
+                    and self.permission_policy.evaluate(
+                        tool_name, deepcopy(arguments)
+                    ).action != PolicyAction.DENY
+                )
+                if safe_rejection:
+                    # The exact built-in never reached approval, tool hooks,
+                    # middleware or dispatch. Record explicit failure plus
+                    # a runtime-owned audit witness; do not authorize replay.
+                    record.success = False
                 if not defer_terminal_persistence:
                     self.session_store.save_tool_call(
                         session.session_id,
@@ -7288,6 +7323,10 @@ class AshLoop:
                         "call_id": record.call_id,
                         "arguments": record.arguments,
                         "error": record.error,
+                        **({
+                            "automatic_context_safe_rejection": navigation_rejection,
+                            "dispatched": False,
+                        } if safe_rejection else {}),
                     },
                     result="FAILURE",
                 )
@@ -7310,13 +7349,14 @@ class AshLoop:
                         result=result_payload,
                     )
                 results.append(result_payload)
-                await self._fire_tool_error_hook(
-                    session,
-                    call_id=record.call_id,
-                    tool_name=tool_name,
-                    arguments=record.arguments,
-                    error=record.error,
-                )
+                if not safe_rejection:
+                    await self._fire_tool_error_hook(
+                        session,
+                        call_id=record.call_id,
+                        tool_name=tool_name,
+                        arguments=record.arguments,
+                        error=record.error,
+                    )
                 if breaker_failure:
                     record_breaker_outcome(tool_name, False)
 
@@ -7337,7 +7377,8 @@ class AshLoop:
                     error=_bounded_durable_tool_error(
                         f"Invalid tool arguments: {exc}",
                         fallback="Invalid tool arguments",
-                    )
+                    ),
+                    navigation_rejection="invalid_arguments",
                 )
                 continue
 
@@ -7368,8 +7409,25 @@ class AshLoop:
                     error=navigation_refusal,
                     provider_error=navigation_refusal,
                     breaker_failure=False,
+                    navigation_rejection="navigation_budget",
                 )
                 continue
+            if (
+                decision.action != PolicyAction.DENY
+                and can_attest_navigation_rejection()
+            ):
+                from ash.tools.search import SearchTextTool
+
+                if type(tool) is SearchTextTool:
+                    invalid_pattern = tool.preflight_pattern(**deepcopy(arguments))
+                    if invalid_pattern is not None:
+                        await reject_invalid_call(
+                            error=_bounded_durable_tool_error(
+                                invalid_pattern.error, fallback="Invalid search pattern"
+                            ),
+                            navigation_rejection="invalid_search",
+                        )
+                        continue
             if tool_name in {
                 "write_file",
                 "replace_file_content",

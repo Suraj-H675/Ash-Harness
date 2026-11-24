@@ -400,9 +400,19 @@ forks a fresh context without importing any reasoning items,
 tool results, approvals or tool dispatches. Automatic continuation is
 **refused** if the previous turn dispatched any shell command or other
 external tool, even when its result is known, or if it has ambiguous actions,
-unfinished edits or unverified external tasks. Only known-successful local
+unfinished edits or unverified external tasks. Known-successful local
 read/search tools, including `search_tools` catalog discovery, and direct
-workspace edit tools may precede an automatic handoff.
+workspace edit tools may precede an automatic handoff. Narrow exceptions
+cover proven harmless pre-dispatch rejections.
+While this option is active, the exact built-in navigation tools can record
+an invalid argument, invalid search pattern, or context-budget refusal as a
+known failure without approving, dispatching or executing the call. This
+requires the normal trusted runtime, no registered hooks or custom approval
+callbacks, and no applicable policy denial. The automatic fork checks the
+matching durable call and its audit witness within the same transaction as
+the parent audit-chain check. A missing, inconsistent or duplicate witness,
+a generic dispatched failure, an untrusted implementation or a denied action
+still prevents the fork. No rejected navigation call is replayed.
 While this option is active, the built-in `replace_file_content` tool also
 preflights an approved edit **before** tool dispatch, tool hooks or middleware.
 If the exact replacement is already invalid, Ash records a rejection without

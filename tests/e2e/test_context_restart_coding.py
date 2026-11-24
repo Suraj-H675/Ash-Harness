@@ -195,3 +195,140 @@ async def test_partial_edits_survive_context_restart_and_full_repair_is_verified
         assert approvals.count("run_command") == 1
     finally:
         await loop.aclose()
+
+
+@pytest.mark.asyncio
+async def test_opted_in_restart_after_harmless_navigation_rejections(tmp_path: Path) -> None:
+    """Ordinary coding mistakes must not turn a safe context restart into a dead end."""
+    from ash.config import AshConfig
+    from ash.core.checkpoints import FileCheckpointMiddleware
+    from ash.core.secret_middleware import SecretRedactionMiddleware
+    from ash.providers.replay_state import ProviderReplayCredentialIdentity
+    from ash.safety.grants import ArgumentMatcher, MatchOperator, PermissionRule, RuleEffect
+    from ash.tools.search import SearchTextTool
+
+    source_file = tmp_path / "module.py"
+    source_file.write_text("VALUE = 1\n", encoding="utf-8")
+    (tmp_path / "large.py").write_text("# source line\n" * 1500, encoding="utf-8")
+    command = shlex.quote(sys.executable) + " -c " + shlex.quote(
+        "from pathlib import Path; assert Path('module.py').read_text() == 'VALUE = 2\\n'; print('VERIFIED')"
+    )
+    task = "Change VALUE to 2 and verify using the permitted command: " + command
+
+    class Provider(ProviderABC):
+        model_name = "safe-completion-recovery"
+        _ash_declared_capabilities = ProviderCapabilities(
+            native_tools=True, context_window=32768, max_input_tokens=28768,
+            max_output_tokens=4000,
+        )
+
+        def __init__(self) -> None:
+            self.parent_requests = 0
+            self.child_requests = 0
+            self.states: list[list[dict]] = []
+
+        def count_tokens(self, text: str) -> int:
+            return max(1, (len(text) + 2) // 3)
+
+        def replay_credential_identity(self) -> ProviderReplayCredentialIdentity:
+            return ProviderReplayCredentialIdentity.from_secret(
+                "synthetic-recovery-affinity", scope=(self.model_name,)
+            )
+
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            history = repr(messages)
+            if "Original user coding task (preserved verbatim)" in history:
+                assert not any(m.get("provider_state") for m in messages)
+                assert "edit-in-parent" not in history
+                self.child_requests += 1
+                assert source_file.read_text() == "VALUE = 2\n"
+                if self.child_requests == 1:
+                    calls = [{"id": "inspect-child", "name": "read_file",
+                              "arguments": {"file_path": "module.py"}}]
+                elif self.child_requests == 2:
+                    assert "VALUE = 2" in history
+                    calls = [{"id": "verify-child", "name": "run_command",
+                              "arguments": {"command_line": command}}]
+                else:
+                    assert self.child_requests == 3 and "VERIFIED" in history
+                    yield StreamChunk(content="Verified after safe recovery.", is_done=True)
+                    return
+                yield StreamChunk(native_tool_calls=calls, is_done=True)
+                return
+            assert [m["provider_state"] for m in messages if m.get("provider_state")] == self.states
+            self.parent_requests += 1
+            n = self.parent_requests
+            assert n < 20, "expected real context exhaustion"
+            if n == 1:
+                calls = [{"id": "edit-in-parent", "name": "replace_file_content",
+                          "arguments": {"file_path": "module.py", "target_content": "VALUE = 1",
+                                        "replacement_content": "VALUE = 2"}}]
+            elif n == 2:
+                calls = [{"id": "invalid-args", "name": "search_text",
+                          "arguments": {"pattern": "VALUE", "context_lines": 15}},
+                         {"id": "invalid-regex", "name": "search_text",
+                          "arguments": {"pattern": "("}},
+                         {"id": "stale-edit", "name": "replace_file_content",
+                          "arguments": {"file_path": "module.py", "target_content": "VALUE = 1",
+                                        "replacement_content": "VALUE = 99"}}]
+            else:
+                calls = [{"id": f"read-{n}", "name": "read_file",
+                          "arguments": {"file_path": "large.py", "max_chars": 16000}}]
+            state = [{"type": "reasoning", "id": f"parent-state-{n}", "summary": [],
+                      "status": "completed", "encrypted_content": "Q" * 6300}]
+            self.states.append(state)
+            yield StreamChunk(native_tool_calls=calls, provider_state=state, is_done=True)
+
+    guard = SafetyGuard(tmp_path)
+    store = SessionStore(tmp_path / "recovery.db")
+    provider = Provider()
+    loop = AshLoop(
+        store, provider, guard, HeadlessUI(output_format="text", stream=io.StringIO()),
+        tmp_path, tools={"read_file": ReadFileTool(guard), "search_text": SearchTextTool(guard),
+                         "replace_file_content": ReplaceFileContentTool(guard),
+                         "run_command": RunCommandTool(guard, project_root=tmp_path)},
+        config=AshConfig(model="custom/safe-completion-recovery", workspace_root=tmp_path,
+                         db_directory=tmp_path / "db", memory_backend="off",
+                         max_context_tokens=32768, max_completion_tokens=4000),
+        safety_tier="auto_approve",
+    )
+    # Keep the command authorization a user-owned exact grant; the restart
+    # must neither synthesize nor replay an approval.
+    command_rule = PermissionRule.create(RuleEffect.ALLOW, "run_command", (
+        ArgumentMatcher("command_line", MatchOperator.EXACT, command),
+    ))
+    loop.permission_policy.set_persistent_rules([command_rule])
+    def checkpoint_context():
+        if loop.current_session is None or loop.turn_context is None:
+            return None
+        return (loop.current_session.session_id, loop.turn_context.turn_id,
+                str(loop.turn_context.get("tool_call_id", "")))
+    loop.tool_middlewares.extend([
+        FileCheckpointMiddleware(store, guard, checkpoint_context), SecretRedactionMiddleware(),
+    ])
+    loop._safe_edit_preflight = True
+    try:
+        parent = await loop.start_session()
+        result = await run_with_context_continuation(loop, task, max_continuations=1)
+        assert result.response == "Verified after safe recovery." and result.context_continuations == 1
+        old = store.load_session(parent.session_id)
+        new = store.load_session(result.session_id)
+        assert new.parent_session_id == old.session_id
+        assert source_file.read_text() == "VALUE = 2\n"
+        assert sum(c.tool_name == "replace_file_content" and c.success is True for c in old.tool_calls) == 1
+        assert sum(c.tool_name == "run_command" and c.success is True for c in new.tool_calls) == 1
+        assert not any(c.tool_name == "run_command" for c in old.tool_calls)
+        assert all(not c.dispatched and not c.executed and not c.approved and c.success is False
+                   for c in old.tool_calls if c.call_id in {"invalid-args", "invalid-regex"})
+        assert any(c.tool_name == "read_file" and c.success is False and not c.dispatched
+                   for c in old.tool_calls)
+        stale = next(c for c in old.tool_calls if c.call_id == "stale-edit")
+        assert stale.approved and stale.success is False and not stale.dispatched and not stale.executed
+        command_approvals = [a for a in store.list_audit_logs(new.session_id)
+                             if a.action_type == "user_approval" and a.target_resource == "run_command"]
+        assert len(command_approvals) == 1
+        assert command_approvals[0].details["rule_id"] == command_rule.rule_id
+        assert [m.metadata["provider_state"] for m in old.messages if m.metadata.get("provider_state")] == provider.states
+        assert not store.verify_audit_log(old.session_id) and not store.verify_audit_log(new.session_id)
+    finally:
+        await loop.aclose()

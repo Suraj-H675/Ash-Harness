@@ -413,13 +413,8 @@ class SearchTextTool(BaseTool):
             root, args, single_file=stat.S_ISREG(metadata.st_mode)
         )
 
-    async def _python_fallback(
-        self,
-        root: Path,
-        args: SearchTextArgs,
-        *,
-        single_file: bool,
-    ) -> ToolResult:
+    @staticmethod
+    def _compile_pattern(args: SearchTextArgs) -> regex_engine.Pattern | ToolResult:
         flags = regex_engine.VERSION0
         if not args.case_sensitive:
             flags |= regex_engine.IGNORECASE
@@ -427,7 +422,7 @@ class SearchTextTool(BaseTool):
             regex_engine.escape(args.pattern) if args.fixed_strings else args.pattern
         )
         try:
-            regex = regex_engine.compile(expression, flags)
+            return regex_engine.compile(expression, flags)
         except regex_engine.error as exc:
             return ToolResult(
                 success=False,
@@ -437,6 +432,22 @@ class SearchTextTool(BaseTool):
                     "use fixed_strings=true for a literal search."
                 ),
             )
+
+    def preflight_pattern(self, **kwargs: Any) -> ToolResult | None:
+        """Validate a pattern without reading files or dispatching a tool."""
+        result = self._compile_pattern(SearchTextArgs(**kwargs))
+        return result if isinstance(result, ToolResult) else None
+
+    async def _python_fallback(
+        self,
+        root: Path,
+        args: SearchTextArgs,
+        *,
+        single_file: bool,
+    ) -> ToolResult:
+        regex = self._compile_pattern(args)
+        if isinstance(regex, ToolResult):
+            return regex
 
         capture_limit = (
             min(args.max_output_bytes, MAX_SEARCH_CONTEXT_CAPTURE_BYTES)

@@ -5016,3 +5016,56 @@ def test_rename_unknown_session_fails(tmp_path: Path) -> None:
     store = SessionStore(tmp_path / "sessions.db")
     with pytest.raises(KeyError, match="Session not found"):
         store.rename_session("missing", "name")
+
+
+@pytest.mark.parametrize("fault", [
+    "missing", "arguments", "error", "duplicate", "denial", "command", "dispatched",
+    "contradictory", "wrong_kind",
+])
+def test_automatic_context_restart_requires_matching_navigation_refusal_witness(
+    tmp_path: Path, fault: str,
+) -> None:
+    from ash.core.checkpoints import recover_interrupted_turns
+    from ash.safety.guard import SafetyGuard
+
+    store = SessionStore(tmp_path / "navigation-rejection.db")
+    source = store.create_session(str(tmp_path))
+    turn_id = "interrupted-coding"
+    store.start_turn(source.session_id, turn_id, "Inspect the source")
+    tool = {"command": "run_command", "wrong_kind": "read_file"}.get(fault, "search_text")
+    args = {"command_line": "untrusted"} if fault == "command" else (
+        {"file_path": "source.py"} if fault == "wrong_kind" else {"pattern": "("}
+    )
+    store.save_tool_call(source.session_id, ToolCallRecord(
+        call_id="rejected", tool_name=tool, arguments=args,
+        approved=fault == "dispatched", dispatched=fault == "dispatched",
+        executed=fault == "dispatched", success=False, error="invalid search",
+        result=None, timestamp=datetime.now(timezone.utc),
+    ), turn_id=turn_id)
+    details = {
+        "call_id": "rejected", "arguments": args if fault != "arguments" else {"pattern": "other"},
+        "error": "invalid search" if fault != "error" else "different error",
+        "automatic_context_safe_rejection": "invalid_search", "dispatched": False,
+    }
+    if fault != "missing":
+        for _ in range(2 if fault == "duplicate" else 1):
+            store.append_audit_log(
+                source.session_id, action_type="safety_block" if fault == "denial" else "tool_call",
+                target_resource=tool, details=details,
+                result="BLOCKED_BY_GUARD" if fault == "denial" else "FAILURE",
+            )
+    if fault == "contradictory":
+        store.append_audit_log(
+            source.session_id, action_type="safety_block", target_resource=tool,
+            details={"call_id": "rejected", "arguments": args}, result="BLOCKED_BY_GUARD",
+        )
+    assert not store.verify_audit_log(source.session_id)
+    store.interrupt_turn(turn_id)
+    recover_interrupted_turns(store, SafetyGuard(tmp_path), source.session_id,
+                              include_quiescent_interrupted=True)
+    with pytest.raises(SessionForkConflictError):
+        store.restart_context_session(
+            source.session_id, expected_project_path=tmp_path,
+            user_handoff="Inspect the source, no replay", automatic=True,
+        )
+    assert len(store.session_tree(source.session_id)) == 1

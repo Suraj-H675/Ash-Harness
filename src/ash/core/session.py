@@ -156,9 +156,11 @@ MAX_RECOVERY_ARGUMENT_PREVIEW_BYTES = 64 * 1024
 # An automatic context handoff may repeat the original *coding objective*,
 # never known external commands or opaque plugin effects. Direct workspace
 # edits remain under the existing file, policy, checkpoint and audit guards.
-AUTOMATIC_CONTEXT_HANDOFF_TOOLS = frozenset({
-    "read_file", "read_files", "search_text", "search_tools",
-    "list_dir", "glob_files", "git_status", "git_diff",
+AUTOMATIC_CONTEXT_NAVIGATION_TOOLS = frozenset({
+    "read_file", "read_files", "search_text", "list_dir", "glob_files",
+})
+AUTOMATIC_CONTEXT_HANDOFF_TOOLS = AUTOMATIC_CONTEXT_NAVIGATION_TOOLS | frozenset({
+    "search_tools", "git_status", "git_diff",
     "workspace_diff",
     "write_file", "replace_file_content", "replace_file_edits", "whole_edit",
     "apply_patch",
@@ -6171,20 +6173,21 @@ class SessionStore:
                             "SELECT status FROM turn_journal WHERE session_id = ?",
                             (session_id,),
                         ).fetchall()
-                        unsafe_call = conn.execute(
-                            "SELECT 1 FROM tool_calls WHERE session_id = ? "
+                        unresolved_calls = conn.execute(
+                            "SELECT call_id, tool_name, arguments_json, approved, dispatched, "
+                            "executed, success, result, error, exit_code "
+                            "FROM tool_calls WHERE session_id = ? "
                             "AND (tool_name NOT IN ("
                             + ",".join("?" for _ in AUTOMATIC_CONTEXT_HANDOFF_TOOLS)
                             + ") OR NOT (success IS 1 OR ("
                             "tool_name = 'replace_file_content' "
                             "AND approved = 1 AND dispatched = 0 "
-                            "AND executed = 0 AND success IS 0))) LIMIT 1",
+                            "AND executed = 0 AND success IS 0)))",
                             (session_id, *sorted(AUTOMATIC_CONTEXT_HANDOFF_TOOLS)),
-                        ).fetchone()
+                        ).fetchall()
                         if (
                             len(turn_rows) != 1
                             or turn_rows[0]["status"] != "interrupted"
-                            or unsafe_call is not None
                         ):
                             raise SessionForkConflictError(
                                 "automatic context handoff requires one "
@@ -6202,9 +6205,8 @@ class SessionStore:
                             (session_id,),
                         )
                         try:
-                            audit_errors = self._verify_audit_entries(
-                                _audit_record_from_row(row) for row in audit_rows
-                            )
+                            audit_records = [_audit_record_from_row(row) for row in audit_rows]
+                            audit_errors = self._verify_audit_entries(audit_records)
                         except (KeyError, TypeError, ValueError, OverflowError) as exc:
                             raise SessionForkConflictError(
                                 "automatic context handoff requires valid "
@@ -6215,6 +6217,47 @@ class SessionStore:
                                 "automatic context handoff requires valid "
                                 "source audit integrity"
                             )
+                        # Only admit a newly attested harmless refusal, never
+                        # a generic failure or a user/guard denial. The hash
+                        # chain and durable call identity are checked in this
+                        # same transaction before authorizing the fresh turn.
+                        witnesses: dict[str, list[AuditLogRecord]] = {}
+                        unresolved_ids = {row["call_id"] for row in unresolved_calls}
+                        for audit in audit_records:
+                            call_id = audit.details.get("call_id")
+                            # Include conflicting records, not only records
+                            # claiming the expected no-dispatch outcome.
+                            if isinstance(call_id, str) and call_id in unresolved_ids:
+                                witnesses.setdefault(call_id, []).append(audit)
+                        for row in unresolved_calls:
+                            matches = witnesses.get(row["call_id"], [])
+                            witness = matches[0] if len(matches) == 1 else None
+                            details = witness.details if witness is not None else {}
+                            marker = details.get("automatic_context_safe_rejection")
+                            if not (
+                                row["tool_name"] in AUTOMATIC_CONTEXT_NAVIGATION_TOOLS
+                                and row["approved"] == row["dispatched"] == row["executed"] == 0
+                                and row["success"] == 0
+                                and row["result"] is None
+                                and row["exit_code"] is None
+                                and isinstance(row["error"], str) and row["error"]
+                                and witness is not None
+                                and witness.target_resource == row["tool_name"]
+                                and witness.action_type == "tool_call"
+                                and witness.result == "FAILURE"
+                                and details.get("dispatched") is False
+                                and isinstance(marker, str)
+                                and (
+                                    marker in {"invalid_arguments", "navigation_budget"}
+                                    or (marker == "invalid_search" and row["tool_name"] == "search_text")
+                                )
+                                and details.get("arguments") == json.loads(row["arguments_json"])
+                                and details.get("error") == row["error"]
+                            ):
+                                raise SessionForkConflictError(
+                                    "automatic context handoff requires one reconciled coding "
+                                    "turn without external actions or unknown tool outcomes"
+                                )
                 total_count, retained, removed = _message_boundary_rows(
                     conn,
                     session_id,

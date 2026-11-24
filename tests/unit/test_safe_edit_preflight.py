@@ -304,3 +304,67 @@ async def test_permission_denial_is_not_upgraded_to_safe_preflight(
         assert (tmp_path / "module.py").read_text() == "before = 0\n"
     finally:
         await loop.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("boundary", ["disabled", "hook", "subclass", "deny", "callback"])
+async def test_navigation_rejection_attestation_refuses_untrusted_boundary(
+    tmp_path: Path, boundary: str,
+) -> None:
+    from ash.tools.search import SearchTextTool
+
+    guard = SafetyGuard(tmp_path)
+    hooks = None
+    marker = tmp_path / "hook-effect"
+    if boundary == "hook":
+        hooks = HookRegistry()
+        hooks.register_lifecycle(LifecycleHook(
+            event="tool_error", callback=lambda _payload: marker.write_text("effect"),
+        ))
+
+    class CustomSearch(SearchTextTool):
+        pass
+
+    tool = CustomSearch(guard) if boundary == "subclass" else SearchTextTool(guard)
+    loop = make_loop(tmp_path, hooks=hooks, tool=tool)
+    try:
+        session = await loop.start_session()
+        turn_id = "interrupted-navigation"
+        loop.session_store.start_turn(session.session_id, turn_id, "Find source")
+        loop.turn_context = TurnContext(session_id=session.session_id, turn_id=turn_id)
+        loop._safe_edit_preflight = boundary != "disabled"
+        if boundary == "deny":
+            loop.permission_policy.set_persistent_rules([
+                PermissionRule.create(RuleEffect.DENY, "search_text")
+            ])
+        if boundary == "callback":
+            async def approve(_name, _arguments):
+                raise AssertionError("approval must not run for invalid arguments")
+            loop.on_tool_approval = approve
+        # A policy denial must remain a denial even for a bad regex. Other
+        # cases exercise the shared schema-validation refusal path.
+        arguments = {"pattern": "("} if boundary == "deny" else {
+            "pattern": "value", "context_lines": 15,
+        }
+        results = await loop._execute_tool_calls([
+            {"call_id": "rejected-search", "name": "search_text", "arguments": arguments},
+        ], session, persist_tool_messages=True)
+        assert not results[0]["success"]
+        saved = loop.session_store.load_session(session.session_id).tool_calls[0]
+        assert saved.success is None and not saved.approved and not saved.dispatched and not saved.executed
+        audit = loop.session_store.list_audit_logs(session.session_id)
+        assert not any("automatic_context_safe_rejection" in a.details for a in audit)
+        assert marker.exists() == (boundary == "hook")
+        if boundary == "deny":
+            assert any(a.action_type == "safety_block" for a in audit)
+        loop.session_store.interrupt_turn(turn_id)
+        recover_interrupted_turns(loop.session_store, loop.safety_guard, session.session_id,
+                                  include_quiescent_interrupted=True)
+        with pytest.raises(SessionForkConflictError, match="without external actions"):
+            loop.session_store.restart_context_session(
+                session.session_id, expected_project_path=tmp_path,
+                user_handoff="Inspect source in a new window", automatic=True,
+            )
+        assert len(loop.session_store.session_tree(session.session_id)) == 1
+    finally:
+        await loop.aclose()
