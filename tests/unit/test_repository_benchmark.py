@@ -2018,3 +2018,45 @@ def test_r23b_allows_iterative_visible_test_runs_with_same_command() -> None:
     assert task.require_single_visible_test is False
     assert "you may repeat that exact command after edits" in task.prompt
     assert task.command_grant == "python3 -B qa_visible.py"
+
+
+def test_beartype_forward_scope_task_has_frozen_semantic_oracles() -> None:
+    task = bench.TASKS["beartype-forward-reference-namespace-isolation"]
+    assert task.source == "beartype/beartype"
+    assert task.upstream == "https://github.com/beartype/beartype.git"
+    assert task.base_sha == "aa5b766d9e9bdffdd0c83f7c6b99547c9ede6752"
+    assert task.reference_fix_sha == "bca8aebb579cfd2b0741d0b121ffa4199331c029"
+    assert task.upstream_pr == "https://github.com/beartype/beartype/pull/709"
+    assert task.license == "MIT" and task.runtime is None
+    assert task.editable == frozenset({
+        "beartype/_util/cls/utilclsget.py",
+        "beartype/_util/func/utilfuncframe.py",
+    })
+    assert task.expected_reference_paths == task.editable | {
+        "beartype_test/a00_unit/a20_util/func/test_utilfuncframe.py",
+        "beartype_test/a00_unit/a60_decor/a60_pep/test_decorpep435.py",
+    }
+    assert task.require_both_oracles_red_green
+    assert task.require_each_editable_ablation_red
+    assert not task.require_all_editable_changed
+    assert not task.require_single_visible_test
+    assert task.diagnostic_retake_of is None
+    assert task.command_grant == "python3 -B qa_visible.py"
+    assert task.visible_script == "qa_visible.py"
+    assert hashlib.sha256(task.visible_source.encode()).hexdigest() == (
+        "6313ff2aa30e4c1bec5c232492096dc93e1aec174408eb443bb6f5196f626c9c"
+    )
+    assert hashlib.sha256(task.hidden_source.encode()).hexdigest() == (
+        "0929746017c03bc717266983ad63899f7ade89d823d099b825297c84f81f56f2"
+    )
+    assert hashlib.sha256(bench.shared_user_prompt(task).encode()).hexdigest() == (
+        "f8fa2a5615f91146db4303ba6f507338c17940ff5f626a80f6f02cd25f49bb11"
+    )
+    assert bench.shared_user_prompt(task) == task.prompt
+    assert task.hidden_source not in task.prompt
+    assert task.reference_fix_sha not in task.prompt
+    assert "you may repeat that exact command after edits" in task.prompt
+    assert "using run_command" not in task.prompt
+    assert bench.task_evidence_classification(task) == "source-backed-task"
+    compile(task.visible_source, "<visible>", "exec")
+    compile(task.hidden_source, "<hidden>", "exec")

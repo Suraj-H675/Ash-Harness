@@ -2529,7 +2529,283 @@ PYTEST_MIXED_INDIRECT_HIDDEN_EXPECTED = json.dumps(
 )
 
 
+BEARTYPE_FORWARD_SCOPES_VISIBLE = r"""import sys
+from enum import Enum
+
+from beartype import beartype
+from beartype._util.cls.utilclsget import get_type_locals
+from beartype._util.func.utilfuncframe import get_frame_locals
+from beartype.roar import BeartypeCallHintParamViolation
+
+sentinel = object()
+
+
+def inspect_scope():
+    snapshot = get_frame_locals(sys._getframe(1))
+    assert isinstance(snapshot, dict) and snapshot['marker'] is sentinel
+    snapshot['marker'] = 'modified snapshot'
+    snapshot['added_by_probe'] = True
+
+
+class ClassBody:
+    marker = sentinel
+    inspect_scope()
+
+
+assert ClassBody.marker is sentinel
+assert 'added_by_probe' not in vars(ClassBody)
+
+
+class Envelope:
+    PENDING = sentinel
+
+    @beartype
+    class Status(Enum):
+        PENDING = 1
+        READY = 2
+
+        def describe(self, count: 'int') -> str:
+            return f'{self.name}:{count}'
+
+
+assert Envelope.PENDING is sentinel
+assert Envelope.__new__ is object.__new__
+assert isinstance(Envelope(), Envelope)
+assert 'describe' not in vars(Envelope) and '_member_map_' not in vars(Envelope)
+assert Envelope.Status.READY.describe(3) == 'READY:3'
+try:
+    Envelope.Status.READY.describe('3')
+except BeartypeCallHintParamViolation:
+    pass
+else:
+    raise AssertionError('quoted annotation no longer checks argument types')
+
+namespace = get_type_locals(Envelope.Status)
+assert set(namespace) == set(vars(Envelope.Status))
+assert namespace['__new__'] is vars(Envelope.Status)['__new__']
+print('BEARTYPE_FORWARD_SCOPES_VISIBLE_OK')
+"""
+
+
+BEARTYPE_FORWARD_SCOPES_HIDDEN = r"""import sys
+from collections.abc import Mapping
+from enum import Enum
+
+from beartype import beartype
+from beartype._util.cls.utilclsget import get_type_locals
+from beartype._util.func.utilfuncframe import get_frame_locals
+from beartype.roar import BeartypeCallHintParamViolation, BeartypeCallHintReturnViolation
+
+marker = object()
+
+
+def exercise_snapshots(frame):
+    first = get_frame_locals(frame)
+    second = get_frame_locals(frame)
+    assert isinstance(first, dict) and isinstance(second, dict)
+    assert first is not second
+    assert first['stable'] is marker and second['stable'] is marker
+    first['stable'] = 'replacement'
+    first['snapshot_only'] = 17
+    assert second['stable'] is marker and 'snapshot_only' not in second
+    assert frame.f_locals['stable'] is marker
+    assert 'snapshot_only' not in frame.f_locals
+
+
+def probe_caller():
+    exercise_snapshots(sys._getframe(1))
+
+
+# Test an independent module execution namespace, a normal function frame,
+# and a custom class namespace. Snapshots are shallow: object identity remains.
+module_scope = {'stable': marker, 'probe_caller': probe_caller}
+exec('probe_caller()', module_scope)
+assert module_scope['stable'] is marker and 'snapshot_only' not in module_scope
+
+
+def probe_function():
+    stable = marker
+    probe_caller()
+    assert stable is marker
+
+
+probe_function()
+
+
+class NamespaceMeta(type):
+    @classmethod
+    def __prepare__(mcls, name, bases):
+        return {}
+
+
+class Prepared(metaclass=NamespaceMeta):
+    stable = marker
+    probe_caller()
+
+
+assert Prepared.stable is marker and 'snapshot_only' not in vars(Prepared)
+
+
+class Parent:
+    inherited_only = marker
+
+
+class Child(Parent):
+    own = marker
+
+    def __new__(cls):
+        return object.__new__(cls)
+
+    @staticmethod
+    def method():
+        return 42
+
+
+# The helper must keep the complete directly declared namespace, including
+# __new__; no requirement on mappingproxy versus another read-only mapping.
+for cls in (Parent, Child):
+    direct = vars(cls)
+    actual = get_type_locals(cls)
+    assert isinstance(actual, Mapping)
+    assert set(actual) == set(direct)
+    assert all(actual[key] is direct[key] for key in direct)
+    try:
+        actual['probe_injection'] = marker
+    except Exception:
+        pass  # The task specifies read-only behavior, not an exception class.
+    else:
+        raise AssertionError('class namespace helper returned a writable mapping')
+    assert 'probe_injection' not in actual and 'probe_injection' not in direct
+assert '__new__' in get_type_locals(Child)
+assert 'inherited_only' not in get_type_locals(Child)
+
+
+def envelope_new(cls):
+    return object.__new__(cls)
+
+
+class Outer:
+    Alias = str
+    stable = marker
+    __new__ = envelope_new
+
+    @beartype
+    class Nested:
+        Alias = int
+        stable = 99
+
+        def __new__(cls):
+            return object.__new__(cls)
+
+        def twice(self, value: 'Alias') -> 'Alias':
+            return value * 2
+
+        def bad_return(self, value: 'Alias') -> 'Alias':
+            return str(value)
+
+
+assert Outer.Alias is str and Outer.stable is marker
+assert Outer.__new__ is envelope_new
+assert isinstance(Outer(), Outer)
+assert 'twice' not in vars(Outer) and 'bad_return' not in vars(Outer)
+assert Outer.Nested.Alias is int and Outer.Nested.stable == 99
+inner = Outer.Nested()
+assert inner.twice(7) == 14
+try:
+    inner.twice('seven')
+except BeartypeCallHintParamViolation:
+    pass
+else:
+    raise AssertionError('local class alias no longer validates input')
+try:
+    inner.bad_return(7)
+except BeartypeCallHintReturnViolation:
+    pass
+else:
+    raise AssertionError('local class alias no longer validates return')
+
+
+def make_family():
+    stable = marker
+
+    class Family:
+        RED = stable
+        BLUE = 'unrelated outer value'
+
+        @beartype
+        class Color(Enum):
+            RED = 10
+            BLUE = 20
+
+            def label(self, text: 'str') -> str:
+                return text + self.name
+
+    return Family
+
+
+family = make_family()
+assert family.RED is marker and family.BLUE == 'unrelated outer value'
+assert family.__new__ is object.__new__ and isinstance(family(), family)
+assert 'label' not in vars(family) and '_member_map_' not in vars(family)
+assert family.Color.BLUE.label('paint ') == 'paint BLUE'
+try:
+    family.Color.BLUE.label(42)
+except BeartypeCallHintParamViolation:
+    pass
+else:
+    raise AssertionError('nested enum argument validation lost')
+assert set(get_type_locals(family.Color)) == set(vars(family.Color))
+print('BEARTYPE_FORWARD_SCOPES_HIDDEN_OK')
+"""
+
+
 TASKS = {
+    "beartype-forward-reference-namespace-isolation": RepositoryTask(
+        source="beartype/beartype",
+        upstream="https://github.com/beartype/beartype.git",
+        base_sha="aa5b766d9e9bdffdd0c83f7c6b99547c9ede6752",
+        reference_fix_sha="bca8aebb579cfd2b0741d0b121ffa4199331c029",
+        editable=frozenset({
+            "beartype/_util/cls/utilclsget.py",
+            "beartype/_util/func/utilfuncframe.py",
+        }),
+        visible_script="qa_visible.py",
+        visible_source=BEARTYPE_FORWARD_SCOPES_VISIBLE,
+        hidden_source=BEARTYPE_FORWARD_SCOPES_HIDDEN,
+        command_grant="python3 -B qa_visible.py",
+        prompt=(
+            'Repair namespace isolation during quoted forward-reference resolution in '
+            'this pinned beartype repository. Decorating an inner class or enum can '
+            'overwrite existing attributes in its enclosing class or inject attributes '
+            'into that namespace. Preserve outer namespaces and constructors while '
+            'retaining correct runtime type checking of quoted annotations, including '
+            'aliases declared in the inner class. The internal get_frame_locals helper '
+            "must return a fresh mutable dictionary of a frame's local scope without "
+            'exposing the live namespace for modification (including class, module and '
+            'function frames); preserve the original values and their object identities. '
+            'The internal get_type_locals helper must provide a read-only mapping of all '
+            'directly declared class attributes, including __new__, without adding '
+            'inherited attributes. Do not disable annotation resolution or type checking '
+            'to avoid the bug. Inspect qa_visible.py and relevant production code. You '
+            'may change only beartype/_util/cls/utilclsget.py and '
+            'beartype/_util/func/utilfuncframe.py. Do not edit tests, metadata, or other '
+            'files. Run exactly python3 -B qa_visible.py as the only permitted test '
+            'command; you may repeat that exact command after edits. Read-only source '
+            'inspection commands are allowed. Do not run other tests or shell commands '
+            'that modify files.'
+        ),
+        upstream_pr="https://github.com/beartype/beartype/pull/709",
+        license="MIT",
+        require_all_editable_changed=False,
+        expected_reference_paths=frozenset({
+            "beartype/_util/cls/utilclsget.py",
+            "beartype/_util/func/utilfuncframe.py",
+            "beartype_test/a00_unit/a20_util/func/test_utilfuncframe.py",
+            "beartype_test/a00_unit/a60_decor/a60_pep/test_decorpep435.py",
+        }),
+        require_both_oracles_red_green=True,
+        require_each_editable_ablation_red=True,
+    ),
     "packaging-legacy-dataclass-pickles": RepositoryTask(
         source="pypa/packaging",
         upstream="https://github.com/pypa/packaging.git",
