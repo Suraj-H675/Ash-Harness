@@ -92,6 +92,8 @@ def record_completed_coding_turn(
     command_dispatched: bool = True,
     extra_tool: str | None = None,
     command_first: bool = False,
+    command_exit_code: int | None = 0,
+    command_arguments: dict | None = None,
 ) -> str:
     turn_id = "prior-coding-turn"
     store.start_turn(session_id, turn_id, "Original source repair")
@@ -112,13 +114,14 @@ def record_completed_coding_turn(
                 call_id=call_id,
                 tool_name=name,
                 arguments=(
-                    {"command": target} if name == "run_command"
-                    else {"file_path": target}
+                    (command_arguments if command_arguments is not None else {"command_line": target})
+                    if name == "run_command" else {"file_path": target}
                 ),
                 approved=True,
                 dispatched=dispatched,
                 executed=dispatched,
                 success=successful,
+                exit_code=command_exit_code if name == "run_command" and dispatched else None,
                 result=(
                     "1 passed in 0.13s" if name == "run_command"
                     else "Changed file successfully"
@@ -145,7 +148,8 @@ def reconcile(loop: AshLoop, session_id: str) -> None:
 def test_bounded_report_keeps_last_edit_and_test_after_many_reads() -> None:
     actions = [
         {"tool": "replace_file_content", "arguments": {"file_path": "src/a.py"}, "result": "done"},
-        {"tool": "run_command", "arguments": {"command": "python3 -B qa_visible.py"}, "result": "passed"},
+        {"tool": "run_command", "arguments": {"command_line": "python3 -B qa_visible.py"},
+         "exit_code": 0, "result": "passed"},
     ] + [
         {"tool": "read_file", "arguments": {"file_path": f"src/file-{i}.py"}, "result": "read"}
         for i in range(95)
@@ -155,6 +159,7 @@ def test_bounded_report_keeps_last_edit_and_test_after_many_reads() -> None:
     assert receipt["shown_calls"] == 32
     assert receipt["actions"][0]["file_path"] == "src/a.py"
     assert receipt["actions"][1]["command"] == "python3 -B qa_visible.py"
+    assert receipt["actions"][1]["exit_code"] == 0
 
 
 @pytest.mark.asyncio
@@ -469,8 +474,12 @@ async def test_cancelled_report_stays_interrupted_and_keeps_prior_usage(
 @pytest.mark.parametrize(
     "settings",
     [
-        {"command_success": False},
-        {"command_success": None},
+        {"command_success": False, "command_exit_code": 1},
+        {"command_success": None, "command_exit_code": None},
+        {"command_exit_code": None},
+        {"command_arguments": {"command": "python3 -B qa_visible.py"}},
+        {"command_arguments": {"command_line": ""}},
+        {"command_arguments": {"command_line": "python3 -B qa_visible.py", "cwd": 42}},
         {"command_dispatched": False},
         {"include_edit": False},
         {"command_first": True},
@@ -660,3 +669,38 @@ async def test_headless_one_shot_marks_tool_free_finalization_without_replaying(
     assert payload["context_continuations"] == 0
     assert payload["session_id"] == active_session_id
     assert "Tool-free final report" in payload["response"]
+
+
+def test_report_redacts_before_truncating_and_marks_incomplete_fields() -> None:
+    from ash.core.redaction import redact_text
+
+    # Synthetic values deliberately place a recognizable secret across each
+    # old slicing boundary. Never use a real credential in this fixture.
+    secret = "fixture-sensitive-" + "q" * 80
+    command = "x" * 488 + " password=" + secret + " z" * 300
+    output = "password=" + secret + " " + "tail " * 195
+    cwd = "x" * 350
+    assert secret not in redact_text(command)
+    assert secret not in redact_text(output)
+    receipt = json.loads(_compact_actions([{
+        "tool": "run_command", "arguments": {"command_line": command, "cwd": cwd},
+        "exit_code": 0, "result": output,
+    }]))["actions"][0]
+    assert receipt["command"] == redact_text(command)[:500]
+    assert receipt["output_tail"] == redact_text(output)[-1000:]
+    assert receipt["cwd"] == cwd[:300]
+    assert receipt["exit_code"] == 0
+    assert receipt["command_truncated"] is True
+    assert receipt["cwd_truncated"] is True
+    # Redaction shortened this particular output below the display limit.
+    assert len(redact_text(output)) <= 1000
+    assert "output_truncated" not in receipt
+    assert "fixture-sensitive" not in json.dumps(receipt)
+    assert "q" * 20 not in json.dumps(receipt)
+    long_output = output + " end" * 50
+    long_receipt = json.loads(_compact_actions([{
+        "tool": "run_command", "arguments": {"command_line": command, "cwd": cwd},
+        "exit_code": 0, "result": long_output,
+    }]))["actions"][0]
+    assert long_receipt["output_truncated"] is True
+    assert long_receipt["output_tail"] == redact_text(long_output)[-1000:]

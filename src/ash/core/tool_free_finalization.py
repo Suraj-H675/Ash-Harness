@@ -46,7 +46,7 @@ class ToolFreeReport:
 
 def _compact_actions(actions: list[dict[str, Any]]) -> str:
     """Prefer durable outcomes; never send arbitrary full source/tool output."""
-    records: list[dict[str, str]] = []
+    records: list[dict[str, Any]] = []
     # Later inspections must not evict the final edit and verification from
     # the bounded report. Keep those two chronological evidence anchors in
     # addition to the most recent calls (maximum 32 records total).
@@ -63,16 +63,25 @@ def _compact_actions(actions: list[dict[str, Any]]) -> str:
         action = actions[i]
         name = str(action["tool"])
         arguments = action["arguments"]
-        record = {"tool": name, "status": "recorded successful"}
+        record: dict[str, Any] = {"tool": name, "status": "recorded successful"}
         if name == "run_command":
-            record["command"] = redact_text(
-                str(arguments.get("command", ""))[:500]
-            )
-            record["output_tail"] = redact_text(str(action["result"])[-1000:])
+            command = redact_text(arguments["command_line"])
+            cwd = redact_text(arguments.get("cwd") or ".")
+            output = redact_text(str(action["result"]))
+            record["command"] = command[:500]
+            record["cwd"] = cwd[:300]
+            record["exit_code"] = action["exit_code"]
+            record["output_tail"] = output[-1000:]
+            if len(command) > 500:
+                record["command_truncated"] = True
+            if len(cwd) > 300:
+                record["cwd_truncated"] = True
+            if len(output) > 1000:
+                record["output_truncated"] = True
         else:
             target = arguments.get("file_path")
             if target is not None:
-                record["file_path"] = redact_text(str(target)[:300])
+                record["file_path"] = redact_text(str(target))[:300]
         records.append(record)
     payload = {
         "total_successful_calls": len(actions),

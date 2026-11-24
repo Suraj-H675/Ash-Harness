@@ -6492,8 +6492,8 @@ class SessionStore:
                     return None
             rows = conn.execute(
                 "SELECT tool_name, arguments_json, result, error, approved, "
-                "dispatched, executed, success FROM tool_calls "
-                "WHERE session_id = ? AND turn_id = ? ORDER BY rowid",
+                "dispatched, executed, success, exit_code FROM tool_calls "
+                "WHERE session_id = ? AND turn_id = ? ORDER BY rowid LIMIT 129",
                 (session_id, turn_id),
             ).fetchall()
             if not rows or len(rows) > 128:
@@ -6523,13 +6523,24 @@ class SessionStore:
                     "whole_edit", "apply_patch",
                 }:
                     last_edit_index = index
-                if name == "run_command":
-                    last_command_index = index
-                actions.append({
+                action: dict[str, Any] = {
                     "tool": name,
                     "arguments": arguments,
                     "result": str(row["result"] or ""),
-                })
+                }
+                if name == "run_command":
+                    command = arguments.get("command_line")
+                    cwd = arguments.get("cwd")
+                    if (
+                        not isinstance(command, str) or not command.strip()
+                        or (cwd is not None and not isinstance(cwd, str))
+                        or type(row["exit_code"]) is not int
+                        or row["exit_code"] != 0
+                    ):
+                        return None
+                    action["exit_code"] = row["exit_code"]
+                    last_command_index = index
+                actions.append(action)
             if last_edit_index < 0 or last_command_index <= last_edit_index:
                 return None
             return turn_id, actions

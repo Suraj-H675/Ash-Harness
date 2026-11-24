@@ -462,7 +462,13 @@ interrupted in the journal; its tool actions are neither imported nor replayed.
 Ash records a separate completed reporting turn with explicit provenance and
 sets `tool_free_finalized=true` in one-shot JSON output. The report must
 distinguish a successful recorded command from proof that every user
-requirement was met. Missing, failed, ambiguous or unrecognized actions,
+requirement was met. Admission requires a recorded zero exit status and a
+valid command identity after the last successful local edit. The reporting
+evidence identifies the command, its working directory, its exit status and
+bounded redacted output. Redaction precedes truncation, and truncated command,
+directory or output fields are marked. A later edit without a subsequent
+successful command prevents tool-free finalization; no command is rerun by
+the recovery path. Missing, failed, ambiguous or unrecognized actions,
 failed provider finalization, and explicitly configured cumulative turn-token
 caps still fail closed. This does not certify the correctness of arbitrary
 code or make finalization a replacement for testing.

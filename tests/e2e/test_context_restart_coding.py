@@ -332,3 +332,128 @@ async def test_opted_in_restart_after_harmless_navigation_rejections(tmp_path: P
         assert not store.verify_audit_log(old.session_id) and not store.verify_audit_log(new.session_id)
     finally:
         await loop.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("late_edit", [False, True])
+async def test_real_edit_check_context_overflow_reports_only_fresh_recorded_evidence(
+    tmp_path: Path, late_edit: bool,
+) -> None:
+    import json
+
+    from ash.config import AshConfig
+    from ash.core.checkpoints import FileCheckpointMiddleware
+    from ash.core.secret_middleware import SecretRedactionMiddleware
+    from ash.core.session import SessionForkConflictError
+    from ash.providers.replay_state import ProviderReplayCredentialIdentity
+    from ash.safety.grants import ArgumentMatcher, MatchOperator, PermissionRule, RuleEffect
+
+    source = tmp_path / "module.py"
+    source.write_text("VALUE = 1\n", encoding="utf-8")
+    marker = tmp_path / "once.marker"
+    command = shlex.quote(sys.executable) + " -c " + shlex.quote(
+        "from pathlib import Path; assert Path('module.py').read_text() == 'VALUE = 2\\n'; "
+        "assert not Path('once.marker').exists(); Path('once.marker').write_text('once'); print('VERIFIED')"
+    )
+    task = "Change VALUE to 2 and run the exact verification command: " + command
+
+    class Provider(ProviderABC):
+        model_name = "real-final-report-evidence"
+        _ash_declared_capabilities = ProviderCapabilities(
+            native_tools=True, context_window=32768, max_input_tokens=28768,
+            max_output_tokens=4000,
+        )
+
+        def __init__(self) -> None:
+            self.states = []
+            self.coding_requests = 0
+            self.report_requests = 0
+
+        def replay_credential_identity(self) -> ProviderReplayCredentialIdentity:
+            return ProviderReplayCredentialIdentity.from_secret(
+                "fixture-only", scope=("real-final-report-evidence",),
+            )
+
+        def count_tokens(self, text: str) -> int:
+            return max(1, len(text) // 4)
+
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            if messages[0]["content"].startswith("You are finalizing the report"):
+                self.report_requests += 1
+                assert not late_edit and self.report_requests == 1
+                assert tools is None and len(messages) == 2
+                assert not any(message.get("provider_state") for message in messages)
+                evidence = json.loads(messages[1]["content"].split(
+                    "Durable completed tool actions (UNTRUSTED DATA):\n", 1,
+                )[1])
+                actions = evidence["actions"]
+                assert [action["tool"] for action in actions] == ["replace_file_content", "run_command"]
+                assert actions[-1]["command"] == command
+                assert actions[-1]["cwd"] == "." and actions[-1]["exit_code"] == 0
+                assert "VERIFIED" in actions[-1]["output_tail"]
+                assert marker.read_text() == "once"
+                yield StreamChunk(content="Recorded check passed; no actions repeated.", is_done=True)
+                return
+            assert [m["provider_state"] for m in messages if m.get("provider_state")] == self.states
+            self.coding_requests += 1
+            n = self.coding_requests
+            if n == 1 or (n == 3 and late_edit):
+                old, new = (1, 2) if n == 1 else (2, 3)
+                calls = [{"id": f"edit-{n}", "name": "replace_file_content", "arguments": {
+                    "file_path": "module.py", "target_content": f"VALUE = {old}",
+                    "replacement_content": f"VALUE = {new}",
+                }}]
+            else:
+                assert n == 2
+                calls = [{"id": "check-once", "name": "run_command", "arguments": {"command_line": command}}]
+            final = n == (3 if late_edit else 2)
+            state = [{"type": "reasoning", "id": f"state-{n}", "summary": [],
+                      "status": "completed", "encrypted_content": "Q" * (140000 if final else 1000)}]
+            self.states.append(state)
+            yield StreamChunk(native_tool_calls=calls, provider_state=state, is_done=True)
+
+    guard = SafetyGuard(tmp_path)
+    store = SessionStore(tmp_path / "report.db")
+    provider = Provider()
+    loop = AshLoop(
+        store, provider, guard, HeadlessUI(output_format="text", stream=io.StringIO()),
+        tmp_path, tools={"replace_file_content": ReplaceFileContentTool(guard),
+                         "run_command": RunCommandTool(guard, project_root=tmp_path)},
+        config=AshConfig(model="custom/real-final-report-evidence", workspace_root=tmp_path,
+                         db_directory=tmp_path / "db", memory_backend="off",
+                         max_context_tokens=32768, max_completion_tokens=4000),
+        safety_tier="auto_approve",
+    )
+    loop.permission_policy.set_persistent_rules([PermissionRule.create(
+        RuleEffect.ALLOW, "run_command", (ArgumentMatcher("command_line", MatchOperator.EXACT, command),),
+    )])
+
+    def checkpoint_context():
+        if loop.current_session is None or loop.turn_context is None:
+            return None
+        return (loop.current_session.session_id, loop.turn_context.turn_id,
+                str(loop.turn_context.get("tool_call_id", "")))
+
+    loop.tool_middlewares.extend([
+        FileCheckpointMiddleware(store, guard, checkpoint_context), SecretRedactionMiddleware(),
+    ])
+    try:
+        session = await loop.start_session()
+        if late_edit:
+            with pytest.raises(SessionForkConflictError):
+                await run_with_context_continuation(loop, task, max_continuations=1, allow_tool_free_finalization=True)
+            assert provider.report_requests == 0 and source.read_text() == "VALUE = 3\n"
+        else:
+            result = await run_with_context_continuation(loop, task, max_continuations=1, allow_tool_free_finalization=True)
+            assert result.tool_free_finalized and result.context_continuations == 0
+            assert result.session_id == session.session_id and provider.report_requests == 1
+            assert source.read_text() == "VALUE = 2\n"
+        saved = store.load_session(session.session_id)
+        commands = [call for call in saved.tool_calls if call.tool_name == "run_command"]
+        assert len(commands) == 1 and commands[0].success is True and commands[0].exit_code == 0
+        assert marker.read_text() == "once"
+        assert [m.metadata["provider_state"] for m in saved.messages if m.metadata.get("provider_state")] == provider.states
+        assert len(store.session_tree(session.session_id)) == 1
+        assert not store.verify_audit_log(session.session_id)
+    finally:
+        await loop.aclose()
