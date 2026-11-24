@@ -20,6 +20,7 @@ from codex_repository_benchmark import (  # noqa: E402
     _exact_test_command,
     _isolated_codex_profile,
     _native_codex_binary,
+    _verify_host_connector_isolation,
     _sealed_codex_argv,
     SEALED_PERMISSION_PROFILE,
     run_task,
@@ -41,7 +42,13 @@ def test_sealed_plain_codex_argv_has_managed_profile_without_legacy_override(
         effort="xhigh",
         context_tokens=32768,
     )
-    assert argv[:2] == ["/trusted/native/codex", "exec"]
+    assert argv[0] == "/trusted/native/codex"
+    assert argv[1:8] == [
+        "--disable", "apps",
+        "--disable", "codex_apps_mcp_2026_07_28",
+        "--disable", "enable_mcp_apps",
+        "exec",
+    ]
     assert "--ignore-user-config" in argv
     assert "--ignore-rules" in argv
     assert "--ephemeral" in argv
@@ -131,6 +138,7 @@ def test_event_summary_records_only_metadata_not_model_content(tmp_path: Path) -
     path.write_text("".join(json.dumps(x) + "\n" for x in records))
     result = summarize_codex_events(path, "python3 -B qa_visible.py")
     assert result["visible_test_command_executed"] is True
+    assert result["visible_test_command_passed"] is True
     assert result["shell_command_count"] == 1
     assert result["shell_non_test_commands"] == 0
     assert result["terminal_events"] == ["turn.completed"]
@@ -191,6 +199,269 @@ def test_codex_routing_error_after_work_does_not_invalidate_trial(
     result = summarize_codex_events(path, "python3 -B qa_visible.py")
     assert result["infrastructure_unavailable"] is False
     assert result["shell_command_count"] == 1
+
+
+def test_failed_visible_test_is_recorded_as_executed_but_not_passed(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "codex.jsonl"
+    path.write_text(json.dumps({
+        "type": "item.completed",
+        "item": {
+            "id": "test-command",
+            "type": "command_execution",
+            "command": "python3 -B qa_visible.py",
+            "exit_code": 1,
+            "status": "completed",
+        },
+    }) + "\n")
+
+    result = summarize_codex_events(path, "python3 -B qa_visible.py")
+
+    assert result["visible_test_command_executed"] is True
+    assert result["visible_test_command_passed"] is False
+    assert result["visible_test_command_count"] == 1
+
+
+def test_wrapped_visible_test_start_and_completion_count_once(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "codex.jsonl"
+    records = [
+        {
+            "type": "item.started",
+            "item": {
+                "id": "test-command",
+                "type": "command_execution",
+                "command": "/usr/bin/zsh -lc 'python3 -B qa_visible.py'",
+            },
+        },
+        {
+            "type": "item.completed",
+            "item": {
+                "id": "test-command",
+                "type": "command_execution",
+                "command": "/usr/bin/zsh -lc 'python3 -B qa_visible.py'",
+                "exit_code": 0,
+                "status": "completed",
+            },
+        },
+    ]
+    path.write_text("".join(json.dumps(row) + "\n" for row in records))
+
+    result = summarize_codex_events(path, "python3 -B qa_visible.py")
+
+    assert result["visible_test_command_executed"] is True
+    assert result["visible_test_command_passed"] is True
+    assert result["visible_test_command_count"] == 1
+    assert result["shell_command_count"] == 1
+
+
+def test_anonymous_shell_updates_do_not_count_as_new_test_invocations(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "codex.jsonl"
+    records = [
+        {"type": "item.started", "item": {
+            "type": "command_execution",
+            "command": "python3 -B qa_visible.py",
+        }},
+        {"type": "item.updated", "item": {
+            "type": "command_execution",
+            "command": "python3 -B qa_visible.py",
+        }},
+        {"type": "item.completed", "item": {
+            "type": "command_execution",
+            "command": "python3 -B qa_visible.py",
+            "status": "completed",
+            "exit_code": 0,
+        }},
+    ]
+    path.write_text("".join(json.dumps(row) + "\n" for row in records))
+
+    result = summarize_codex_events(path, "python3 -B qa_visible.py")
+
+    assert result["visible_test_command_count"] == 1
+    assert result["visible_test_command_passed"] is True
+
+
+def test_host_connector_detection_does_not_require_test_command_metadata(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "codex.jsonl"
+    path.write_text(json.dumps({
+        "type": "item.failed",
+        "item": {
+            "type": "mcp_tool_call",
+            "server": "codex_apps_mcp_2026_07_28",
+            "tool": "devspace.open_workspace",
+            "status": "denied",
+        },
+    }) + "\n")
+
+    result = summarize_codex_events(path, None)
+
+    assert result["host_connector_invocation_observed"] is True
+    assert result["visible_test_command_executed"] is False
+
+
+@pytest.mark.parametrize(
+    "event",
+    [
+        {
+            "type": "item.started",
+            "item": {
+                "id": "host-call",
+                "type": "mcp_tool_call",
+                "server": "codex_apps_mcp_2026_07_28",
+                "tool": "devspace.open_workspace",
+                "status": "in_progress",
+                "arguments": {"root": "PRIVATE-HOST-PATH"},
+            },
+        },
+        {
+            "type": "item.completed",
+            "item": {
+                "id": "host-call",
+                "type": "mcp_tool_call",
+                "server": "codex_apps_mcp_2026_07_28",
+                "tool": "devspace.open_workspace",
+                "status": "failed",
+                "error": "PRIVATE-HOST-ERROR",
+            },
+        },
+        {
+            "type": "item.completed",
+            "item": {
+                "type": "tool_call",
+                "name": "devspace.open_workspace",
+                "status": "denied",
+            },
+        },
+    ],
+)
+def test_codex_mcp_or_host_app_attempt_invalidates_isolation_without_logging_content(
+    tmp_path: Path, event: dict[str, object],
+) -> None:
+    path = tmp_path / "codex.jsonl"
+    path.write_text(json.dumps(event) + "\n")
+
+    result = summarize_codex_events(path, "python3 -B qa_visible.py")
+
+    assert result["host_connector_invocation_observed"] is True
+    assert result["host_connector_event_count"] == 1
+    assert "PRIVATE" not in repr(result)
+
+
+def test_malformed_codex_jsonl_is_rejected_instead_of_proving_isolation(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "codex.jsonl"
+    path.write_text('{"type":"item.started",\n')
+    with pytest.raises(json.JSONDecodeError):
+        summarize_codex_events(path, "python3 -B qa_visible.py")
+
+
+def test_no_model_feature_readiness_uses_native_binary_and_isolated_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    native = tmp_path / "native-codex"
+    native.write_bytes(b"\x7fELF" + b"native")
+    observed: dict[str, object] = {}
+
+    def fake_run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        if argv[-3:] == ["mcp", "list", "--json"]:
+            observed["inventory_argv"] = argv
+            return subprocess.CompletedProcess(argv, 0, "[]", "")
+        observed["argv"] = argv
+        env = kwargs["env"]
+        assert isinstance(env, dict)
+        observed["env"] = env
+        # The temporary home exists during the native feature probe and is
+        # intentionally deleted before _verify_host_connector_isolation returns.
+        assert Path(env["CODEX_HOME"]).is_dir()
+        assert not (Path(env["CODEX_HOME"]) / "auth.json").exists()
+        assert kwargs["timeout"] == 15
+        assert kwargs["capture_output"] is True
+        assert kwargs["text"] is True
+        return subprocess.CompletedProcess(
+            argv,
+            0,
+            "apps stable false\n"
+            "codex_apps_mcp_2026_07_28 under development false\n"
+            "enable_mcp_apps under development false\n",
+            "",
+        )
+
+    monkeypatch.setattr(runner.subprocess, "run", fake_run)
+
+    result = _verify_host_connector_isolation(native)
+
+    assert observed["argv"] == [
+        str(native), "--disable", "apps", "--disable",
+        "codex_apps_mcp_2026_07_28", "--disable", "enable_mcp_apps",
+        "features", "list",
+    ]
+    assert observed["inventory_argv"] == [
+        str(native), "--disable", "apps", "--disable", "codex_apps_mcp_2026_07_28",
+        "--disable", "enable_mcp_apps", "mcp", "list", "--json",
+    ]
+    env = observed["env"]
+    assert isinstance(env, dict)
+    assert not Path(env["CODEX_HOME"]).exists()  # isolation cleanup succeeded
+    isolation_root = Path(env["CODEX_HOME"]).parent
+    assert Path(env["HOME"]).parent == isolation_root
+    assert Path(env["XDG_CONFIG_HOME"]).parent == isolation_root
+    assert Path(env["TMPDIR"]).parent == isolation_root
+    assert not (Path(env["CODEX_HOME"]) / "auth.json").exists()
+    assert "OPENAI_API_KEY" not in env
+    assert "GITHUB_TOKEN" not in env
+    assert "CODEX_ACCOUNT_OVERLAY_ACCOUNT" not in env
+    assert result["verified"] is True
+    assert result["disabled_features"] == [
+        "apps", "codex_apps_mcp_2026_07_28", "enable_mcp_apps",
+    ]
+    assert "PRIVATE" not in repr(result)
+
+
+@pytest.mark.parametrize(
+    "stdout",
+    [
+        "apps stable true\n"
+        "codex_apps_mcp_2026_07_28 under development false\n"
+        "enable_mcp_apps under development false\n",
+        "apps stable false\n"
+        "codex_apps_mcp_2026_07_28 under development false\n",
+        "unknown cli response\n",
+    ],
+)
+def test_no_model_feature_readiness_fails_closed_on_enabled_or_unknown_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stdout: str,
+) -> None:
+    native = tmp_path / "native-codex"
+    native.write_bytes(b"\x7fELF" + b"native")
+    monkeypatch.setattr(
+        runner.subprocess,
+        "run",
+        lambda argv, **_kwargs: subprocess.CompletedProcess(argv, 0, stdout, ""),
+    )
+
+    with pytest.raises(RuntimeError, match="host-app feature state"):
+        _verify_host_connector_isolation(native)
+
+
+def test_no_model_feature_readiness_fails_closed_on_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    native = tmp_path / "native-codex"
+    native.write_bytes(b"\x7fELF" + b"native")
+
+    def timeout(argv: list[str], **_kwargs: object) -> None:
+        raise subprocess.TimeoutExpired(argv, 15)
+
+    monkeypatch.setattr(runner.subprocess, "run", timeout)
+    with pytest.raises(RuntimeError, match="host-app feature check timed out"):
+        _verify_host_connector_isolation(native)
 
 
 def test_codex_env_does_not_inherit_api_credentials(
@@ -355,9 +626,13 @@ def test_unsealed_plain_codex_cli_refuses_before_making_evidence(
     assert not evidence.exists()
 
 
+@pytest.mark.parametrize("replace_binary", [False, True])
 def test_codex_timeout_terminates_process_group_without_leaking_keys(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, replace_binary: bool,
 ) -> None:
+    native = tmp_path / "native-codex"
+    native.write_bytes(b"\x7fELFsynthetic")
+    native_sha = hashlib.sha256(native.read_bytes()).hexdigest()
     child_args: list[str] = []
     child_env: dict[str, str] = {}
     signals: list[int] = []
@@ -383,6 +658,9 @@ def test_codex_timeout_terminates_process_group_without_leaking_keys(
         child_args.extend(argv)
         child_env.update(env)
         assert kwargs["start_new_session"] is True
+        descriptor, = kwargs["pass_fds"]
+        assert kwargs["executable"] == f"/proc/self/fd/{descriptor}"
+        assert hashlib.sha256(Path(kwargs["executable"]).read_bytes()).hexdigest() == native_sha
         return Child()
 
     @contextlib.contextmanager
@@ -393,13 +671,23 @@ def test_codex_timeout_terminates_process_group_without_leaking_keys(
 
     # This simulated child exercises process-group cleanup, not actual model
     # authorization or sandbox isolation. Security checks are stubbed only here.
-    monkeypatch.setattr(runner, "_require_sealed_comparator_profile", lambda: None)
-    monkeypatch.setattr(
-        runner, "_probe_effective_sealed_sandbox", lambda *_args, **_kwargs: None
-    )
-    monkeypatch.setattr(
-        runner, "_native_codex_binary", lambda: Path("/usr/bin/codex-real")
-    )
+    monkeypatch.setattr(runner, "_require_sealed_comparator_profile", lambda: (native, native_sha))
+
+    def sandbox_probe(*_args, **_kwargs):
+        if replace_binary:
+            replacement = native.with_suffix(".replacement")
+            replacement.write_bytes(b"\x7fELFdifferent")
+            replacement.replace(native)
+
+    monkeypatch.setattr(runner, "_probe_effective_sealed_sandbox", sandbox_probe)
+    monkeypatch.setattr(runner, "_verify_host_connector_isolation", lambda _exe: {
+        "verified": True,
+        "method": "native-features-and-mcp-list-per-invocation",
+        "disabled_features": [
+            "apps", "codex_apps_mcp_2026_07_28", "enable_mcp_apps",
+        ],
+        "native_binary_sha256": native_sha,
+    })
     monkeypatch.setattr(runner, "_isolated_codex_profile", fake_profile)
     monkeypatch.setattr(runner.subprocess, "Popen", popen)
     monkeypatch.setattr(runner.os, "killpg", lambda pid, sig: signals.append(sig))
@@ -407,6 +695,12 @@ def test_codex_timeout_terminates_process_group_without_leaking_keys(
     evidence = tmp_path / "evidence"
     evidence.mkdir()
     (tmp_path / "tmp").mkdir()
+    if replace_binary:
+        with pytest.raises(RuntimeError, match="changed before sealed dispatch"):
+            runner._run_codex(tmp_path, evidence, model="gpt-6-luna", effort="xhigh",
+                              timeout=50, prompt="Repair the bug", scratch=tmp_path)
+        assert not child_args and not signals
+        return
     receipt = runner._run_codex(
         tmp_path,
         evidence,
@@ -432,12 +726,19 @@ def test_codex_timeout_terminates_process_group_without_leaking_keys(
     assert Path(child_env["TMPDIR"]).parent == tmp_path
     assert Path(child_env["TMPDIR"]).name.startswith(".ash-codex-tmp-")
     assert not Path(child_env["TMPDIR"]).exists(), "temporary workspace scratch leaked"
-    assert child_args[0] == "/usr/bin/codex-real"
+    assert child_args[0] == str(native)
 
 
-@pytest.mark.parametrize("tamper_visible", [False, True])
+@pytest.mark.parametrize(
+    ("tamper_visible", "test_exit_code", "expected_passed"),
+    [(False, 0, True), (True, 0, False), (False, 1, False)],
+)
 def test_scoring_rejects_modified_oracle_and_cleans_scratch(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tamper_visible: bool
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tamper_visible: bool,
+    test_exit_code: int,
+    expected_passed: bool,
 ) -> None:
     task = RepositoryTask(
         source="local-fixture",
@@ -482,7 +783,7 @@ def test_scoring_rejects_modified_oracle_and_cleans_scratch(
                     "type": "command_execution",
                     "command": "/usr/bin/zsh -lc 'python3 -B qa_visible.py'",
                     "status": "completed",
-                    "exit_code": 0,
+                    "exit_code": test_exit_code,
                 },
             },
             {"type": "turn.completed", "usage": {"input_tokens": 80}},
@@ -499,6 +800,12 @@ def test_scoring_rejects_modified_oracle_and_cleans_scratch(
             "sandbox": "workspace-write",
             "ephemeral": True,
             "native_binary_direct": True,
+            "host_connector_isolation_verified": True,
+            "host_connector_disable_method": "native-features-and-mcp-list-per-invocation",
+            "host_connector_disabled_features": [
+                "apps", "codex_apps_mcp_2026_07_28", "enable_mcp_apps",
+            ],
+            "native_binary_sha256": "e" * 64,
             "isolated_codex_home": True,
             "isolated_home_xdg": True,
             "memory_backed_auth_copy_cleaned": True,
@@ -525,9 +832,10 @@ def test_scoring_rejects_modified_oracle_and_cleans_scratch(
         timeout=170,
         authorize_model_trial=True,  # mock executor only; no model call
     )
-    assert result["passed"] is not tamper_visible
+    assert result["passed"] is expected_passed
     assert result["protected_files_unchanged"] is not tamper_visible
     assert result["visible_test_command_executed"] is True
+    assert result["visible_test_command_passed"] is (test_exit_code == 0)
     assert result["scratch_removed"] is True
     assert result["context_tokens_requested"] == 32768
     assert not scratch_roots[0].exists()
@@ -604,6 +912,12 @@ def test_codex_scoring_accepts_new_editable_source_modules(
             "sandbox": "workspace-write",
             "ephemeral": True,
             "native_binary_direct": True,
+            "host_connector_isolation_verified": True,
+            "host_connector_disable_method": "native-features-and-mcp-list-per-invocation",
+            "host_connector_disabled_features": [
+                "apps", "codex_apps_mcp_2026_07_28", "enable_mcp_apps",
+            ],
+            "native_binary_sha256": "e" * 64,
             "isolated_codex_home": True,
             "isolated_home_xdg": True,
             "memory_backed_auth_copy_cleaned": True,
@@ -702,6 +1016,12 @@ def test_r17_codex_fake_grade_accepts_one_semantic_source_repair(
             "timed_out": False,
             "cli_seconds": 1.0,
             "native_binary_direct": True,
+            "host_connector_isolation_verified": True,
+            "host_connector_disable_method": "native-features-and-mcp-list-per-invocation",
+            "host_connector_disabled_features": [
+                "apps", "codex_apps_mcp_2026_07_28", "enable_mcp_apps",
+            ],
+            "native_binary_sha256": "e" * 64,
             "isolated_codex_home": True,
             "isolated_home_xdg": True,
             "memory_backed_auth_copy_cleaned": True,
@@ -993,3 +1313,52 @@ def test_explicit_opt_in_passes_one_trial_authorization_without_model(
     assert invoked[0][2]["preflight_only"] is False
     assert invoked[0][2]["model"] == "gpt-6-luna"
     assert invoked[0][2]["effort"] == "xhigh"
+
+
+def test_repeated_exact_visible_test_attempts_count_without_becoming_non_test(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "codex.jsonl"
+    command = "/usr/bin/zsh -lc 'python3 -B qa_visible.py'"
+    events = [
+        {"type": "item.completed", "item": {
+            "id": "first", "type": "command_execution", "command": command,
+            "status": "failed", "exit_code": 1,
+        }},
+        {"type": "item.completed", "item": {
+            "id": "after-edit", "type": "command_execution", "command": command,
+            "status": "completed", "exit_code": 0,
+        }},
+        {"type": "turn.completed"},
+    ]
+    path.write_text("".join(json.dumps(event) + "\n" for event in events))
+    summary = summarize_codex_events(path, "python3 -B qa_visible.py")
+    assert summary["visible_test_command_executed"] is True
+    assert summary["visible_test_command_passed"] is True
+    assert summary["visible_test_command_count"] == 2
+    assert summary["shell_command_count"] == 2
+    assert summary["shell_non_test_commands"] == 0
+
+
+@pytest.mark.parametrize("inventory", ['[{"name":"managed-server"}]', 'not-json', '{}'])
+def test_native_readiness_refuses_unexpected_mcp_inventory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, inventory: str) -> None:
+    native = tmp_path / "native"
+    native.write_bytes(b"\x7fELFfixture")
+    feature_states = "\n".join(f"{name} stable false" for name in runner.HOST_APP_FEATURES)
+    monkeypatch.setattr(runner.subprocess, "run", lambda argv, **_kwargs: subprocess.CompletedProcess(
+        argv, 0, inventory if argv[-3:] == ["mcp", "list", "--json"] else feature_states, "",
+    ))
+    with pytest.raises(RuntimeError, match="MCP inventory"):
+        _verify_host_connector_isolation(native)
+
+
+@pytest.mark.parametrize("event", [
+    {"type":"item.started", "item":{"type":"new_remote_tool_shape", "id":"x"}},
+    {"type":"item.completed", "item":{"type":"command_execution", "id":"x", "command":"/usr/bin/zsh -lc 'codex exec -m gpt-6-luna'", "exit_code":0, "status":"completed"}},
+    {"type":"item.started", "item":{"type":["unexpected"]}},
+])
+def test_unrecognized_or_nested_tool_trace_is_not_evidence_of_isolation(tmp_path: Path, event: dict[str, object]) -> None:
+    trace = tmp_path / "codex.jsonl"
+    trace.write_text(json.dumps(event) + "\n")
+    with pytest.raises(ValueError):
+        summarize_codex_events(trace, "python3 -B qa_visible.py")

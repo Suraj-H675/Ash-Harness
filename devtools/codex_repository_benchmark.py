@@ -36,6 +36,7 @@ from repository_benchmark import (
     hidden_oracle_classification,
     hidden_oracle_sha256,
     snapshot_files,
+    task_evidence_classification,
     validate_editable_paths,
     verify_task_runtime,
 )
@@ -61,6 +62,18 @@ _REQUIRED_TOOL_OBSERVATIONS = {
 }
 _TERMINAL_EVENTS = {"turn.completed", "turn.failed", "turn.cancelled"}
 _SHELLS = frozenset({"bash", "zsh", "sh"})
+HOST_APP_FEATURES = (
+    "apps",
+    "codex_apps_mcp_2026_07_28",
+    "enable_mcp_apps",
+)
+HOST_CONNECTOR_CHECK_METHOD = "native-features-and-mcp-list-per-invocation"
+_HOST_APP_DISABLE_FLAGS = tuple(
+    argument for feature in HOST_APP_FEATURES for argument in ("--disable", feature)
+)
+_FEATURE_STATES = {
+    "stable", "experimental", "under development", "deprecated", "removed",
+}
 
 
 def _read_sealed_metadata(path: Path, *, owner: int, mode: int) -> bytes:
@@ -86,7 +99,7 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _require_sealed_comparator_profile() -> None:
+def _require_sealed_comparator_profile() -> tuple[Path, str]:
     """Fail closed unless Linux, managed profile and live-tool proof still match.
 
     The owner-approved one-shot real Luna tool smoke is retained as private
@@ -123,6 +136,7 @@ def _require_sealed_comparator_profile() -> None:
             ":slash_tmp": "deny",
             str(release_root): "read",
         }
+        binary_sha = _sha256_file(binary)
         valid = (
             isinstance(attestation, dict)
             and attestation.get("schema") == 1
@@ -134,7 +148,7 @@ def _require_sealed_comparator_profile() -> None:
             and attestation.get("required_observations") == _REQUIRED_TOOL_OBSERVATIONS
             and attestation.get("managed_policy_sha256")
             == hashlib.sha256(policy_data).hexdigest()
-            and attestation.get("native_binary_sha256") == _sha256_file(binary)
+            and attestation.get("native_binary_sha256") == binary_sha
             and policy["allowed_permission_profiles"].get(SEALED_PERMISSION_PROFILE)
             is True
             and profile.get("extends") == ":workspace"
@@ -146,6 +160,7 @@ def _require_sealed_comparator_profile() -> None:
             raise RuntimeError(
                 "Sealed comparator managed policy / live-tool proof drifted"
             )
+        return binary, binary_sha
     except (OSError, ValueError, KeyError, TypeError, UnicodeError) as error:
         raise RuntimeError(
             "Sealed comparator profile unavailable or not independently attested"
@@ -278,23 +293,79 @@ def _exact_test_command(command: str, expected: str) -> bool:
         return False
 
 
-def summarize_codex_events(log: Path, exact_test: str) -> dict[str, Any]:
+def _is_host_connector_invocation(event: dict[str, Any]) -> bool:
+    """Recognize MCP or app-tool activity without retaining tool payloads."""
+    candidates = [event]
+    for key in ("item", "tool_call", "toolCall", "call"):
+        candidate = event.get(key)
+        if isinstance(candidate, dict):
+            candidates.append(candidate)
+    for candidate in candidates:
+        kind = candidate.get("type")
+        if isinstance(kind, str):
+            normalized = kind.casefold().replace("-", "_")
+            if "mcp" in normalized or (
+                "app" in normalized and ("tool" in normalized or "call" in normalized)
+            ):
+                return True
+            if "tool_call" in normalized:
+                name = candidate.get("tool_name", candidate.get("name"))
+                if isinstance(name, str) and "." in name:
+                    return True
+        server = next(
+            (
+                candidate.get(key)
+                for key in ("server", "server_name", "mcp_server", "mcp_server_name")
+                if isinstance(candidate.get(key), str)
+            ),
+            None,
+        )
+        tool = next(
+            (
+                candidate.get(key)
+                for key in ("tool", "tool_name", "name", "method")
+                if isinstance(candidate.get(key), str)
+            ),
+            None,
+        )
+        if isinstance(server, str) and isinstance(tool, str):
+            return True
+    return False
+
+
+def summarize_codex_events(log: Path, exact_test: str | None) -> dict[str, Any]:
     """Summarize a bounded private JSONL log without copying tool contents."""
     if log.stat().st_size > MAX_EVENT_BYTES:
         raise ValueError("Codex event log exceeds the bounded evidence limit")
-    commands = 0
-    non_test_commands = 0
-    successful_test_commands = 0
+    command_items: dict[str, dict[str, Any]] = {}
+    anonymous_pending: dict[str, list[str]] = {}
+    next_anonymous_id = 0
     terminal: list[str] = []
     last_usage: dict[str, int] = {}
     routing_errors = 0
     substantive_events = 0
+    host_connector_event_count = 0
     with log.open(encoding="utf-8") as stream:
         for line in stream:
             event = json.loads(line)
             if not isinstance(event, dict):
                 raise ValueError("Codex event was not an object")
             kind = event.get("type")
+            if not isinstance(kind, str):
+                raise ValueError("Invalid Codex event type")
+            host_event = _is_host_connector_invocation(event)
+            if host_event:
+                host_connector_event_count += 1
+            elif kind in {"item.started", "item.updated", "item.completed", "item.failed"}:
+                item = event.get("item")
+                if (not isinstance(item, dict) or not isinstance(item.get("type"), str)
+                        or item.get("type") not in {
+                    "command_execution", "agent_message", "reasoning", "file_change",
+                    "todo_list", "error",
+                }):
+                    raise ValueError("Unrecognized Codex item type in sealed trace")
+            elif kind not in {"thread.started", "turn.started", "error"} | _TERMINAL_EVENTS:
+                raise ValueError("Unrecognized Codex event type in sealed trace")
             # A provider-routing failure before any agent action cannot be
             # graded as a coding failure or a competitor loss. Retain only a
             # boolean, never the backend's potentially sensitive message.
@@ -318,26 +389,91 @@ def summarize_codex_events(log: Path, exact_test: str) -> dict[str, Any]:
                         and value >= 0
                     }
             item = event.get("item")
-            if kind != "item.completed" or not isinstance(item, dict):
+            if isinstance(item, dict) and item.get("type") != "error":
+                if kind in {"item.started", "item.updated", "item.completed", "item.failed"}:
+                    substantive_events += 1
+            if (
+                kind not in {"item.started", "item.updated", "item.completed", "item.failed"}
+                or not isinstance(item, dict)
+                or item.get("type") != "command_execution"
+            ):
                 continue
-            if item.get("type") != "error":
-                substantive_events += 1
-            if item.get("type") != "command_execution":
-                continue
-            commands += 1
-            is_test = _exact_test_command(str(item.get("command", "")), exact_test)
-            if not is_test:
-                non_test_commands += 1
-            elif item.get("exit_code") == 0 and item.get("status") == "completed":
-                successful_test_commands += 1
+            command = item.get("command")
+            command = command if isinstance(command, str) else ""
+            # A nested Codex invocation could introduce a different host-tool
+            # configuration. It is not an authorized source-inspection command.
+            if re.search(r"(?:^|[\s;|&'\"])(?:[^\s;|&'\"]*/)?codex(?:-real)?\s+(?:exec|mcp|app-server|resume|--)", command):
+                raise ValueError("Nested Codex invocation in sealed trace")
+            item_id = item.get("id")
+            if isinstance(item_id, str) and item_id:
+                identity = "id:" + item_id
+            elif kind in {"item.updated", "item.completed", "item.failed"}:
+                pending = anonymous_pending.get(command, [])
+                if pending:
+                    if kind in {"item.completed", "item.failed"}:
+                        identity = pending.pop(0)
+                        if not pending:
+                            anonymous_pending.pop(command, None)
+                    else:
+                        identity = pending[0]
+                else:
+                    identity = f"anonymous:{next_anonymous_id}"
+                    next_anonymous_id += 1
+                    if kind == "item.updated":
+                        anonymous_pending.setdefault(command, []).append(identity)
+            else:
+                identity = f"anonymous:{next_anonymous_id}"
+                next_anonymous_id += 1
+                anonymous_pending.setdefault(command, []).append(identity)
+            record = command_items.setdefault(identity, {
+                "command": command,
+                "completed": False,
+                "status": None,
+                "exit_code": None,
+            })
+            if command and record["command"] and command != record["command"]:
+                raise ValueError("Contradictory Codex command identity")
+            if record["completed"]:
+                raise ValueError("Codex command event followed terminal event")
+            if command:
+                record["command"] = command
+            if kind == "item.failed":
+                record.update(completed=True, status="failed", exit_code=item.get("exit_code"))
+            if kind == "item.completed":
+                record.update(
+                    completed=True,
+                    status=item.get("status"),
+                    exit_code=item.get("exit_code"),
+                )
+
+    test_records = (
+        [
+            item for item in command_items.values()
+            if _exact_test_command(item["command"], exact_test)
+        ]
+        if exact_test is not None
+        else []
+    )
+    visible_test_command_passed = any(
+        item["completed"]
+        and item["status"] == "completed"
+        and type(item["exit_code"]) is int
+        and item["exit_code"] == 0
+        for item in test_records
+    )
+    command_count = len(command_items)
     return {
-        "shell_command_count": commands,
-        "shell_non_test_commands": non_test_commands,
-        "visible_test_command_executed": successful_test_commands > 0,
+        "shell_command_count": command_count,
+        "shell_non_test_commands": command_count - len(test_records),
+        "visible_test_command_executed": bool(test_records),
+        "visible_test_command_passed": visible_test_command_passed,
+        "visible_test_command_count": len(test_records),
+        "host_connector_invocation_observed": host_connector_event_count > 0,
+        "host_connector_event_count": host_connector_event_count,
         "terminal_events": terminal,
         "usage": last_usage,
         "infrastructure_unavailable": bool(
-            routing_errors and not substantive_events and not commands
+            routing_errors and not substantive_events and not command_count
         ),
     }
 
@@ -430,6 +566,77 @@ def _codex_env(
     }
 
 
+def _host_apps_features_argv(executable: Path) -> list[str]:
+    return [str(executable), *_HOST_APP_DISABLE_FLAGS, "features", "list"]
+
+
+def _parse_disabled_host_app_features(stdout: str) -> list[str]:
+    observed: dict[str, list[bool]] = {name: [] for name in HOST_APP_FEATURES}
+    for line in stdout.splitlines():
+        fields = line.split()
+        if not fields or fields[0] not in observed:
+            continue
+        if len(fields) < 3 or fields[-1] not in {"true", "false"}:
+            raise ValueError("unrecognized Codex feature state")
+        state = " ".join(fields[1:-1])
+        if state not in _FEATURE_STATES:
+            raise ValueError("unrecognized Codex feature state")
+        observed[fields[0]].append(fields[-1] == "true")
+    if any(values != [False] for values in observed.values()):
+        raise ValueError("required host-app features are not disabled")
+    return sorted(observed)
+
+
+def _verify_host_connector_isolation(executable: Path) -> dict[str, Any]:
+    """Check per-invocation native Codex app flags without auth or inference."""
+    try:
+        binary_sha = _sha256_file(executable)
+        with tempfile.TemporaryDirectory(prefix="ash-codex-feature-check-") as raw:
+            root = Path(raw)
+            codex_home = root / "codex"
+            sandbox_tmp = root / "tmp"
+            codex_home.mkdir(mode=0o700)
+            sandbox_tmp.mkdir(mode=0o700)
+            env = _codex_env(root, codex_home, sandbox_tmp=sandbox_tmp)
+            outcome = subprocess.run(
+                _host_apps_features_argv(executable),
+                cwd=root,
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=15,
+                check=False,
+            )
+            inventory = subprocess.run(
+                [str(executable), *_HOST_APP_DISABLE_FLAGS, "mcp", "list", "--json"],
+                cwd=root, env=env, capture_output=True, text=True, timeout=15,
+                check=False,
+            )
+        if _sha256_file(executable) != binary_sha:
+            raise RuntimeError("Native Codex changed during host-tool readiness checks")
+    except subprocess.TimeoutExpired as error:
+        raise RuntimeError("Codex host-app feature check timed out") from error
+    except OSError as error:
+        raise RuntimeError("Codex host-app feature check could not run") from error
+    if outcome.returncode != 0 or not isinstance(outcome.stdout, str):
+        raise RuntimeError("Codex host-app feature state is unavailable")
+    try:
+        disabled = _parse_disabled_host_app_features(outcome.stdout)
+    except ValueError as error:
+        raise RuntimeError("Codex host-app feature state is unrecognized") from error
+    try:
+        if inventory.returncode != 0 or json.loads(inventory.stdout) != []:
+            raise ValueError("MCP inventory is not empty")
+    except (TypeError, ValueError) as error:
+        raise RuntimeError("Codex MCP inventory is nonempty or unverified") from error
+    return {
+        "verified": True,
+        "method": HOST_CONNECTOR_CHECK_METHOD,
+        "disabled_features": disabled,
+        "native_binary_sha256": binary_sha,
+    }
+
+
 def _stop_child(child: subprocess.Popen[bytes]) -> None:
     """Reap the CLI process group even when interrupted during a model run."""
     if child.poll() is not None:
@@ -463,6 +670,7 @@ def _sealed_codex_argv(
     """
     return [
         str(executable),
+        *_HOST_APP_DISABLE_FLAGS,
         "exec",
         "--ignore-user-config",
         "--ignore-rules",
@@ -501,8 +709,7 @@ def _run_codex(
     scratch: Path,
     context_tokens: int = 32768,
 ) -> dict[str, Any]:
-    _require_sealed_comparator_profile()
-    executable = _native_codex_binary()
+    executable, attested_sha = _require_sealed_comparator_profile()
     argv = _sealed_codex_argv(
         executable,
         workspace,
@@ -516,6 +723,9 @@ def _run_codex(
         or not workspace.resolve().is_relative_to(scratch.resolve())
     ):
         raise RuntimeError("Sealed comparator workspace is outside isolated scratch")
+    host_isolation = _verify_host_connector_isolation(executable)
+    if host_isolation["native_binary_sha256"] != attested_sha:
+        raise RuntimeError("Native Codex no longer matches the sealed attestation")
     timed_out = False
     with contextlib.ExitStack() as resources:
         # An unpredictable mode-0700 scratch directory dies before grading.
@@ -532,9 +742,20 @@ def _run_codex(
         ):
             # Match the Ash CLI timer: start immediately before spawning
             # the agent, not while preparing the isolated auth profile.
+            # Bind dispatch to the file whose digest was attested. A pathname
+            # replacement between the final check and exec cannot select a
+            # different executable. This runner is already Linux-only.
+            descriptor = os.open(executable, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+            resources.callback(os.close, descriptor)
+            with os.fdopen(os.dup(descriptor), "rb") as pinned:
+                digest = hashlib.file_digest(pinned, "sha256").hexdigest()
+            if digest != attested_sha or _sha256_file(executable) != attested_sha:
+                raise RuntimeError("Native Codex changed before sealed dispatch")
             start = time.monotonic()
             child = subprocess.Popen(
                 argv,
+                executable=f"/proc/self/fd/{descriptor}",
+                pass_fds=(descriptor,),
                 cwd=workspace,
                 env=_codex_env(scratch, codex_home, sandbox_tmp=sandbox_tmp),
                 stdin=subprocess.PIPE,
@@ -551,6 +772,8 @@ def _run_codex(
                 _stop_child(child)
                 raise
             cli_seconds = round(time.monotonic() - start, 2)
+            if _sha256_file(executable) != attested_sha:
+                raise RuntimeError("Native Codex changed during sealed dispatch")
     return {
         "exit_code": child.returncode,
         "timed_out": timed_out,
@@ -570,6 +793,10 @@ def _run_codex(
         "user_config_ignored": True,
         "user_rules_ignored": True,
         "host_skill_discovery_disabled_requested": True,
+        "host_connector_isolation_verified": host_isolation["verified"],
+        "host_connector_disable_method": host_isolation["method"],
+        "host_connector_disabled_features": host_isolation["disabled_features"],
+        "native_binary_sha256": host_isolation["native_binary_sha256"],
         "native_binary_direct": True,
         "isolated_codex_home": True,
         "isolated_home_xdg": True,
@@ -621,6 +848,8 @@ def run_task(
             "license": task.license,
             "base_sha": task.base_sha,
             "reference_fix_sha": task.reference_fix_sha,
+            "diagnostic_retake_of": task.diagnostic_retake_of,
+            "evidence_classification": task_evidence_classification(task),
             "preflight": preflight_receipt,
             "editable": sorted(task.editable),
             "visible_test": task.command_grant,
@@ -669,25 +898,42 @@ def run_task(
         except (OSError, ValueError, UnicodeError, json.JSONDecodeError):
             event_log_valid = False
             events = {
-                "shell_command_count": 0,
-                "shell_non_test_commands": 0,
-                "visible_test_command_executed": False,
+                "shell_command_count": None,
+                "shell_non_test_commands": None,
+                "visible_test_command_executed": None,
+                "visible_test_command_passed": None,
+                "visible_test_command_count": None,
+                "host_connector_invocation_observed": None,
+                "host_connector_event_count": None,
                 "terminal_events": [],
                 "usage": {},
             }
+        host_connector_isolation_verified = bool(
+            event_log_valid
+            and invocation.get("host_connector_isolation_verified") is True
+            and events.get("host_connector_invocation_observed") is False
+        )
+        score_eligible = event_log_valid and host_connector_isolation_verified
         passed = bool(
             invocation["exit_code"] == 0
             and not invocation["timed_out"]
-            and event_log_valid
+            and score_eligible
             and events["terminal_events"] == ["turn.completed"]
             and protected
             and changed
             and oracles["correct"]
-            and events["visible_test_command_executed"]
+            and events["visible_test_command_executed"] is True
+            and events["visible_test_command_passed"] is True
+            and (
+                not task.require_single_visible_test
+                or events["visible_test_command_count"] == 1
+            )
         )
         result = {
             "task": name,
             "runner": "plain-codex-cli",
+            "diagnostic_retake_of": task.diagnostic_retake_of,
+            "evidence_classification": task_evidence_classification(task),
             "model_requested": model,
             "reasoning_effort_requested": effort,
             "context_tokens_requested": context_tokens,
@@ -696,6 +942,15 @@ def run_task(
             "sandbox": invocation.get("sandbox", "unverified"),
             "shell_command_policy_enforced": False,
             "host_skill_discovery_disabled_requested": True,
+            "host_connector_isolation_verified": host_connector_isolation_verified,
+            "host_connector_disable_method": invocation.get(
+                "host_connector_disable_method"
+            ),
+            "host_connector_disabled_features": invocation.get(
+                "host_connector_disabled_features"
+            ),
+            "native_binary_sha256": invocation.get("native_binary_sha256"),
+            "score_eligible": score_eligible,
             "skill_stack_isolated_verified": False,
             "native_binary_direct": invocation["native_binary_direct"],
             "isolated_codex_home": invocation["isolated_codex_home"],

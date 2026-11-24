@@ -786,6 +786,40 @@ for cls in (direct_url.VcsInfo,direct_url.DirectUrl,pylock.PackageVcs,pylock.Pyl
 print("R23_PACKAGING_HIDDEN_OK")
 '''
 
+_PACKAGING_R23_BAD_STATE_LOOP = """for state,error_type in (
+        ({key:key for key in names[:-1]},TypeError),
+        ({**{key:key for key in names},'unexpected':'junk'},TypeError),
+        (['value']*(len(fields)-1),ValueError),
+        (['value']*(len(fields)+1),ValueError),
+    ):
+        try:
+            blank.__setstate__(state)
+        except error_type:
+            pass
+        else:
+            raise AssertionError(f'{cls.__name__} accepted invalid pickle state {type(state).__name__}')"""
+_PACKAGING_R23B_BAD_STATE_LOOP = """for state in (
+        {key:key for key in names[:-1]},
+        {**{key:key for key in names},'unexpected':'junk'},
+        ['value']*(len(fields)-1),
+        ['value']*(len(fields)+1),
+    ):
+        try:
+            blank.__setstate__(state)
+        except (TypeError,ValueError):
+            pass
+        else:
+            raise AssertionError(f'{cls.__name__} accepted invalid pickle state {type(state).__name__}')"""
+
+
+def _packaging_r23b_hidden_source() -> str:
+    if PACKAGING_LEGACY_DATACLASS_HIDDEN.count(_PACKAGING_R23_BAD_STATE_LOOP) != 1:
+        raise RuntimeError("R23 frozen malformed-state oracle anchor drifted")
+    return PACKAGING_LEGACY_DATACLASS_HIDDEN.replace(
+        _PACKAGING_R23_BAD_STATE_LOOP, _PACKAGING_R23B_BAD_STATE_LOOP, 1
+    )
+
+
 PACKAGING_PICKLE_VISIBLE = r"""import pickle
 import sys
 sys.path.insert(0, 'src')
@@ -1797,6 +1831,9 @@ class RepositoryTask:
     require_all_editable_changed: bool = True
     expected_reference_paths: frozenset[str] | None = None
     require_both_oracles_red_green: bool = False
+    require_single_visible_test: bool = False
+    require_each_editable_ablation_red: bool = False
+    diagnostic_retake_of: str | None = None
 
 
 @dataclass(frozen=True)
@@ -3090,6 +3127,40 @@ TASKS = {
 }
 
 
+TASKS["packaging-legacy-dataclass-pickles-r23b"] = replace(
+    TASKS["packaging-legacy-dataclass-pickles"],
+    hidden_source=_packaging_r23b_hidden_source(),
+    prompt=(
+        "Repair backward compatibility for old serialized dataclass values "
+        "in this pinned pypa/packaging repository. The older 26.3 version "
+        "serialized pylock and direct_url dataclasses using dictionary "
+        "instance state; current frozen slotted dataclasses can silently "
+        "restore those dictionary keys as field values rather than the "
+        "original data. Deserialize authentic old pickle values accurately "
+        "across the supported nested model types. Reject malformed dict and "
+        "list states instead of silently mis-restoring fields, while accepting "
+        "either TypeError or ValueError for malformed-state rejection. Preserve "
+        "round trips and the existing pickle format of current slotted "
+        "dataclasses. Inspect qa_visible.py and the relevant production code. "
+        "You may change only src/packaging/_structures.py, "
+        "src/packaging/direct_url.py, and src/packaging/pylock.py. Do not edit "
+        "tests, packaging metadata, or any other file. Run exactly "
+        "python3 -B qa_visible.py as the only permitted test command; "
+        "you may repeat that exact command after edits. Read-only source "
+        "inspection commands are allowed. Do not run other tests or shell "
+        "commands that modify files."
+    ),
+    require_each_editable_ablation_red=True,
+    diagnostic_retake_of="packaging-legacy-dataclass-pickles",
+)
+
+
+def task_evidence_classification(task: RepositoryTask) -> str:
+    if task.diagnostic_retake_of is not None:
+        return "diagnostic-retake-same-upstream-source-not-fresh-held-out"
+    return "source-backed-task"
+
+
 def shared_user_prompt(task: RepositoryTask) -> str:
     """Model-neutral task input for paired Ash/plain-Codex evaluations."""
     return (
@@ -3904,6 +3975,54 @@ def preflight(task: RepositoryTask, root: Path) -> tuple[Path, dict[str, object]
         raise RuntimeError(
             "upstream historical regression is not independently reproducible"
         )
+    ablation_results: list[dict[str, object]] = []
+    if task.require_each_editable_ablation_red:
+        if not task.editable:
+            raise RuntimeError("module ablation requires editable source paths")
+        for tree in (baseline, reference):
+            _assert_safe_source_tree(tree)
+        for editable_path in sorted(task.editable):
+            relative = Path(editable_path)
+            if (
+                relative.is_absolute()
+                or not relative.parts
+                or ".." in relative.parts
+            ):
+                raise RuntimeError("editable module ablation path is unsafe")
+            with tempfile.TemporaryDirectory(
+                prefix=".ash-benchmark-ablation-", dir=root
+            ) as raw_ablation:
+                ablation = Path(raw_ablation) / "source"
+                shutil.copytree(
+                    reference,
+                    ablation,
+                    ignore=shutil.ignore_patterns(".git"),
+                )
+                source_module = baseline / relative
+                ablated_module = ablation / relative
+                if source_module.is_file():
+                    ablated_module.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copyfile(source_module, ablated_module)
+                elif ablated_module.is_file():
+                    ablated_module.unlink()
+                ablation_score = check_oracles(ablation, task)
+                visible_exit = ablation_score.get("visible_oracle_exit")
+                hidden_exit = ablation_score.get("hidden_oracle_exit")
+                ablation_is_red = (
+                    ablation_score.get("correct") is False
+                    and type(visible_exit) is int
+                    and type(hidden_exit) is int
+                    and (visible_exit != 0 or hidden_exit != 0)
+                )
+                if not ablation_is_red:
+                    raise RuntimeError(
+                        "an editable module ablation did not make the oracle red"
+                    )
+                ablation_results.append({
+                    "path": editable_path,
+                    "visible_oracle_exit": visible_exit,
+                    "hidden_oracle_exit": hidden_exit,
+                })
     base_files = snapshot_files(baseline)
     reference_files = snapshot_files(reference)
     if base_files != base_before or reference_files != reference_before:
@@ -3959,6 +4078,8 @@ def preflight(task: RepositoryTask, root: Path) -> tuple[Path, dict[str, object]
                 "system_python_executable": "/usr/bin/python3",
             }
         )
+    if task.require_each_editable_ablation_red:
+        receipt["editable_ablation_results"] = ablation_results
     if task.expected_reference_paths is not None:
         receipt.update(
             {
@@ -4043,6 +4164,7 @@ def collect_coding_session_receipts(
             "executed": entry.executed,
             "approved": entry.approved,
             "error": (entry.error or "")[:180],
+            "exit_code": entry.exit_code,
             "command": entry.arguments.get("command_line", "")
             if entry.tool_name == "run_command"
             else "",
@@ -4220,10 +4342,30 @@ def run_task(
         store = SessionStore(db / "sessions.db")
         aggregated = collect_coding_session_receipts(store, workspace)
         calls = aggregated["calls"]
+        if not isinstance(calls, list) or any(
+            not isinstance(call, dict) for call in calls
+        ):
+            raise RuntimeError("Coding session tool-call receipts are malformed")
         audit_ok = aggregated["audit_ok"] and aggregated["lineage_ok"]
         event_stats = aggregated["events"]
         usage = aggregated["usage"]
         terminals = aggregated["terminals"]
+        visible_test_calls = [
+            call for call in calls
+            if call["tool"] == "run_command"
+            and call["command"] == task.command_grant
+        ]
+        visible_test_command_count = sum(
+            call["executed"] is True for call in visible_test_calls
+        )
+        visible_test_command_executed = visible_test_command_count > 0
+        visible_test_command_passed = any(
+            call["executed"] is True
+            and call["success"] is True
+            and type(call["exit_code"]) is int
+            and call["exit_code"] == 0
+            for call in visible_test_calls
+        )
         required = any(
             call["tool"] in EDIT_TOOL_NAMES and call["success"] and call["executed"]
             for call in calls
@@ -4231,9 +4373,13 @@ def run_task(
             call["tool"] == "run_command"
             and call["success"]
             and call["executed"]
+            and type(call["exit_code"]) is int
+            and call["exit_code"] == 0
             and call["command"] == task.command_grant
             for call in calls
         )
+        if task.require_single_visible_test:
+            required = required and visible_test_command_count == 1
         result: dict[str, object] = {
             "task": task_name,
             "source": task.source,
@@ -4241,6 +4387,8 @@ def run_task(
             "license": task.license,
             "base_sha": task.base_sha,
             "reference_fix_sha": task.reference_fix_sha,
+            "diagnostic_retake_of": task.diagnostic_retake_of,
+            "evidence_classification": task_evidence_classification(task),
             "task_prompt_sha256": hashlib.sha256(task.prompt.encode()).hexdigest(),
             "user_prompt_sha256": hashlib.sha256(user_prompt.encode()).hexdigest(),
             "visible_oracle_sha256": hashlib.sha256(
@@ -4275,6 +4423,9 @@ def run_task(
             "protected_files_unchanged": protected,
             "required_sources_changed": changed,
             "required_tools_succeeded": required,
+            "visible_test_command_executed": visible_test_command_executed,
+            "visible_test_command_passed": visible_test_command_passed,
+            "visible_test_command_count": visible_test_command_count,
             "audit_ok": audit_ok,
             "terminal_events": terminals,
             "usage": usage,

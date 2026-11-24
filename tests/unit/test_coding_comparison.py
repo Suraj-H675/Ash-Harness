@@ -11,6 +11,9 @@ import pytest
 
 
 _path = Path(__file__).resolve().parents[2] / "devtools/coding_comparison.py"
+_devtools = _path.parent
+if str(_devtools) not in sys.path:
+    sys.path.insert(0, str(_devtools))
 _spec = importlib.util.spec_from_file_location("coding_comparison_under_test", _path)
 assert _spec is not None and _spec.loader is not None
 comparison = importlib.util.module_from_spec(_spec)
@@ -36,6 +39,10 @@ def _evidence(root: Path) -> tuple[Path, Path]:
                 "protected_files_unchanged": True,
                 "required_sources_changed": True,
                 "required_tools_succeeded": True,
+                "visible_test_command_executed": True,
+                "visible_test_command_passed": True,
+                "diagnostic_retake_of": None,
+                "evidence_classification": "source-backed-task",
                 "exit_code": 0,
                 "timed_out": False,
                 "elapsed_seconds": 80,
@@ -45,11 +52,26 @@ def _evidence(root: Path) -> tuple[Path, Path]:
     )
     (codex / "manifest.json").write_text(
         json.dumps(
-            {"task": "real-bug", "base_sha": "a" * 40, "reference_fix_sha": "b" * 40}
+            {
+                "task": "real-bug",
+                "base_sha": "a" * 40,
+                "reference_fix_sha": "b" * 40,
+                "visible_test": "python3 -B qa_visible.py",
+                "diagnostic_retake_of": None,
+                "evidence_classification": "source-backed-task",
+            }
         )
     )
     (codex / "invocation.json").write_text(json.dumps({
-        "ephemeral": True, "cli_seconds": 170,
+        "ephemeral": True,
+        "cli_seconds": 170,
+        "native_binary_direct": True,
+        "host_connector_isolation_verified": True,
+        "host_connector_disable_method": "native-features-and-mcp-list-per-invocation",
+        "host_connector_disabled_features": [
+            "apps", "codex_apps_mcp_2026_07_28", "enable_mcp_apps",
+        ],
+        "native_binary_sha256": "d" * 64,
     }))
     (codex / "grade.json").write_text(
         json.dumps(
@@ -61,6 +83,16 @@ def _evidence(root: Path) -> tuple[Path, Path]:
                 "protected_files_unchanged": True,
                 "required_source_changed": True,
                 "visible_test_command_executed": True,
+                "visible_test_command_passed": False,
+                "visible_test_command_count": 1,
+                "host_connector_isolation_verified": True,
+                "host_connector_invocation_observed": False,
+                "score_eligible": True,
+                "event_log_valid": True,
+                "native_binary_direct": True,
+                "native_binary_sha256": "d" * 64,
+                "diagnostic_retake_of": None,
+                "evidence_classification": "source-backed-task",
                 "exit_code": -15,
                 "timed_out": True,
                 "terminal_events": [],
@@ -71,6 +103,18 @@ def _evidence(root: Path) -> tuple[Path, Path]:
         )
     )
     (codex / "prompt.txt").write_text("SECRET-TEST-PROMPT")
+    (codex / "codex.jsonl").write_text(
+        json.dumps({
+            "type": "item.completed",
+            "item": {
+                "id": "visible-test",
+                "type": "command_execution",
+                "command": "python3 -B qa_visible.py",
+                "status": "completed",
+                "exit_code": 1,
+            },
+        }) + "\n" + json.dumps({"type": "turn.completed"}) + "\n"
+    )
     return ash, codex
 
 
@@ -82,6 +126,11 @@ def test_comparison_separates_correct_code_from_terminal_completion(
     assert report["requested_model_effort_match"] is True
     assert report["ash"]["scored_pass"] is True
     assert report["codex"]["correct_source"] is True
+    assert report["codex"]["visible_test_command_executed"] is True
+    assert report["codex"]["visible_test_command_passed"] is False
+    assert report["codex"]["recorded_visible_test_command_executed"] is True
+    assert report["codex"]["event_trace_verified"] is True
+    assert report["evaluation"]["host_connector_isolation_verified"] is True
     assert report["codex"]["cli_complete"] is False
     assert report["codex"]["scored_pass"] is False
     assert report["ash"]["timed_out"] is False
@@ -92,7 +141,7 @@ def test_comparison_separates_correct_code_from_terminal_completion(
     assert report["evaluation"]["same_tool_and_command_authorizations"] is False
     assert report["codex"]["prompt_sha256"] is not None
     assert "SECRET-TEST-PROMPT" not in repr(report)
-    assert report["evaluation"]["codex_native_binary_direct"] is False
+    assert report["evaluation"]["codex_native_binary_direct"] is True
     assert report["evaluation"]["excluded_provider_outage"] is False
     assert report["evaluation"]["matching_cli_timing_available"] is True
     assert report["evaluation"]["ash_unbounded_turn_configured"] is True
@@ -101,6 +150,316 @@ def test_comparison_separates_correct_code_from_terminal_completion(
     assert report["ash"]["elapsed_scope"] == "preflight_cli_and_grading"
     assert report["codex"]["cli_seconds"] == 170
     assert report["codex"]["elapsed_scope"] == "cli_only"
+
+
+def test_legacy_receipts_keep_host_isolation_unknown_and_are_not_pair_eligible(
+    tmp_path: Path,
+) -> None:
+    ash, codex = _evidence(tmp_path)
+    grade_path = codex / "grade.json"
+    grade = json.loads(grade_path.read_text())
+    grade["visible_test_command_executed"] = False
+    grade_path.write_text(json.dumps(grade))
+    for path, field in (
+        (ash / "result.json", "visible_test_command_executed"),
+        (ash / "result.json", "visible_test_command_passed"),
+        (codex / "grade.json", "host_connector_isolation_verified"),
+        (codex / "grade.json", "score_eligible"),
+    ):
+        data = json.loads(path.read_text())
+        data.pop(field, None)
+        path.write_text(json.dumps(data))
+    data = json.loads((codex / "manifest.json").read_text())
+    data.pop("evidence_classification", None)
+    data.pop("diagnostic_retake_of", None)
+    (codex / "manifest.json").write_text(json.dumps(data))
+
+    report = comparison.compare(ash, codex)
+
+    assert report["codex"]["host_connector_isolation_verified"] is None
+    assert report["codex"]["visible_test_command_executed"] is True
+    assert report["codex"]["recorded_visible_test_command_executed"] is False
+    assert report["codex"]["visible_test_command_passed"] is False
+    assert report["evaluation"]["host_connector_isolation_verified"] is None
+    assert report["comparison_verified"] is False
+    assert report["score_eligible"] is False
+    assert report["evidence_classification"] == "legacy-receipt-provenance-unrecorded"
+
+
+def test_malformed_event_log_keeps_grade_outcomes_but_blocks_control_claim(
+    tmp_path: Path,
+) -> None:
+    ash, codex = _evidence(tmp_path)
+    (codex / "codex.jsonl").write_text('{"type":"item.started",\n')
+
+    report = comparison.compare(ash, codex)
+
+    assert report["codex"]["correct_source"] is True
+    assert report["codex"]["visible_test_command_executed"] is True
+    assert report["codex"]["event_trace_verified"] is False
+    assert report["codex"]["host_connector_isolation_verified"] is None
+    assert report["comparison_verified"] is False
+    assert report["score_eligible"] is False
+
+
+def test_connector_trace_is_checked_even_without_visible_test_metadata(
+    tmp_path: Path,
+) -> None:
+    ash, codex = _evidence(tmp_path)
+    manifest_path = codex / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest.pop("visible_test")
+    manifest_path.write_text(json.dumps(manifest))
+    event_path = codex / "codex.jsonl"
+    event = {
+        "type": "item.failed",
+        "item": {
+            "type": "mcp_tool_call",
+            "server": "codex_apps_mcp_2026_07_28",
+            "tool": "devspace.open_workspace",
+            "status": "denied",
+        },
+    }
+    event_path.write_text(json.dumps(event) + "\n")
+
+    report = comparison.compare(ash, codex)
+
+    assert report["codex"]["event_trace_verified"] is True
+    assert report["codex"]["host_connector_invocation_observed"] is True
+    assert report["codex"]["host_connector_isolation_verified"] is False
+    assert report["codex"]["visible_test_command_executed"] is False
+    assert report["comparison_verified"] is False
+    assert report["score_eligible"] is False
+
+
+def test_mcp_attempt_invalidates_pair_eligibility_but_preserves_grade_outcomes(
+    tmp_path: Path,
+) -> None:
+    ash, codex = _evidence(tmp_path)
+    event_path = codex / "codex.jsonl"
+    events = [
+        json.loads(line) for line in event_path.read_text().splitlines()
+    ]
+    events.insert(0, {
+        "type": "item.started",
+        "item": {
+            "id": "host-call",
+            "type": "mcp_tool_call",
+            "server": "codex_apps_mcp_2026_07_28",
+            "tool": "devspace.open_workspace",
+            "status": "in_progress",
+        },
+    })
+    event_path.write_text("".join(json.dumps(event) + "\n" for event in events))
+    path = codex / "grade.json"
+    grade = json.loads(path.read_text())
+    grade.update({
+        "host_connector_isolation_verified": False,
+        "host_connector_invocation_observed": True,
+        "score_eligible": False,
+        "visible_test_command_executed": True,
+        "visible_test_command_passed": False,
+        "oracles": {"correct": True},
+        "protected_files_unchanged": True,
+        "required_source_changed": True,
+        "passed": False,
+    })
+    path.write_text(json.dumps(grade))
+
+    report = comparison.compare(ash, codex)
+
+    assert report["codex"]["correct_source"] is True
+    assert report["codex"]["visible_test_command_executed"] is True
+    assert report["codex"]["visible_test_command_passed"] is False
+    assert report["codex"]["host_connector_invocation_observed"] is True
+    assert report["codex"]["score_eligible"] is False
+    assert report["comparison_verified"] is False
+    assert report["score_eligible"] is False
+
+
+def test_historical_r23_is_read_as_failed_and_host_exposed_without_receipt_rewrite(
+    tmp_path: Path,
+) -> None:
+    ash, codex = _evidence(tmp_path)
+    ash_path = ash / "result.json"
+    ash_result = json.loads(ash_path.read_text())
+    ash_result.update({
+        "task": "packaging-legacy-dataclass-pickles",
+        "base_sha": comparison.TASKS[
+            "packaging-legacy-dataclass-pickles"
+        ].base_sha,
+        "reference_fix_sha": comparison.TASKS[
+            "packaging-legacy-dataclass-pickles"
+        ].reference_fix_sha,
+        "passed": False,
+        "visible_test_command_executed": True,
+        "visible_test_command_passed": True,
+        "oracle": {"correct": False},
+    })
+    for key in ("diagnostic_retake_of", "evidence_classification"):
+        ash_result.pop(key, None)
+    ash_path.write_text(json.dumps(ash_result))
+    for name in ("manifest.json", "grade.json"):
+        path = codex / name
+        receipt = json.loads(path.read_text())
+        receipt["task"] = "packaging-legacy-dataclass-pickles"
+        if name == "manifest.json":
+            receipt["base_sha"] = comparison.TASKS[
+                "packaging-legacy-dataclass-pickles"
+            ].base_sha
+            receipt["reference_fix_sha"] = comparison.TASKS[
+                "packaging-legacy-dataclass-pickles"
+            ].reference_fix_sha
+        receipt.pop("diagnostic_retake_of", None)
+        receipt.pop("evidence_classification", None)
+        if name == "manifest.json":
+            receipt["visible_test"] = "python3 -B qa_visible.py"
+        else:
+            receipt.update({
+                "passed": False,
+                "oracles": {"correct": False},
+                "required_source_changed": False,
+                "visible_test_command_executed": False,
+                "visible_test_command_passed": False,
+                "protected_files_unchanged": True,
+            })
+            for key in (
+                "host_connector_isolation_verified",
+                "host_connector_invocation_observed",
+                "score_eligible",
+            ):
+                receipt.pop(key, None)
+        path.write_text(json.dumps(receipt))
+    event_path = codex / "codex.jsonl"
+    events = [json.loads(line) for line in event_path.read_text().splitlines()]
+    events.insert(0, {
+        "type": "item.started",
+        "item": {
+            "id": "host-call",
+            "type": "mcp_tool_call",
+            "server": "codex_apps_mcp_2026_07_28",
+            "tool": "devspace.open_workspace",
+            "status": "completed",
+        },
+    })
+    event_path.write_text("".join(json.dumps(event) + "\n" for event in events))
+    before = {path.name: path.read_bytes() for path in (ash_path, codex / "grade.json")}
+
+    report = comparison.compare(ash, codex)
+
+    assert report["ash"]["scored_pass"] is False
+    assert report["ash"]["visible_test_command_executed"] is True
+    assert report["ash"]["visible_test_command_passed"] is True
+    assert report["codex"]["scored_pass"] is False
+    assert report["codex"]["correct_source"] is False
+    assert report["codex"]["visible_test_command_executed"] is True
+    assert report["codex"]["recorded_visible_test_command_executed"] is False
+    assert report["codex"]["visible_test_command_passed"] is False
+    assert report["codex"]["host_connector_invocation_observed"] is True
+    assert report["codex"]["host_connector_isolation_verified"] is False
+    assert report["comparison_verified"] is False
+    assert report["score_eligible"] is False
+    assert report["evaluation"]["fully_controlled"] is False
+    assert before == {
+        path.name: path.read_bytes() for path in (ash_path, codex / "grade.json")
+    }
+
+
+def test_diagnostic_retake_is_labeled_as_same_source_not_held_out(
+    tmp_path: Path,
+) -> None:
+    ash, codex = _evidence(tmp_path)
+    ash_data = json.loads((ash / "result.json").read_text())
+    ash_data.update({
+        "task": "packaging-legacy-dataclass-pickles-r23b",
+        "base_sha": comparison.TASKS[
+            "packaging-legacy-dataclass-pickles-r23b"
+        ].base_sha,
+        "reference_fix_sha": comparison.TASKS[
+            "packaging-legacy-dataclass-pickles-r23b"
+        ].reference_fix_sha,
+        "diagnostic_retake_of": "packaging-legacy-dataclass-pickles",
+        "evidence_classification": (
+            "diagnostic-retake-same-upstream-source-not-fresh-held-out"
+        ),
+    })
+    (ash / "result.json").write_text(json.dumps(ash_data))
+    for name in ("manifest.json", "grade.json"):
+        path = codex / name
+        data = json.loads(path.read_text())
+        data.update({
+            "task": "packaging-legacy-dataclass-pickles-r23b",
+            "diagnostic_retake_of": "packaging-legacy-dataclass-pickles",
+            "evidence_classification": (
+                "diagnostic-retake-same-upstream-source-not-fresh-held-out"
+            ),
+        })
+        if name == "manifest.json":
+            data["base_sha"] = comparison.TASKS[
+                "packaging-legacy-dataclass-pickles-r23b"
+            ].base_sha
+            data["reference_fix_sha"] = comparison.TASKS[
+                "packaging-legacy-dataclass-pickles-r23b"
+            ].reference_fix_sha
+        path.write_text(json.dumps(data))
+
+    report = comparison.compare(ash, codex)
+
+    assert report["diagnostic_retake_of"] == "packaging-legacy-dataclass-pickles"
+    assert report["evidence_classification"] == (
+        "diagnostic-retake-same-upstream-source-not-fresh-held-out"
+    )
+    assert report["preflight_verified"] is False
+    assert report["comparison_verified"] is False
+    assert any("same upstream source" in item for item in report["comparison_caveats"])
+    assert any("different system prompts and built-in tool descriptions" in item for item in report["comparison_caveats"])
+    assert any("shell policy is not independently enforced" in item for item in report["comparison_caveats"])
+
+
+def test_r23b_registry_label_survives_missing_receipt_provenance(
+    tmp_path: Path,
+) -> None:
+    ash, codex = _evidence(tmp_path)
+    ash_path = ash / "result.json"
+    ash_data = json.loads(ash_path.read_text())
+    ash_data.update({
+        "task": "packaging-legacy-dataclass-pickles-r23b",
+        "base_sha": comparison.TASKS[
+            "packaging-legacy-dataclass-pickles-r23b"
+        ].base_sha,
+        "reference_fix_sha": comparison.TASKS[
+            "packaging-legacy-dataclass-pickles-r23b"
+        ].reference_fix_sha,
+        "diagnostic_retake_of": None,
+        "evidence_classification": "source-backed-task",
+    })
+    ash_path.write_text(json.dumps(ash_data))
+    for name in ("manifest.json", "grade.json"):
+        path = codex / name
+        data = json.loads(path.read_text())
+        data.update({
+            "task": "packaging-legacy-dataclass-pickles-r23b",
+            "diagnostic_retake_of": None,
+            "evidence_classification": "source-backed-task",
+        })
+        if name == "manifest.json":
+            data["base_sha"] = comparison.TASKS[
+                "packaging-legacy-dataclass-pickles-r23b"
+            ].base_sha
+            data["reference_fix_sha"] = comparison.TASKS[
+                "packaging-legacy-dataclass-pickles-r23b"
+            ].reference_fix_sha
+        path.write_text(json.dumps(data))
+
+    report = comparison.compare(ash, codex)
+
+    assert report["diagnostic_retake_of"] == "packaging-legacy-dataclass-pickles"
+    assert report["evidence_classification"] == (
+        "diagnostic-retake-same-upstream-source-not-fresh-held-out"
+    )
+    assert report["evaluation"]["evidence_classification_verified"] is False
+    assert report["preflight_verified"] is False
+    assert report["comparison_verified"] is False
 
 
 @pytest.mark.parametrize("budget,unbounded,asymmetric", [
@@ -197,7 +556,12 @@ def test_isolated_codex_receipt_is_distinguished_from_legacy_trial(
     report = comparison.compare(ash, codex)
     assert report["evaluation"]["codex_native_binary_direct"] is True
     assert report["evaluation"]["codex_private_home_and_xdg"] is True
-    assert report["evaluation"]["codex_ephemeral_auth_cleanup"] is True
+    assert report["evaluation"]["codex_ephemeral_auth_cleanup"] is False
+    invocation_path = codex / "invocation.json"
+    invocation = json.loads(invocation_path.read_text())
+    invocation["memory_backed_auth_copy_cleaned"] = True
+    invocation_path.write_text(json.dumps(invocation))
+    assert comparison.compare(ash, codex)["evaluation"]["codex_ephemeral_auth_cleanup"] is True
 
 
 @pytest.mark.parametrize("window", [32768, 65536])

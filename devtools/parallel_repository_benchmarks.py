@@ -23,12 +23,16 @@ from typing import Any, Callable
 
 from coding_comparison import compare
 from codex_repository_benchmark import (
-    _native_codex_binary,
     _require_sealed_comparator_profile,
+    _verify_host_connector_isolation,
 )
 from coding_benchmark import _chatgpt_tmpfs_root
 from ash.providers.openai_chatgpt_auth import ChatGPTAuthSession, ChatGPTCredentialStore
-from repository_benchmark import TASKS, hidden_oracle_classification
+from repository_benchmark import (
+    TASKS,
+    hidden_oracle_classification,
+    task_evidence_classification,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -57,8 +61,10 @@ def preflight_plain_codex_readiness() -> None:
     before its own dispatch. This early guard only prevents a wasted Ash arm;
     it does not assert identical Ash/Codex runtime tool permissions.
     """
-    _require_sealed_comparator_profile()
-    _native_codex_binary()
+    executable, attested_sha = _require_sealed_comparator_profile()
+    readiness = _verify_host_connector_isolation(executable)
+    if readiness["native_binary_sha256"] != attested_sha:
+        raise RuntimeError("Native Codex no longer matches the sealed attestation")
     _chatgpt_tmpfs_root()
 
 
@@ -139,19 +145,36 @@ def run_pair(
             # the aggregate report. The private stderr file is diagnostic.
             exit_codes[engine] = -1
 
+    comparison_caveats = [
+        "system prompts and built-in tool descriptions differ between Ash and native Codex",
+        "Ash enforces exact command permissions; native Codex shell policy is not independently enforced",
+        "feature checks cover named app and MCP flags; event logs do not inventory every possible host tool",
+        "requested model settings do not attest every effective limit",
+    ]
+    if TASKS[task].diagnostic_retake_of is not None:
+        comparison_caveats.append(
+            "diagnostic retake of the same upstream source; no fresh held-out evidence"
+        )
+        comparison_caveats.append(
+            "retake eligibility requires matching red/green and per-module ablation preflight results from both arms"
+        )
     result: dict[str, Any] = {
         "task": task,
+        "diagnostic_retake_of": TASKS[task].diagnostic_retake_of,
+        "evidence_classification": task_evidence_classification(TASKS[task]),
         "repetition": repetition,
         "engine_order": list(order),
         "runner_exit_codes": exit_codes,
         "comparison_verified": False,
         "fully_controlled": False,
+        "score_eligible": False,
+        "preflight_verified": None,
+        "host_connector_isolation_verified": None,
+        "host_connector_disable_method": None,
+        "host_connector_disabled_features": None,
+        "native_binary_sha256": None,
         "comparison_scope": "operational_qualified",
-        "comparison_caveats": [
-            "system prompts are not matched or attested",
-            "tool and command authorizations are not identical",
-            "requested model settings do not attest every effective limit",
-        ],
+        "comparison_caveats": comparison_caveats,
         "hidden_oracle_classification": hidden_oracle_classification(TASKS[task]),
     }
     try:
@@ -160,29 +183,31 @@ def run_pair(
         result["reason"] = "incomplete_or_mismatched_receipts"
     else:
         evaluation = comparison["evaluation"]
-        matched = all(
-            evaluation[key]
-            for key in (
-                "same_upstream_revision_pins",
-                "same_task_objective_fingerprint_verified",
-                "identical_user_prompts_verified",
-                "identical_oracle_source_verified",
-                "same_requested_context_window",
-                "ash_unbounded_turn_configured",
-                "codex_native_binary_direct",
-                "codex_private_home_and_xdg",
-                "codex_ephemeral_auth_cleanup",
-            )
-        ) and comparison["requested_model_effort_match"]
-        matched = matched and not evaluation["excluded_provider_outage"]
+        exit_codes_consistent = all(
+            exit_codes.get(engine) == (0 if comparison[engine]["scored_pass"] else 1)
+            for engine in ("ash", "codex")
+        )
+        matched = comparison["comparison_verified"] is True and exit_codes_consistent
         result.update(
             comparison_verified=bool(matched),
             reason="verified" if matched else "provider_outage_or_parity_unverified",
-            fully_controlled=evaluation["fully_controlled"] is True,
-            comparison_scope=(
-                "controlled" if evaluation["fully_controlled"] is True
-                else "operational_qualified"
+            fully_controlled=False,
+            score_eligible=matched and comparison["score_eligible"] is True,
+            runner_exit_codes_consistent=exit_codes_consistent,
+            preflight_verified=comparison["preflight_verified"],
+            comparison_scope="operational_qualified",
+            diagnostic_retake_of=comparison["diagnostic_retake_of"],
+            evidence_classification=comparison["evidence_classification"],
+            host_connector_isolation_verified=(
+                evaluation["host_connector_isolation_verified"]
             ),
+            host_connector_disable_method=(
+                comparison["codex"]["host_connector_disable_method"]
+            ),
+            host_connector_disabled_features=(
+                comparison["codex"]["host_connector_disabled_features"]
+            ),
+            native_binary_sha256=comparison["codex"]["native_binary_sha256"],
             ash_pass=comparison["ash"]["scored_pass"],
             codex_pass=comparison["codex"]["scored_pass"],
             # Preserve the evidence that a graded repair can be correct yet
@@ -192,9 +217,14 @@ def run_pair(
                 engine: {
                     field: comparison[engine][field]
                     for field in (
-                        "correct_source", "visible_test_executed",
+                        "correct_source", "visible_test_command_executed",
+                        "visible_test_command_passed",
+                        "host_connector_isolation_verified",
+                        "host_connector_invocation_observed", "score_eligible",
+                        "shell_command_policy_enforced",
                         "cli_complete", "timed_out", "scored_pass",
                     )
+                    if field in comparison[engine]
                 }
                 for engine in ("ash", "codex")
             },

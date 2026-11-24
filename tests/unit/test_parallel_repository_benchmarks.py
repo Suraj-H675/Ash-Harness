@@ -36,10 +36,36 @@ def _emit_receipt(task_name: str, evidence: Path, *, outage: bool = False) -> No
     """Synthetic receipts exercise the real read-only comparator, not a model."""
     evidence.mkdir(mode=0o700)
     task = TASKS[task_name]
+    diagnostic_retake_of = task.diagnostic_retake_of
+    evidence_classification = (
+        "diagnostic-retake-same-upstream-source-not-fresh-held-out"
+        if diagnostic_retake_of
+        else "source-backed-task"
+    )
+    preflight = {
+        "base_visible_exit": 1,
+        "base_hidden_exit": 1,
+        "reference_visible_exit": 0,
+        "reference_hidden_exit": 0,
+        "reference_added_paths": [],
+        "reference_removed_paths": [],
+        "reference_modified_paths": [],
+        "editable_ablation_results": [
+            {
+                "path": path,
+                "visible_oracle_exit": 1,
+                "hidden_oracle_exit": 1,
+            }
+            for path in sorted(task.editable)
+        ],
+    }
     base = {
         "task": task_name,
         "base_sha": task.base_sha,
         "reference_fix_sha": task.reference_fix_sha,
+        "diagnostic_retake_of": diagnostic_retake_of,
+        "evidence_classification": evidence_classification,
+        "preflight": preflight,
     }
     hashes = {
         "task_prompt_sha256": hashlib.sha256(task.prompt.encode()).hexdigest(),
@@ -55,24 +81,46 @@ def _emit_receipt(task_name: str, evidence: Path, *, outage: bool = False) -> No
             "reasoning_effort": "xhigh", "context_tokens": 32768,
             "turn_token_budget": 0,
             "passed": True, "oracle": {"correct": True},
+            "visible_test_command_executed": True,
+            "visible_test_command_passed": True,
             "protected_files_unchanged": True, "required_sources_changed": True,
             "required_tools_succeeded": True, "exit_code": 0,
             "timed_out": False, "cli_seconds": 25.0, "elapsed_seconds": 29.0,
         }))
         return
-    (evidence / "manifest.json").write_text(json.dumps({**base, **hashes}))
+    (evidence / "manifest.json").write_text(json.dumps({
+        **base, **hashes, "visible_test": task.command_grant,
+        "editable": sorted(task.editable),
+    }))
     (evidence / "prompt.txt").write_text(shared_user_prompt(task))
     (evidence / "invocation.json").write_text(json.dumps({
-        "ephemeral": True, "cli_seconds": 30.0,
+        "ephemeral": True, "memory_backed_auth_copy_cleaned": True, "cli_seconds": 30.0,
+        "native_binary_direct": True,
+        "host_connector_isolation_verified": True,
+        "host_connector_disable_method": "native-features-and-mcp-list-per-invocation",
+        "host_connector_disabled_features": [
+            "apps", "codex_apps_mcp_2026_07_28", "enable_mcp_apps",
+        ],
+        "native_binary_sha256": "e" * 64,
     }))
     (evidence / "grade.json").write_text(json.dumps({
         "task": task_name, "model_requested": "gpt-6-luna",
+        "diagnostic_retake_of": diagnostic_retake_of,
+        "evidence_classification": evidence_classification,
         "reasoning_effort_requested": "xhigh", "context_tokens_requested": 32768,
         "passed": not outage,
         "oracles": {"correct": not outage},
         "protected_files_unchanged": True,
         "required_source_changed": not outage,
         "visible_test_command_executed": not outage,
+        "visible_test_command_passed": not outage,
+        "visible_test_command_count": 1 if not outage else 0,
+        "host_connector_isolation_verified": True,
+        "host_connector_invocation_observed": False,
+        "score_eligible": not outage,
+        "shell_command_policy_enforced": False,
+        "event_log_valid": True,
+        "native_binary_sha256": "e" * 64,
         "exit_code": 0 if not outage else -15,
         "timed_out": outage, "terminal_events": ["turn.completed"] if not outage else [],
         "elapsed_seconds": 30.0, "shell_non_test_commands": 2,
@@ -80,6 +128,29 @@ def _emit_receipt(task_name: str, evidence: Path, *, outage: bool = False) -> No
         "isolated_home_xdg": True, "memory_backed_auth_copy_cleaned": True,
         "infrastructure_unavailable": outage,
     }))
+    event_rows = []
+    if outage:
+        event_rows.append({
+            "type": "error",
+            "message": "workspace routing discovery timed out",
+        })
+    else:
+        event_rows.extend([
+            {
+                "type": "item.completed",
+                "item": {
+                    "id": "visible-test",
+                    "type": "command_execution",
+                    "command": task.command_grant,
+                    "status": "completed",
+                    "exit_code": 0,
+                },
+            },
+            {"type": "turn.completed"},
+        ])
+    (evidence / "codex.jsonl").write_text(
+        "".join(json.dumps(event) + "\n" for event in event_rows)
+    )
 
 
 def test_engine_commands_select_plain_codex_with_identical_model_limits(
@@ -144,6 +215,33 @@ def test_explicit_batch_consent_reaches_only_plain_codex_runner(
     assert "--authorize-model-trial" not in commands(
         "h11-chunk-footer", "codex", tmp_path, 170, 32768
     )
+
+
+def test_native_readiness_checks_apps_before_any_credential_preparation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sequence: list[str] = []
+    native = Path("/isolated/native/codex")
+    monkeypatch.setattr(
+        batch_runner, "_require_sealed_comparator_profile",
+        lambda: (sequence.append("attestation") or (native, "e" * 64)),
+    )
+    monkeypatch.setattr(
+        batch_runner, "_verify_host_connector_isolation",
+        lambda executable: (sequence.append(
+            "features" if executable == native else "wrong-binary"
+        ) or {"native_binary_sha256": "e" * 64}),
+    )
+    monkeypatch.setattr(
+        batch_runner, "_chatgpt_tmpfs_root",
+        lambda: (sequence.append("credential-storage-check") or Path("/dev/shm")),
+    )
+
+    batch_runner.preflight_plain_codex_readiness()
+
+    assert sequence == [
+        "attestation", "features", "credential-storage-check",
+    ]
 
 
 def test_paired_cli_requires_consent_before_reading_auth_or_creating_evidence(
@@ -293,14 +391,20 @@ def test_pair_alternates_order_and_validates_external_receipts(
     assert report["engine_outcomes"] == {
         "ash": {
             "correct_source": True,
-            "visible_test_executed": True,
+            "visible_test_command_executed": True,
+            "visible_test_command_passed": True,
             "cli_complete": True,
             "timed_out": False,
             "scored_pass": True,
         },
         "codex": {
             "correct_source": True,
-            "visible_test_executed": True,
+            "visible_test_command_executed": True,
+            "visible_test_command_passed": True,
+            "host_connector_isolation_verified": True,
+            "host_connector_invocation_observed": False,
+            "score_eligible": True,
+            "shell_command_policy_enforced": False,
             "cli_complete": True,
             "timed_out": False,
             "scored_pass": True,
@@ -308,6 +412,16 @@ def test_pair_alternates_order_and_validates_external_receipts(
     }
     assert report["timing_available"] is True
     assert report["fully_controlled"] is False
+    assert report["score_eligible"] is True
+    assert report["preflight_verified"] is None
+    assert report["host_connector_isolation_verified"] is True
+    assert report["host_connector_disable_method"] == (
+        "native-features-and-mcp-list-per-invocation"
+    )
+    assert report["host_connector_disabled_features"] == [
+        "apps", "codex_apps_mcp_2026_07_28", "enable_mcp_apps",
+    ]
+    assert report["native_binary_sha256"] == "e" * 64
     assert report["comparison_scope"] == "operational_qualified"
     assert report["ash_cli_seconds"] == 25.0
     assert report["codex_cli_seconds"] == 30.0
@@ -332,6 +446,8 @@ def test_pair_preserves_correct_code_and_test_but_failed_completion(
             receipt["oracle"]["correct"] = False
             receipt["required_sources_changed"] = False
             receipt["required_tools_succeeded"] = False
+            receipt["visible_test_command_executed"] = False
+            receipt["visible_test_command_passed"] = False
         else:
             receipt["terminal_events"] = []
         path.write_text(json.dumps(receipt))
@@ -347,14 +463,20 @@ def test_pair_preserves_correct_code_and_test_but_failed_completion(
     assert report["engine_outcomes"] == {
         "ash": {
             "correct_source": False,
-            "visible_test_executed": False,
+            "visible_test_command_executed": False,
+            "visible_test_command_passed": False,
             "cli_complete": False,
             "timed_out": False,
             "scored_pass": False,
         },
         "codex": {
             "correct_source": True,
-            "visible_test_executed": True,
+            "visible_test_command_executed": True,
+            "visible_test_command_passed": True,
+            "host_connector_isolation_verified": True,
+            "host_connector_invocation_observed": False,
+            "score_eligible": True,
+            "shell_command_policy_enforced": False,
             "cli_complete": False,
             "timed_out": True,
             "scored_pass": False,
@@ -377,6 +499,78 @@ def test_pair_excludes_provider_outage_from_valid_comparisons(tmp_path: Path) ->
     assert report["comparison_verified"] is False
     assert report["reason"] == "provider_outage_or_parity_unverified"
     assert report["runner_exit_codes"] == {"ash": 0, "codex": 1}
+
+
+def test_pair_mcp_attempt_blocks_comparison_but_keeps_source_outcomes(
+    tmp_path: Path,
+) -> None:
+    def fake_invoke(_argv: list[str], evidence: Path) -> int:
+        _emit_receipt("h11-chunk-footer", evidence)
+        if evidence.name == "codex":
+            path = evidence / "grade.json"
+            grade = json.loads(path.read_text())
+            grade.update({
+                "passed": False,
+                "score_eligible": False,
+                "host_connector_isolation_verified": False,
+                "host_connector_invocation_observed": True,
+            })
+            path.write_text(json.dumps(grade))
+            event_path = evidence / "codex.jsonl"
+            events = [json.loads(line) for line in event_path.read_text().splitlines()]
+            events.insert(0, {
+                "type": "item.started",
+                "item": {
+                    "id": "host-call",
+                    "type": "mcp_tool_call",
+                    "server": "codex_apps_mcp_2026_07_28",
+                    "tool": "devspace.open_workspace",
+                    "status": "in_progress",
+                },
+            })
+            event_path.write_text(
+                "".join(json.dumps(event) + "\n" for event in events)
+            )
+        return 0
+
+    report = run_pair(
+        "h11-chunk-footer", 1, tmp_path, 170, 32768,
+        invoke=fake_invoke, authorize_model_trial=True,
+    )
+
+    assert report["comparison_verified"] is False
+    assert report["score_eligible"] is False
+    assert report["codex_pass"] is False
+    assert report["engine_outcomes"]["codex"]["correct_source"] is True
+    assert report["engine_outcomes"]["codex"]["host_connector_isolation_verified"] is False
+    assert report["engine_outcomes"]["codex"]["host_connector_invocation_observed"] is True
+    assert report["engine_outcomes"]["codex"]["visible_test_command_executed"] is True
+    assert report["engine_outcomes"]["codex"]["visible_test_command_passed"] is True
+
+
+def test_r23b_pair_is_labeled_diagnostic_same_source_not_held_out(
+    tmp_path: Path,
+) -> None:
+    task = "packaging-legacy-dataclass-pickles-r23b"
+
+    def fake_invoke(_argv: list[str], evidence: Path) -> int:
+        _emit_receipt(task, evidence)
+        return 0
+
+    report = run_pair(
+        task, 1, tmp_path, 170, 32768,
+        invoke=fake_invoke, authorize_model_trial=True,
+    )
+
+    assert report["comparison_verified"] is True
+    assert report["fully_controlled"] is False
+    assert report["score_eligible"] is True
+    assert report["preflight_verified"] is True
+    assert report["diagnostic_retake_of"] == "packaging-legacy-dataclass-pickles"
+    assert report["evidence_classification"] == (
+        "diagnostic-retake-same-upstream-source-not-fresh-held-out"
+    )
+    assert any("same upstream source" in item for item in report["comparison_caveats"])
 
 
 def test_r17_synthetic_pair_uses_the_standard_grade_path(tmp_path: Path) -> None:
@@ -485,3 +679,51 @@ def test_benchmark_credential_preflight_never_exposes_token(
     monkeypatch.setattr(batch_runner.time, "time", lambda: 800)
     assert refresh_existing_chatgpt_access(160) is True
     assert refresh_existing_chatgpt_access(180) is False
+
+
+@pytest.mark.parametrize("fault", [
+    "missing_test_metadata", "wrong_test_command", "contradictory_command",
+    "missing_cleanup", "failed_cleanup", "non_ephemeral", "unexpected_exit",
+])
+def test_r23b_rejects_inconsistent_evidence_without_model(tmp_path: Path, fault: str) -> None:
+    task = "packaging-legacy-dataclass-pickles-r23b"
+
+    def fake_invoke(_argv: list[str], evidence: Path) -> int:
+        _emit_receipt(task, evidence)
+        if evidence.name == "ash":
+            return 0
+        grade_path = evidence / "grade.json"
+        invocation_path = evidence / "invocation.json"
+        manifest_path = evidence / "manifest.json"
+        trace_path = evidence / "codex.jsonl"
+        grade = json.loads(grade_path.read_text())
+        invocation = json.loads(invocation_path.read_text())
+        invocation.update(memory_backed_auth_copy_cleaned=True)
+        trace = [json.loads(row) for row in trace_path.read_text().splitlines()]
+        if fault == "missing_test_metadata":
+            for key in ("visible_test_command_executed", "visible_test_command_passed", "visible_test_command_count"):
+                grade.pop(key)
+            trace = [{"type": "turn.completed"}]
+        elif fault == "wrong_test_command":
+            manifest = json.loads(manifest_path.read_text())
+            manifest["visible_test"] = "python3 -B wrong.py"
+            manifest_path.write_text(json.dumps(manifest))
+            trace[0]["item"]["command"] = "python3 -B wrong.py"
+        elif fault == "contradictory_command":
+            trace.insert(0, {"type": "item.started", "item": {
+                "id": "visible-test", "type": "command_execution", "command": "python3 -B wrong.py", "status": "in_progress",
+            }})
+        elif fault == "missing_cleanup":
+            invocation.pop("memory_backed_auth_copy_cleaned")
+        elif fault == "failed_cleanup":
+            invocation["memory_backed_auth_copy_cleaned"] = False
+        elif fault == "non_ephemeral":
+            invocation["ephemeral"] = False
+        grade_path.write_text(json.dumps(grade))
+        invocation_path.write_text(json.dumps(invocation))
+        trace_path.write_text("".join(json.dumps(row) + "\n" for row in trace))
+        return 137 if fault == "unexpected_exit" else 0
+
+    result = run_pair(task, 1, tmp_path, 300, 32768, invoke=fake_invoke, authorize_model_trial=True)
+    assert result["comparison_verified"] is False
+    assert result["score_eligible"] is False

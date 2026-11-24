@@ -1468,6 +1468,7 @@ def test_r17_ash_fake_grade_accepts_one_semantic_source_repair(
             "success": True,
             "executed": True,
             "command": task.command_grant,
+            "exit_code": 0,
         },
     ]
 
@@ -1526,6 +1527,8 @@ def test_r17_ash_fake_grade_accepts_one_semantic_source_repair(
     assert result["protected_files_unchanged"] is True
     assert result["required_sources_changed"] is True
     assert result["required_tools_succeeded"] is True
+    assert result["visible_test_command_executed"] is True
+    assert result["visible_test_command_passed"] is True
     assert result["oracle"]["correct"] is True
     assert result["scratch_removed"] is True
     assert any(task.command_grant in " ".join(argv) for argv in setup_commands)
@@ -1882,3 +1885,136 @@ def test_r23_packaging_legacy_pickle_oracle_covers_all_model_types() -> None:
     assert "pickle.HIGHEST_PROTOCOL" in task.hidden_source
     assert "pickle.loads(pickle.dumps(loaded" in task.hidden_source
     assert "blank.__setstate__(state)" not in task.visible_source
+
+
+def test_r23b_diagnostic_retake_freezes_new_semantic_oracle_without_rewriting_r23() -> None:
+    old = bench.TASKS["packaging-legacy-dataclass-pickles"]
+    task = bench.TASKS["packaging-legacy-dataclass-pickles-r23b"]
+
+    assert hashlib.sha256(old.visible_source.encode()).hexdigest() == (
+        "f93ccad77d00cd3dfba104aefd8fe65d0dfed02e5cfdc082569fe8a060018005"
+    )
+    assert hashlib.sha256(old.hidden_source.encode()).hexdigest() == (
+        "7b3ae5e595787dfb7bb99580c7adbb96d17140859e57105b0e1ce175f400e41f"
+    )
+    assert task.source == old.source == "pypa/packaging"
+    assert task.upstream == old.upstream
+    assert task.upstream_pr == old.upstream_pr
+    assert task.base_sha == old.base_sha == "0efe21aa398df645c259ee31e54a8a4400b1fc6b"
+    assert task.reference_fix_sha == old.reference_fix_sha == (
+        "6c838aca5942572ba04a1d1a603f5eaed0694263"
+    )
+    assert task.editable == old.editable == frozenset({
+        "src/packaging/_structures.py",
+        "src/packaging/direct_url.py",
+        "src/packaging/pylock.py",
+    })
+    assert task.expected_reference_paths == old.expected_reference_paths
+    assert task.visible_source == old.visible_source
+    assert task.visible_script == old.visible_script == "qa_visible.py"
+    assert task.command_grant == old.command_grant == "python3 -B qa_visible.py"
+    assert task.prompt.count(task.command_grant) == 1
+    assert "run_command" not in task.prompt
+    assert "TypeError or ValueError" in task.prompt
+    assert task.diagnostic_retake_of == "packaging-legacy-dataclass-pickles"
+    assert task.require_all_editable_changed is False
+    assert task.require_both_oracles_red_green is True
+    assert task.require_each_editable_ablation_red is True
+    assert task.runtime is None
+    assert bench.shared_user_prompt(task) == task.prompt
+    assert task.hidden_source != old.hidden_source
+    assert task.hidden_source.replace(
+        bench._PACKAGING_R23B_BAD_STATE_LOOP,
+        bench._PACKAGING_R23_BAD_STATE_LOOP,
+        1,
+    ) == old.hidden_source
+    assert "except (TypeError,ValueError):" in task.hidden_source
+    assert "blank.__setstate__(state)" in task.hidden_source
+    assert "pickle.HIGHEST_PROTOCOL" in task.hidden_source
+    assert "pickle.loads(pickle.dumps(loaded" in task.hidden_source
+    assert "R23_PACKAGING_HIDDEN_OK" in task.hidden_source
+    assert hashlib.sha256(task.hidden_source.encode()).hexdigest() == (
+        "bb86a4b1911d9a2bdafa010e524ad0ae3723ef11d126ac9ea135b952c8401e81"
+    )
+    compile(task.visible_source, "qa_visible.py", "exec")
+    compile(task.hidden_source, "<sealed-r23b-oracle>", "exec")
+
+
+def test_r23b_task_classification_is_diagnostic_not_independent_holdout() -> None:
+    task = bench.TASKS["packaging-legacy-dataclass-pickles-r23b"]
+    assert bench.task_evidence_classification(task) == (
+        "diagnostic-retake-same-upstream-source-not-fresh-held-out"
+    )
+    original = bench.TASKS["packaging-legacy-dataclass-pickles"]
+    assert bench.task_evidence_classification(original) == "source-backed-task"
+
+
+@pytest.mark.parametrize(
+    ("green_ablation_path", "accepted"),
+    [(None, True), ("src/pkg/_two.py", False)],
+)
+def test_preflight_independently_retests_each_editable_module_ablation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    green_ablation_path: str | None,
+    accepted: bool,
+) -> None:
+    editable = frozenset({
+        "src/pkg/_one.py", "src/pkg/_two.py", "src/pkg/_three.py",
+    })
+    task = replace(
+        bench.TASKS["h11-chunk-footer"],
+        editable=editable,
+        expected_reference_paths=None,
+        runtime=None,
+        require_both_oracles_red_green=True,
+        require_each_editable_ablation_red=True,
+    )
+    monkeypatch.setattr(bench, "_verify_r17_python_command_parity", lambda: None)
+    monkeypatch.setattr(bench, "_attest_r17_system_python_version", lambda: "3.14.10")
+
+    def fake_fetch(destination: Path, _task: object, sha: str) -> None:
+        destination.mkdir()
+        for path in editable:
+            source = destination / path
+            source.parent.mkdir(parents=True, exist_ok=True)
+            source.write_text(
+                f"{'reference' if sha == task.reference_fix_sha else 'base'}:{path}",
+                encoding="utf-8",
+            )
+
+    def fake_grade(workspace: Path, _task: object) -> dict[str, object]:
+        reverted = [
+            path for path in editable
+            if (workspace / path).read_text(encoding="utf-8") == f"base:{path}"
+        ]
+        green = not reverted or reverted == [green_ablation_path]
+        status = 0 if green else 1
+        return {
+            "correct": green,
+            "visible_oracle_exit": status,
+            "hidden_oracle_exit": status,
+        }
+
+    monkeypatch.setattr(bench, "fetch_pinned", fake_fetch)
+    monkeypatch.setattr(bench, "check_oracles", fake_grade)
+    if not accepted:
+        with pytest.raises(RuntimeError, match="module ablation did not make the oracle red"):
+            bench.preflight(task, tmp_path)
+        assert not list(tmp_path.glob(".ash-benchmark-ablation-*"))
+        return
+
+    _baseline, proof = bench.preflight(task, tmp_path)
+    assert [item["path"] for item in proof["editable_ablation_results"]] == sorted(editable)
+    assert all(
+        item["visible_oracle_exit"] != 0 or item["hidden_oracle_exit"] != 0
+        for item in proof["editable_ablation_results"]
+    )
+    assert not list(tmp_path.glob(".ash-benchmark-ablation-*"))
+
+
+def test_r23b_allows_iterative_visible_test_runs_with_same_command() -> None:
+    task = bench.TASKS["packaging-legacy-dataclass-pickles-r23b"]
+    assert task.require_single_visible_test is False
+    assert "you may repeat that exact command after edits" in task.prompt
+    assert task.command_grant == "python3 -B qa_visible.py"
