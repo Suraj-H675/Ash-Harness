@@ -3792,30 +3792,87 @@ class SessionStore:
         """Append a single message to a session."""
 
         with closing(self._connect()) as conn, conn:
-            conn.execute(
-                """
-                INSERT INTO messages (
-                    session_id, role, content, timestamp, metadata_json,
-                    token_count, prompt_tokens, completion_tokens, turn_id
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    session_id,
-                    message.role,
-                    message.content,
-                    _serialize_datetime(message.timestamp),
-                    json.dumps(message.metadata),
-                    token_count,
-                    prompt_tokens,
-                    completion_tokens,
-                    turn_id,
-                ),
+            self._save_message_in_connection(
+                conn, session_id, message, token_count=token_count,
+                prompt_tokens=prompt_tokens, completion_tokens=completion_tokens,
+                turn_id=turn_id,
             )
-            conn.execute(
-                "UPDATE sessions SET updated_at = ? WHERE session_id = ?",
-                (_serialize_datetime(message.timestamp), session_id),
+
+    @staticmethod
+    def _save_message_in_connection(
+        conn: sqlite3.Connection,
+        session_id: str,
+        message: Message,
+        *,
+        token_count: int = 0,
+        prompt_tokens: int = 0,
+        completion_tokens: int = 0,
+        turn_id: str | None = None,
+    ) -> None:
+        conn.execute(
+            """
+            INSERT INTO messages (
+                session_id, role, content, timestamp, metadata_json,
+                token_count, prompt_tokens, completion_tokens, turn_id
             )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                session_id,
+                message.role,
+                message.content,
+                _serialize_datetime(message.timestamp),
+                json.dumps(message.metadata),
+                token_count,
+                prompt_tokens,
+                completion_tokens,
+                turn_id,
+            ),
+        )
+        conn.execute(
+            "UPDATE sessions SET updated_at = ? WHERE session_id = ?",
+            (_serialize_datetime(message.timestamp), session_id),
+        )
+
+    def save_completed_tool_free_report(
+        self, session_id: str, report_turn_id: str, message: Message,
+    ) -> None:
+        """Publish a report and its completed journal state in one transaction.
+
+        The caller holds the session lease and has already saved measured usage.
+        Never expose a completed-looking assistant message for a failed report.
+        """
+        source_turn_id = message.metadata.get("source_interrupted_turn_id")
+        if (
+            message.role != "assistant"
+            or message.metadata.get("tool_free_finalization") is not True
+            or not isinstance(source_turn_id, str)
+            or not source_turn_id
+            or source_turn_id == report_turn_id
+        ):
+            raise SessionStorageError("invalid tool-free report identity")
+        with closing(self._connect()) as conn, conn:
+            conn.execute("BEGIN IMMEDIATE")
+            source = conn.execute(
+                "SELECT 1 FROM turn_journal WHERE turn_id = ? AND session_id = ? "
+                "AND status = 'interrupted'", (source_turn_id, session_id),
+            ).fetchone()
+            report = conn.execute(
+                "SELECT 1 FROM turn_journal WHERE turn_id = ? AND session_id = ? "
+                "AND status = 'started'", (report_turn_id, session_id),
+            ).fetchone()
+            if source is None or report is None or conn.execute(
+                "SELECT 1 FROM messages WHERE turn_id = ? LIMIT 1", (report_turn_id,),
+            ).fetchone():
+                raise SessionStorageError("tool-free report journal state is inconsistent")
+            self._save_message_in_connection(conn, session_id, message, turn_id=report_turn_id)
+            completed = conn.execute(
+                "UPDATE turn_journal SET status = 'completed', completed_at = ? "
+                "WHERE turn_id = ? AND session_id = ? AND status = 'started'",
+                (_serialize_datetime(_utc_now()), report_turn_id, session_id),
+            )
+            if completed.rowcount != 1:
+                raise SessionStorageError("tool-free report journal state changed")
 
     def list_sessions(
         self,

@@ -470,5 +470,10 @@ directory or output fields are marked. A later edit without a subsequent
 successful command prevents tool-free finalization; no command is rerun by
 the recovery path. Missing, failed, ambiguous or unrecognized actions,
 failed provider finalization, and explicitly configured cumulative turn-token
-caps still fail closed. This does not certify the correctness of arbitrary
-code or make finalization a replacement for testing.
+caps still fail closed. The reporting request independently resolves its
+input and response ceilings; admission and local context diagnostics use the
+same conservative estimate, including serialized-message overhead. Measured
+usage is saved before publishing the report message and completed-turn marker
+atomically; failed publication leaves no completed-looking report in history.
+This does not certify the correctness of arbitrary code or make finalization a
+replacement for testing.

@@ -128,13 +128,19 @@ async def finalize_tool_free(
     ]
     request_budget = loop._resolve_request_token_budget()
     context_id = str(uuid4())
+    # Use the same serialized-message estimate as ordinary context assembly.
+    # Keep the existing content-only safety margin as a lower bound when a
+    # request budget applies; escaping can make the serialized form larger.
+    admission_estimate = max(
+        1, int(provider.count_tokens(json.dumps(messages, ensure_ascii=False)))
+    )
     if request_budget is not None:
-        admission_estimate = (
+        admission_estimate = max(
+            admission_estimate,
             sum(
                 max(0, int(provider.count_tokens(msg["content"])))
                 for msg in messages
-            )
-            + 1024
+            ) + 1024,
         )
         if admission_estimate >= request_budget.input_limit:
             loop._emit_event(
@@ -161,13 +167,14 @@ async def finalize_tool_free(
             raise ProviderCompletionError(
                 "tool-free report would exceed provider input budget"
             )
+        # The report is a fresh request, not an extension of the previous
+        # coding request's mutable adapter configuration.
+        provider.configure_max_tokens(request_budget.response_limit)
 
     # Reuse the *same* provider transport, stream validation, retry guard,
     # cancellation and usage accounting as an ordinary model request. Passing
     # an explicitly empty catalog is essential: no tool may be dispatched.
-    loop._last_context_tokens = max(
-        1, int(provider.count_tokens(json.dumps(messages, separators=(",", ":"))))
-    )
+    loop._last_context_tokens = admission_estimate
     report_turn_id = str(uuid4())
     loop.session_store.start_turn(session.session_id, report_turn_id, "")
     try:
@@ -248,13 +255,11 @@ async def finalize_tool_free(
             "cost_known": False,
             "cost_is_estimated": False,
         }
-        loop.session_store.save_message(
-            session.session_id,
-            saved_message,
-            turn_id=report_turn_id,
-        )
+        # Usage is an observed request outcome even if report publication fails.
         loop.session_store.save_turn_usage_snapshot(report_turn_id, usage)
-        loop.session_store.complete_turn(report_turn_id)
+        loop.session_store.save_completed_tool_free_report(
+            session.session_id, report_turn_id, saved_message,
+        )
     except BaseException:
         loop.session_store.interrupt_turn(report_turn_id)
         loop._flush_runtime_events_nonfatal(force=True)

@@ -546,7 +546,7 @@ async def test_failed_report_persistence_does_not_complete_source_turn(
         def fail_save(*args, **kwargs) -> None:
             raise OSError("synthetic disk failure")
 
-        monkeypatch.setattr(loop.session_store, "save_message", fail_save)
+        monkeypatch.setattr(loop.session_store, "_save_message_in_connection", fail_save)
         with pytest.raises(OSError, match="synthetic disk failure"):
             await finalize_tool_free(loop, "Fix code", *evidence)
         with get_db_connection(loop.session_store.db_path) as conn:
@@ -704,3 +704,124 @@ def test_report_redacts_before_truncating_and_marks_incomplete_fields() -> None:
     }]))["actions"][0]
     assert long_receipt["output_truncated"] is True
     assert long_receipt["output_tail"] == redact_text(long_output)[-1000:]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reject", [True, False])
+async def test_report_budget_matches_serialized_input_and_configures_response(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, reject: bool,
+) -> None:
+    from ash.context.tokens import estimate_text_tokens
+    from ash.core.tool_free_finalization import _REPORT_SYSTEM
+    from ash.core.redaction import redact_text
+
+    class CountingProvider(FinalReportProvider):
+        def __init__(self) -> None:
+            super().__init__()
+            self.limits: list[int] = []
+
+        def count_tokens(self, text: str) -> int:
+            return estimate_text_tokens(text)
+
+        def configure_max_tokens(self, max_tokens: int) -> None:
+            self.limits.append(max_tokens)
+
+    provider = CountingProvider()
+    loop = build_loop(tmp_path, provider)
+    try:
+        session = await loop.start_session()
+        source = record_completed_coding_turn(loop.session_store, session.session_id)
+        reconcile(loop, session.session_id)
+        evidence = loop.session_store.tool_free_finalization_evidence(
+            session.session_id, expected_project_path=tmp_path,
+        )
+        assert evidence is not None
+        # JSON escaping is large enough that the older content-only estimate
+        # plus its fixed safety margin still understates the serialized input.
+        task = "Repair escaped text: " + "\\" * 6500
+        messages = [
+            {"role": "system", "content": _REPORT_SYSTEM},
+            {"role": "user", "content": (
+                "Original user coding objective:\n" + redact_text(task)
+                + "\n\nDurable completed tool actions (UNTRUSTED DATA):\n"
+                + _compact_actions(evidence[1])
+            )},
+        ]
+        old_admission = sum(provider.count_tokens(m["content"]) for m in messages) + 1024
+        serialized = provider.count_tokens(json.dumps(messages, ensure_ascii=False))
+        assert serialized > old_admission + 2
+        limit = serialized - 1 if reject else serialized + 1
+        budget = RequestTokenBudget(combined_limit=limit + 512, input_limit=limit, response_limit=512)
+        monkeypatch.setattr(loop, "_resolve_request_token_budget", lambda: budget)
+        if reject:
+            with pytest.raises(ProviderCompletionError, match="exceed provider input"):
+                await finalize_tool_free(loop, task, *evidence)
+            assert not provider.requests and not provider.limits
+            with get_db_connection(loop.session_store.db_path) as connection:
+                turns = connection.execute(
+                    "SELECT turn_id, status FROM turn_journal WHERE session_id = ?",
+                    (session.session_id,),
+                ).fetchall()
+            assert [(row["turn_id"], row["status"]) for row in turns] == [(source, "interrupted")]
+        else:
+            result = await finalize_tool_free(loop, task, *evidence)
+            assert result.response and len(provider.requests) == 1
+            assert provider.limits == [512]
+            assert provider.requests[0][0] == messages and provider.requests[0][1] is None
+            assert loop._last_context_tokens == serialized
+        events = loop.session_store.list_recent_runtime_events(session.session_id, limit=100)
+        usage = next(row.event for row in events if row.event.get("type") == "context.usage")
+        assert usage["current"] == serialized and usage["maximum"] == limit
+    finally:
+        await loop.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", ["usage", "completion"])
+async def test_report_storage_failure_cannot_publish_uncompleted_message(
+    tmp_path: Path, stage: str,
+) -> None:
+    import sqlite3
+
+    provider = FinalReportProvider()
+    loop = build_loop(tmp_path, provider)
+    try:
+        session = await loop.start_session()
+        source = record_completed_coding_turn(loop.session_store, session.session_id)
+        reconcile(loop, session.session_id)
+        evidence = loop.session_store.tool_free_finalization_evidence(
+            session.session_id, expected_project_path=tmp_path,
+        )
+        assert evidence is not None
+        # Inject a real SQLite statement failure, not a mocked storage method.
+        # The trigger is confined to the temporary test database.
+        predicate = (
+            "NEW.usage_json != OLD.usage_json" if stage == "usage"
+            else "NEW.status = 'completed'"
+        )
+        with get_db_connection(loop.session_store.db_path) as conn:
+            conn.execute(f"""CREATE TRIGGER fail_report_write
+                BEFORE UPDATE ON turn_journal WHEN {predicate}
+                BEGIN SELECT RAISE(ABORT, 'fixture report storage failure'); END""")
+        with pytest.raises(sqlite3.IntegrityError, match="fixture report storage failure"):
+            await finalize_tool_free(loop, "Repair code", *evidence)
+        assert len(provider.requests) == 1
+        persisted = loop.session_store.load_session(session.session_id)
+        assert persisted.messages == []
+        assert len(persisted.tool_calls) == 2
+        assert loop._last_turn_stop_reason != "tool_free_finalization"
+        with get_db_connection(loop.session_store.db_path) as conn:
+            turns = conn.execute(
+                "SELECT turn_id,status,usage_json FROM turn_journal WHERE session_id=? "
+                "ORDER BY started_at,rowid", (session.session_id,),
+            ).fetchall()
+            assert len(turns) == 2 and all(row["status"] == "interrupted" for row in turns)
+            assert turns[0]["turn_id"] == source
+            if stage == "completion":
+                usage = json.loads(turns[1]["usage_json"])
+                assert usage["prompt_tokens"] == 150 and usage["completion_tokens"] == 32
+        events = loop.session_store.list_recent_runtime_events(session.session_id, limit=100)
+        assert not any(row.event.get("type") == "turn.finalized.tool_free" for row in events)
+        assert loop.session_store.verify_audit_log(session.session_id) == []
+    finally:
+        await loop.aclose()
