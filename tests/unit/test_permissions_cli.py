@@ -55,6 +55,32 @@ def test_permissions_cli_explains_modes_without_mutating_rules(
     assert load_permission_rules(workspace) == []
 
 
+@pytest.mark.parametrize(
+    "action",
+    [
+        ["status"],
+        ["modes"],
+        ["allow", "read_file"],
+        ["ask", "read_file"],
+        ["deny", "read_file"],
+        ["revoke", "read_file"],
+        ["remove", "example-rule"],
+        ["clear", "--yes"],
+    ],
+)
+def test_permissions_json_option_is_preserved_across_subcommands(action: list[str]) -> None:
+    import argparse
+
+    from ash.cli_parser import configure_parser
+
+    parser = argparse.ArgumentParser()
+    configure_parser(parser, "test")
+    assert parser.parse_args(["permissions", "--json", *action]).json is True
+    assert parser.parse_args(["permissions", *action, "--json"]).json is True
+    assert parser.parse_args(["permissions", "--json", *action, "--json"]).json is True
+    assert parser.parse_args(["permissions", *action]).json is False
+
+
 def test_permission_grant_renderer_emits_json(tmp_path: Path) -> None:
     workspace = tmp_path / "repo"
     workspace.mkdir()

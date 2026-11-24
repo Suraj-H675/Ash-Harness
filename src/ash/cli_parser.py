@@ -1037,15 +1037,16 @@ def configure_parser(parser: argparse.ArgumentParser, version: str) -> None:
     permissions_subparsers = permissions_parser.add_subparsers(
         dest="permissions_action"
     )
+    # An absent child flag must not overwrite an explicit parent --json.
     permissions_status = permissions_subparsers.add_parser(
         "status", help="Show persistent and managed permission rules"
     )
-    permissions_status.add_argument("--json", action="store_true")
+    permissions_status.add_argument("--json", action="store_true", default=argparse.SUPPRESS)
     permissions_modes = permissions_subparsers.add_parser(
         "modes",
         help="Explain permission modes without changing policy",
     )
-    permissions_modes.add_argument("--json", action="store_true")
+    permissions_modes.add_argument("--json", action="store_true", default=argparse.SUPPRESS)
     for effect in ("allow", "ask", "deny"):
         permissions_rule = permissions_subparsers.add_parser(
             effect,
@@ -1113,22 +1114,22 @@ def configure_parser(parser: argparse.ArgumentParser, version: str) -> None:
             default=[],
             metavar="TOKEN",
         )
-        permissions_rule.add_argument("--json", action="store_true")
+        permissions_rule.add_argument("--json", action="store_true", default=argparse.SUPPRESS)
     permissions_revoke = permissions_subparsers.add_parser(
         "revoke", help="Remove persistent rules for one tool"
     )
     permissions_revoke.add_argument("tool_name")
-    permissions_revoke.add_argument("--json", action="store_true")
+    permissions_revoke.add_argument("--json", action="store_true", default=argparse.SUPPRESS)
     permissions_remove = permissions_subparsers.add_parser(
         "remove", help="Remove one persistent permission rule by ID"
     )
     permissions_remove.add_argument("rule_id")
-    permissions_remove.add_argument("--json", action="store_true")
+    permissions_remove.add_argument("--json", action="store_true", default=argparse.SUPPRESS)
     permissions_clear = permissions_subparsers.add_parser(
         "clear", help="Remove all persistent project permission rules"
     )
     permissions_clear.add_argument("--yes", action="store_true")
-    permissions_clear.add_argument("--json", action="store_true")
+    permissions_clear.add_argument("--json", action="store_true", default=argparse.SUPPRESS)
     extensions_parser = subparsers.add_parser(
         "extensions", help="Inspect and manage Ash extension components"
     )
