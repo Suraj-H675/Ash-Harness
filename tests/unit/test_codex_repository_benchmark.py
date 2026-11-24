@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -660,7 +661,11 @@ def test_codex_timeout_terminates_process_group_without_leaking_keys(
         assert kwargs["start_new_session"] is True
         descriptor, = kwargs["pass_fds"]
         assert kwargs["executable"] == f"/proc/self/fd/{descriptor}"
-        assert hashlib.sha256(Path(kwargs["executable"]).read_bytes()).hexdigest() == native_sha
+        # Inspect the inherited descriptor directly; macOS has no /proc.
+        # The real Linux-only launch path above must still be asserted.
+        with os.fdopen(os.dup(descriptor), "rb") as pinned:
+            pinned.seek(0)
+            assert hashlib.file_digest(pinned, "sha256").hexdigest() == native_sha
         return Child()
 
     @contextlib.contextmanager
