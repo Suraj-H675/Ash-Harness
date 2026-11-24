@@ -6,6 +6,31 @@ All notable changes to Ash are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-11-24
+
+### Changed
+- Account for opaque ChatGPT-plan reasoning transport separately from model
+  text and speed up offline context estimation without changing its results.
+- Include bounded, redacted historical edit-path hints in opted-in automatic
+  context restarts. The new window must still verify actual workspace state.
+
+### Fixed
+- Preserve structured permission output regardless of whether `--json` is
+  placed before or after the permission subcommand.
+- Include the active session ID in actionable headless recovery instructions.
+- Preserve verified command identity and exit status in tool-free recovery
+  reports, enforce reporting budgets, and publish completion atomically.
+
+### Development tooling
+- Require complete terminal and verification evidence in coding comparisons,
+  including detecting edits after the last successful test.
+
+### Upgrade notes
+- This is a package-only upgrade from 0.6.0; the session database remains at
+  schema v23. Automatic context continuation remains opt-in. Competitive
+  coding performance improvements have not yet been established in live
+  independently graded comparisons.
+
 ## [0.6.0] - 2026-11-24
 
 ### Added
@@ -530,7 +555,8 @@ All notable changes to Ash are documented here. The format follows
 - Fixed duplicate `project.urls` tables so the distribution builds with modern
   `setuptools`; expanded CI across Python 3.11 and 3.12.
 
-[Unreleased]: https://github.com/Suraj-H675/Ash-Harness/compare/ash-v0.6.0...HEAD
+[Unreleased]: https://github.com/Suraj-H675/Ash-Harness/compare/ash-v0.6.1...HEAD
+[0.6.1]: https://github.com/Suraj-H675/Ash-Harness/compare/ash-v0.6.0...ash-v0.6.1
 [0.6.0]: https://github.com/Suraj-H675/Ash-Harness/compare/ash-v0.5.1...ash-v0.6.0
 [0.5.1]: https://github.com/Suraj-H675/Ash-Harness/compare/ash-v0.5.0...ash-v0.5.1
 [0.5.0]: https://github.com/Suraj-H675/Ash-Harness/compare/ash-v0.4.6...ash-v0.5.0
