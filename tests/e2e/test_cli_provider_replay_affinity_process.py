@@ -625,9 +625,6 @@ def test_unbound_provider_state_fails_and_explicit_restart_is_clean_across_proce
         )
         assert not any(event.get("type") == "turn.completed" for event in first_events)
         error = next(event for event in first_events if event.get("type") == "error")
-        assert "ash sessions restart-context --session SESSION --handoff TEXT" in (
-            error["error"]["remedy"]
-        )
         assert credential not in first.stdout + first.stderr
         assert len(requests) == 1
         assert requests[0]["has_authorization"] is True
@@ -637,6 +634,13 @@ def test_unbound_provider_state_fails_and_explicit_restart_is_clean_across_proce
             if event.get("type") == "turn.started"
         )
 
+        # The existing envelope identifies the session. Recovery instructions
+        # must also identify it, so text-mode users need not decode an envelope.
+        assert error["session_id"] == session_id
+        assert f"ash sessions restart-context --session {session_id} --handoff TEXT" in (
+            error["error"]["remedy"]
+        )
+        assert f"ash sessions recovery --session {session_id}" in error["error"]["remedy"]
         store = SessionStore(database / "sessions.db")
         source = store.load_session(session_id)
         unbound = next(
@@ -664,6 +668,16 @@ def test_unbound_provider_state_fails_and_explicit_restart_is_clean_across_proce
         assert blocked.returncode == 1
         assert any(event.get("type") == "error" for event in blocked_events)
         assert credential not in blocked.stdout + blocked.stderr
+        assert len(requests) == 1
+        plain_json = cli("--continue", "-p", "Please continue", "--output-format", "json")
+        assert plain_json.returncode == 1
+        payload = json.loads(plain_json.stdout)
+        assert payload["type"] == "error" and payload["session_id"] == session_id
+        assert f"--session {session_id}" in payload["error"]["remedy"]
+        plain_text = cli("--continue", "-p", "Please continue", "--output-format", "text")
+        assert plain_text.returncode == 1
+        assert f"ash sessions restart-context --session {session_id}" in plain_text.stderr
+        assert credential not in plain_json.stdout + plain_json.stderr + plain_text.stdout + plain_text.stderr
         assert len(requests) == 1
 
         source_before_restart = store.load_session(session_id)

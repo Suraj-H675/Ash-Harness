@@ -11,7 +11,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import json
 import math
 import os
@@ -5788,6 +5788,7 @@ async def _bootstrap_and_headless(
     primary_error: BaseException | None = None
     result_payload: dict[str, Any] | None = None
     result_code = 0
+    session = None
     try:
         if reasoning_effort is not None:
             loop.set_reasoning_effort(reasoning_effort)
@@ -5981,6 +5982,18 @@ async def _bootstrap_and_headless(
     except Exception as exc:  # noqa: BLE001
         primary_error = exc
         error = classify_exception(exc)
+        # Use the runtime's active session (which may be a continuation child),
+        # never an unresolved CLI selector. Only substitute a canonical UUID
+        # in shell-command examples; imported nonstandard IDs keep the template.
+        if session is not None and "--session SESSION" in error.remedy:
+            active = getattr(loop, "current_session", None) or session
+            active_id = active.session_id
+            if isinstance(active_id, str) and re.fullmatch(
+                r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", active_id
+            ):
+                error = replace(
+                    error, remedy=error.remedy.replace("--session SESSION", f"--session {active_id}")
+                )
         error_payload = error.to_dict()
         interrupted_edit_files = getattr(loop, "_last_interrupted_edit_files", 0)
         if isinstance(interrupted_edit_files, int) and interrupted_edit_files > 0:

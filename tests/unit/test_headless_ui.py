@@ -514,3 +514,57 @@ def test_headless_ui_never_claims_interactive_mcp_review() -> None:
     assert ui.request_mcp_elicitation("docs", "question", {}) == {
         "action": "decline"
     }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", ["current", "child", "nonstandard", "unresolved"])
+async def test_headless_recovery_remedy_identifies_only_started_canonical_session(case) -> None:
+    from ash.cli import _bootstrap_and_headless
+    from ash.context.history import ContextBudgetExceededError
+
+    parent = "11111111-1111-4111-8111-111111111111"
+    child = "22222222-2222-4222-8222-222222222222"
+
+    def failure():
+        return ContextBudgetExceededError(
+            40000, 28000, protected_current_turn=True, provider_replay_state_preserved=True,
+        )
+
+    class Loop:
+        provider = None
+        safety_guard = None
+        recovered_turns = 0
+        recovery_summary = None
+        current_session = None
+
+        async def start_session(self, session_id=None):
+            if case == "unresolved":
+                # A failed bootstrap must not give recovery advice about a
+                # stale runtime or the unvalidated caller-supplied selector.
+                self.current_session = SimpleNamespace(session_id=parent)
+                raise failure()
+            self.current_session = SimpleNamespace(
+                session_id="legacy; echo unsafe" if case == "nonstandard" else parent,
+            )
+            return self.current_session
+
+        async def run_turn(self, prompt):
+            if case == "child":
+                self.current_session = SimpleNamespace(session_id=child)
+            raise failure()
+
+        async def aclose(self):
+            pass
+
+    stream = io.StringIO()
+    ui = HeadlessUI(output_format="json", stream=stream)
+    rc = await _bootstrap_and_headless(
+        Loop(), SimpleNamespace(), prompt="repair", session_id=None, ui=ui,
+    )
+    assert rc != 0
+    remedy = json.loads(stream.getvalue())["error"]["remedy"]
+    expected = parent if case == "current" else child if case == "child" else "SESSION"
+    assert f"ash sessions restart-context --session {expected} --handoff TEXT" in remedy
+    assert "echo unsafe" not in remedy
+    if case != "current":
+        assert f"--session {parent}" not in remedy
