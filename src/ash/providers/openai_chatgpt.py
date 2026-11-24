@@ -79,6 +79,16 @@ class OpenAIChatGPTProvider(ProviderABC):
     def count_tokens(self, text: str) -> int:
         return self._token_counter.count(text)
 
+    @property
+    def responses_reasoning_transport_estimate(self) -> bool:
+        # First-party Responses transport estimate, not a capability inferred
+        # from a model name or a custom endpoint. Use it only with the default
+        # offline three-character ASCII estimator.
+        return (
+            type(self._token_counter) is OpenAITokenCounter
+            and self._token_counter.using_approximation
+        )
+
     def replay_credential_identity(self) -> ProviderReplayCredentialIdentity | None:
         resolve_identity = getattr(
             self._auth_session,

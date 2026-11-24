@@ -51,6 +51,7 @@ class ContextAssemblyRequest:
     tool_schema_tokens: int
     registered_tool_count: int
     native_tools: bool
+    responses_reasoning_transport_estimate: bool = False
 
 
 @dataclass(frozen=True)
@@ -257,6 +258,7 @@ def assemble_context(request: ContextAssemblyRequest) -> ContextAssemblyResult:
         recent_messages=request.recent_messages,
         max_tool_output_chars=request.max_tool_result_tokens * 4,
         input_token_limit=allocator.input_limit - native_schema_tokens,
+        responses_reasoning_transport_estimate=request.responses_reasoning_transport_estimate,
     )
     compaction = compactor.compact(
         messages,

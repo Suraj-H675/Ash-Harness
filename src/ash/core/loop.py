@@ -5860,7 +5860,17 @@ class AshLoop:
             if _provider_capabilities(self.provider).native_tools
             else 0
         )
-        baseline = HistoryCompactor._count(projected, count_tokens) + native_schema_tokens
+        responses_reasoning_transport_estimate = (
+            getattr(self.provider, "responses_reasoning_transport_estimate", False) is True
+        )
+
+        def count_history(messages: list[dict[str, Any]]) -> int:
+            return HistoryCompactor._count(
+                messages, count_tokens,
+                responses_reasoning_transport_estimate=responses_reasoning_transport_estimate,
+            )
+
+        baseline = count_history(projected) + native_schema_tokens
         input_limit = request_budget.input_limit
         follow_up_reserve = max(128, min(2_048, input_limit // 12))
         if input_limit >= 24_576:
@@ -5876,7 +5886,7 @@ class AshLoop:
             ][-3:]
             if recent_assistants:
                 replay_growth = max(
-                    HistoryCompactor._count([message], count_tokens)
+                    count_history([message])
                     for message in recent_assistants
                 )
                 follow_up_reserve = max(
@@ -5921,7 +5931,7 @@ class AshLoop:
                     projected_result.model_dump(mode="python"),
                 )
                 return (
-                    HistoryCompactor._count(candidate, count_tokens)
+                    count_history(candidate)
                     + native_schema_tokens
                 )
 
@@ -8944,6 +8954,9 @@ class AshLoop:
                     tool_schema_tokens=schema_tokens,
                     registered_tool_count=len(self.tools),
                     native_tools=_provider_capabilities(self.provider).native_tools,
+                    responses_reasoning_transport_estimate=(
+                        getattr(self.provider, "responses_reasoning_transport_estimate", False) is True
+                    ),
                 )
             )
             self._last_context_tokens = assembly.tokens

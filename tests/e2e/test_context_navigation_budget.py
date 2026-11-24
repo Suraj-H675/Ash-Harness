@@ -1031,3 +1031,116 @@ async def test_growing_opaque_state_leaves_room_for_patch_repair_and_test(
         assert not store.verify_audit_log(session.session_id)
     finally:
         await loop.aclose()
+
+
+@pytest.mark.asyncio
+async def test_chatgpt_replay_accounting_preserves_final_edit_and_retest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Transport expansion alone must not consume the model's reasoning window."""
+    from ash.providers.openai_chatgpt import OpenAIChatGPTProvider
+    from ash.providers.openai_chatgpt_auth import ChatGPTAuthSession, ChatGPTCredentialStore
+
+    monkeypatch.setenv("ASH_ENABLE_TIKTOKEN_DOWNLOAD", "0")
+    target = tmp_path / "value.py"
+    target.write_text("VALUE = 1\n", encoding="utf-8")
+    command = shlex.quote(sys.executable) + " -c " + shlex.quote(
+        "from pathlib import Path; assert Path('value.py').read_text() in "
+        "('VALUE = 2\\n', 'VALUE = 3\\n'); print('VERIFIED')"
+    )
+
+    class Provider(OpenAIChatGPTProvider):
+        _ash_declared_capabilities = ProviderCapabilities(
+            native_tools=True, context_window=65_536,
+            max_input_tokens=61_536, max_output_tokens=4_000,
+        )
+
+        def __init__(self) -> None:
+            super().__init__(
+                "gpt-6-luna",
+                auth_session=ChatGPTAuthSession(store=ChatGPTCredentialStore(tmp_path / "auth")),
+            )
+            self.states: list[list[dict[str, Any]]] = []
+            self.requests = 0
+
+        def replay_credential_identity(self) -> ProviderReplayCredentialIdentity:
+            return ProviderReplayCredentialIdentity.from_secret(
+                "fixture-only-transport", scope=("plan-replay-accounting",),
+            )
+
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            assert [m["provider_state"] for m in messages
+                    if m.get("role") == "assistant" and m.get("provider_state")] == self.states
+            n = self.requests
+            self.requests += 1
+            assert n <= 8
+            if n == 8:
+                assert target.read_text() == "VALUE = 3\n"
+                assert "VERIFIED" in repr(messages)
+                yield StreamChunk(content="Latest edit verified.", is_done=True)
+                return
+            if n in (0, 1, 2, 5):
+                name, args = "read_file", {"file_path": "value.py"}
+            elif n in (3, 6):
+                old, new = (1, 2) if n == 3 else (2, 3)
+                name, args = "replace_file_content", {
+                    "file_path": "value.py", "target_content": f"VALUE = {old}",
+                    "replacement_content": f"VALUE = {new}",
+                }
+            else:
+                name, args = "run_command", {"command_line": command}
+            # A synthetic ASCII base64-shaped transport, not provider secrets.
+            size = (4_000, 8_000, 76_000, 12_000, 20_000, 20_000, 36_000, 16_000)[n]
+            state = [{"type": "reasoning", "id": f"replay-{n}", "summary": [],
+                      "status": "completed", "encrypted_content": "Ab0_" * (size // 4)}]
+            self.states.append(state)
+            yield StreamChunk(native_tool_calls=[{"id": f"call-{n}", "name": name,
+                                                   "arguments": args}],
+                              provider_state=state, is_done=True)
+
+    guard = SafetyGuard(tmp_path)
+    store = SessionStore(tmp_path / "session.db")
+    provider = Provider()
+    approvals = []
+
+    async def approve(name, arguments):
+        approvals.append((name, arguments))
+        return name in {"read_file", "replace_file_content"} or (
+            name == "run_command" and arguments == {"command_line": command}
+        )
+
+    loop = AshLoop(
+        store, provider, guard, HeadlessUI(output_format="text", stream=io.StringIO()),
+        tmp_path, tools={"read_file": ReadFileTool(guard),
+                         "replace_file_content": ReplaceFileContentTool(guard),
+                         "run_command": RunCommandTool(guard, project_root=tmp_path)},
+        config=AshConfig(model="openai/gpt-6-luna", workspace_root=tmp_path,
+                         db_directory=tmp_path / "db", memory_backend="off",
+                         max_context_tokens=65_536, max_completion_tokens=4_000),
+        on_tool_approval=approve,
+    )
+
+    def checkpoint_context():
+        if loop.current_session is None or loop.turn_context is None:
+            return None
+        return (loop.current_session.session_id, loop.turn_context.turn_id,
+                str(loop.turn_context.get("tool_call_id", "")))
+
+    loop.tool_middlewares.extend([
+        FileCheckpointMiddleware(store, guard, checkpoint_context), SecretRedactionMiddleware(),
+    ])
+    try:
+        session = await loop.start_session()
+        result = await loop.run_turn("Edit value.py, verify it, refine it and verify the latest edit.")
+        assert result == "Latest edit verified." and provider.requests == 9
+        assert target.read_text() == "VALUE = 3\n"
+        saved = store.load_session(session.session_id)
+        assert [c.tool_name for c in saved.tool_calls if c.success and c.tool_name != "read_file"] == [
+            "replace_file_content", "run_command", "replace_file_content", "run_command",
+        ]
+        assert [m.metadata["provider_state"] for m in saved.messages
+                if m.metadata.get("provider_state")] == provider.states
+        assert [name for name, _ in approvals].count("run_command") == 2
+        assert not store.verify_audit_log(session.session_id)
+    finally:
+        await loop.aclose()

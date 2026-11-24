@@ -837,3 +837,26 @@ async def test_native_compaction_rejected_raw_payload_never_leaks_into_traceback
     assert "synthetic-sensitive-untrusted-item" not in "".join(
         traceback.format_exception(error.value)
     )
+
+
+def test_chatgpt_transport_estimation_is_limited_to_default_offline_counter(
+    tmp_path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ash.context.tokens import OpenAITokenCounter
+    from ash.providers.openai_chatgpt_auth import ChatGPTAuthSession, ChatGPTCredentialStore
+
+    monkeypatch.setenv("ASH_ENABLE_TIKTOKEN_DOWNLOAD", "0")
+    auth = ChatGPTAuthSession(store=ChatGPTCredentialStore(tmp_path / "auth"))
+    default = OpenAIChatGPTProvider("gpt-6-luna", auth_session=auth)
+    assert default.responses_reasoning_transport_estimate
+
+    class CustomCounter:
+        def count(self, text: str) -> int:
+            return len(text)
+
+    custom = OpenAIChatGPTProvider("gpt-6-luna", auth_session=auth, token_counter=CustomCounter())
+    assert not custom.responses_reasoning_transport_estimate
+    exact = OpenAITokenCounter("gpt-6-luna")
+    exact.using_approximation = False
+    provider = OpenAIChatGPTProvider("gpt-6-luna", auth_session=auth, token_counter=exact)
+    assert not provider.responses_reasoning_transport_estimate

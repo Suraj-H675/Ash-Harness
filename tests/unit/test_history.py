@@ -1526,3 +1526,85 @@ def test_compaction_never_drops_protected_user_after_trimming_old_history() -> N
             count_tokens=count_words,
             protected_from_index=3,
         )
+
+
+def test_responses_transport_estimate_preserves_replay_and_real_overflow() -> None:
+    from copy import deepcopy
+
+    from ash.context.tokens import estimate_text_tokens
+
+    messages = [
+        {"role": "user", "content": "Read then edit."},
+        {"role": "assistant", "content": "", "provider_state": [{
+            "type": "reasoning", "id": "rs_known", "summary": [],
+            "status": "completed", "encrypted_content": "Ab0_" * 6000,
+        }]},
+    ]
+    before = deepcopy(messages)
+    wire = HistoryCompactor._count(messages, estimate_text_tokens)
+    estimate = HistoryCompactor._count(
+        messages, estimate_text_tokens, responses_reasoning_transport_estimate=True,
+    )
+    # Preserve full ordinary JSON framing, count exactly ceil(n/4) for the
+    # recognized field, and don't subtract the encryption envelope overhead.
+    empty = deepcopy(messages)
+    empty[1]["provider_state"][0]["encrypted_content"] = ""
+    assert estimate == HistoryCompactor._count(empty, estimate_text_tokens) + 6000
+    assert wire - estimate == 2000
+    compactor = HistoryCompactor(max_context_tokens=9000, completion_reserve=1000,
+                                  input_token_limit=7000,
+                                  responses_reasoning_transport_estimate=True)
+    result = compactor.compact(messages, count_tokens=estimate_text_tokens)
+    assert result.messages == before == messages
+    assert result.provider_replay_state_preserved and not result.compacted
+    assert result.estimated_tokens == estimate
+    with pytest.raises(ContextBudgetExceededError) as forced:
+        compactor.compact(messages, count_tokens=estimate_text_tokens, force=True)
+    assert forced.value.provider_replay_state_preserved
+    too_large = deepcopy(messages)
+    too_large[1]["provider_state"][0]["encrypted_content"] *= 2
+    with pytest.raises(ContextBudgetExceededError) as overflow:
+        compactor.compact(too_large, count_tokens=estimate_text_tokens)
+    assert overflow.value.provider_replay_state_preserved
+    assert messages == before
+
+
+@pytest.mark.parametrize("kind", ["short", "unicode", "invalid_chars", "bad_padding",
+                                  "bad_length", "unknown_type", "extra_field",
+                                  "malformed_item", "nonassistant", "checkpoint"])
+def test_responses_transport_estimate_keeps_unknown_payloads_fully_charged(kind: str) -> None:
+    from copy import deepcopy
+
+    from ash.context.tokens import estimate_text_tokens
+
+    item = {"type": "reasoning", "id": "rs_known", "summary": [],
+            "status": "completed", "encrypted_content": "Ab0_" * 2000}
+    role = "assistant"
+    if kind == "short":
+        item["encrypted_content"] = "Ab0_"
+    elif kind == "unicode":
+        item["encrypted_content"] += "漢"
+    elif kind == "invalid_chars":
+        item["encrypted_content"] += "!"
+    elif kind == "bad_padding":
+        item["encrypted_content"] += "==="
+    elif kind == "bad_length":
+        item["encrypted_content"] += "A"
+    elif kind == "unknown_type":
+        item["type"] = "unknown"
+    elif kind == "extra_field":
+        item["unknown"] = "field"
+    elif kind == "malformed_item":
+        del item["id"]
+    elif kind == "nonassistant":
+        role = "user"
+    elif kind == "checkpoint":
+        item = {"type": "responses_compacted_input", "output": [
+            {"type": "compaction", "encrypted_content": "Ab0_" * 2000},
+        ]}
+    messages = [{"role": role, "content": "Ab0_" * 1000, "provider_state": [item]}]
+    before = deepcopy(messages)
+    assert HistoryCompactor._count(
+        messages, estimate_text_tokens, responses_reasoning_transport_estimate=True,
+    ) == HistoryCompactor._count(messages, estimate_text_tokens)
+    assert messages == before

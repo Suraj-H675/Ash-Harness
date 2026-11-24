@@ -431,6 +431,25 @@ def normalize_context_budget_weights(
     return {name: value / total for name, value in source.items()}
 
 
+# Model-visible estimation only. Never decode, persist a surrogate, or
+# change the replay payload. Inspired by Codex rust-v0.169.0 (Apache-2.0),
+# d32063f96c2dff1dc96af839b3952abb6acfeda4, core/src/context_manager/history.rs
+# estimate_reasoning_length. Retain all envelope overhead (no fixed deduction).
+_RESPONSES_REASONING_BASE64 = re.compile(r"[A-Za-z0-9_-]+={0,2}")
+
+
+def _reasoning_transport_tokens(value: object) -> int | None:
+    if not isinstance(value, str) or len(value) < 1024:
+        return None
+    if _RESPONSES_REASONING_BASE64.fullmatch(value) is None:
+        return None
+    if len(value) % 4 == 1 or (value.endswith("=") and len(value) % 4):
+        return None
+    # Charge three bytes per token on the upper decoded-size estimate:
+    # ceil(ceil(3*n/4)/3) == ceil(n/4). Do not subtract padding or overhead.
+    return (len(value) + 3) // 4
+
+
 class HistoryCompactor:
     """Fit canonical chat messages into a bounded model input budget.
 
@@ -449,6 +468,7 @@ class HistoryCompactor:
         summary_char_limit: int = 12_000,
         max_tool_output_chars: int = 8_000,
         input_token_limit: int | None = None,
+        responses_reasoning_transport_estimate: bool = False,
     ) -> None:
         if max_context_tokens < 1:
             raise ValueError("max_context_tokens must be positive")
@@ -465,6 +485,7 @@ class HistoryCompactor:
         if input_token_limit is not None and input_token_limit < 1:
             raise ValueError("input_token_limit must be positive")
         self._input_token_limit = input_token_limit
+        self._responses_reasoning_transport_estimate = responses_reasoning_transport_estimate
 
     @property
     def input_limit(self) -> int:
@@ -508,7 +529,10 @@ class HistoryCompactor:
             item.get("role") == "assistant" and item.get("provider_state")
             for item in messages
         ):
-            unchanged_tokens = self._count(messages, count_tokens)
+            unchanged_tokens = self._count(
+                messages, count_tokens,
+                responses_reasoning_transport_estimate=self._responses_reasoning_transport_estimate,
+            )
             summary_required = include_previous_summary and bool(previous_summary)
             if force or summary_required or unchanged_tokens > self.input_limit:
                 raise ContextBudgetExceededError(
@@ -909,10 +933,41 @@ class HistoryCompactor:
     def _count(
         messages: list[dict[str, Any]],
         count_tokens: Callable[[str], int],
+        *,
+        responses_reasoning_transport_estimate: bool = False,
     ) -> int:
         sanitized, image_count = _without_image_data(messages)
+        reasoning_tokens = 0
+        if responses_reasoning_transport_estimate:
+            for message in sanitized:
+                states = message.get("provider_state")
+                if message.get("role") != "assistant" or not isinstance(states, list):
+                    continue
+                estimated_states = []
+                for item in states:
+                    estimate = None
+                    if (
+                        isinstance(item, dict)
+                        and item.get("type") == "reasoning"
+                        and set(item) <= {"type", "id", "summary", "status", "encrypted_content"}
+                        and isinstance(item.get("id"), str) and item["id"]
+                        and isinstance(item.get("summary"), list)
+                        and item.get("status") in (None, "completed", "in_progress", "incomplete")
+                    ):
+                        estimate = _reasoning_transport_tokens(item.get("encrypted_content"))
+                    if estimate is None:
+                        estimated_states.append(item)
+                    else:
+                        reasoning_tokens += estimate
+                        estimated_states.append({**item, "encrypted_content": ""})
+                # Temporary estimation-only copy; never the messages returned
+                # by compact() or sent to the provider.
+                message["provider_state"] = estimated_states
         payload = json.dumps(sanitized, ensure_ascii=False, default=str)
-        return max(0, int(count_tokens(payload))) + image_count * IMAGE_TOKEN_ESTIMATE
+        return (
+            max(0, int(count_tokens(payload))) + image_count * IMAGE_TOKEN_ESTIMATE
+            + reasoning_tokens
+        )
 
 
 def _without_image_data(

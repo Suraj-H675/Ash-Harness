@@ -279,6 +279,19 @@ Provider-reported prompt usage may omit retained opaque reasoning or count
 schemas differently; it does not prove the total occupied context. Ash does
 not calibrate its admission estimate from historical usage ratios.
 
+For the first-party ChatGPT plan adapter using Ash's offline ASCII token
+estimator, long URL-safe base64-shaped top-level reasoning payloads are
+estimated by their approximate decoded byte length (three bytes per token,
+retaining padding and envelope overhead). This follows the distinction
+between model-visible content and transport expansion in Codex's public
+`rust-v0.169.0` history accounting, with a more conservative length estimate.
+It is still a heuristic, not a provider token count or a guarantee of fit.
+The same estimate applies to request assembly and navigation admission.
+Other adapters, custom token counters, unrecognized payloads and native
+compaction checkpoints retain their previous accounting. This changes only
+local token estimates; no replay bytes are decrypted, discarded or rewritten,
+and forced local compaction and over-budget replay remain fail-closed.
+
 `context.request.rejected` identifies one request attempt that Ash stopped
 before dispatch because of the local input limit, an opaque-context constraint,
 or the cumulative turn budget. Earlier provider requests may already have
