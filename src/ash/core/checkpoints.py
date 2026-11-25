@@ -5,6 +5,7 @@ from __future__ import annotations
 import difflib
 import hashlib
 import stat
+import tempfile
 from itertools import islice
 from dataclasses import dataclass
 from pathlib import Path
@@ -22,8 +23,15 @@ from ash.safety.scoped_io import (
     stat_scoped_path,
     workspace_mutation_lock,
 )
-from ash.tools.base import BaseTool, ToolMiddleware, ToolResult
-from ash.tools.patch import extract_patch_paths
+from ash.tools.base import BaseTool, ToolExecutionOutcome, ToolMiddleware, ToolResult
+from ash.tools.model_patch import model_patch_as_unified_diff, parse_model_patch
+from ash.tools.patch import (
+    MAX_PATCH_BYTES,
+    ApplyPatchArgs,
+    ApplyPatchTool,
+    _git_apply,
+    extract_patch_paths,
+)
 
 
 EDIT_TOOLS = {
@@ -106,9 +114,14 @@ class FileCheckpointMiddleware(ToolMiddleware):
     async def before_tool(
         self, tool_name: str, arguments: dict[str, Any], tool: BaseTool
     ) -> None:
-        del tool
         context = self.context_provider()
         if context is None or tool_name not in EDIT_TOOLS:
+            return
+        if (
+            tool_name == "apply_patch"
+            and type(tool) is ApplyPatchTool
+            and ApplyPatchArgs.model_validate(arguments).dry_run
+        ):
             return
         session_id, turn_id, call_id = _checkpoint_context(context)
 
@@ -138,6 +151,77 @@ class FileCheckpointMiddleware(ToolMiddleware):
             return
         try:
             session_id, turn_id, call_id = _checkpoint_context(context)
+            if tool_name == "apply_patch":
+                rows = self.store.file_checkpoints_for_call(
+                    session_id, turn_id, call_id
+                )
+                if not rows:
+                    return
+                if (
+                    not result.success
+                    and result.outcome is ToolExecutionOutcome.COMPLETED
+                ):
+                    _finish_unchanged_patch_checkpoints(
+                        self.store, rows, self.guard
+                    )
+                    return
+                patch = str(arguments.get("patch", ""))
+                expected_states = await _expected_patch_states(
+                    rows, patch, self.guard
+                )
+                if expected_states is None:
+                    if result.success:
+                        raise RuntimeError(
+                            "patch output could not be verified against its "
+                            "checkpoint preimages"
+                        )
+                    return
+                finalized_states: list[tuple[str, str, int | None]] = []
+                conflicts: list[str] = []
+                for row in rows:
+                    raw_path = str(row["path"])
+                    path = self.guard.validate_mutation_path(raw_path)
+                    current_digest, current_mode = _digest_and_mode(path, self.guard)
+                    before_digest = _checkpoint_before_digest(row)
+                    before_mode = (
+                        int(row["before_mode"])
+                        if row["before_mode"] is not None
+                        else None
+                    )
+                    expected_digest, expected_mode = expected_states[raw_path]
+                    if _checkpoint_state_matches(
+                        current_digest,
+                        current_mode,
+                        before_digest,
+                        before_mode,
+                    ) or _checkpoint_state_matches(
+                        current_digest,
+                        current_mode,
+                        expected_digest,
+                        expected_mode,
+                    ):
+                        finalized_states.append(
+                            (raw_path, current_digest, current_mode)
+                        )
+                    else:
+                        conflicts.append(raw_path)
+                if conflicts:
+                    if result.success:
+                        raise RuntimeError(
+                            "patch output changed before checkpoint finalization; "
+                            "the checkpoint remains incomplete"
+                        )
+                    return
+                for raw_path, digest, mode in finalized_states:
+                    self.store.finish_file_checkpoint(
+                        session_id,
+                        turn_id,
+                        raw_path,
+                        digest,
+                        after_mode=mode,
+                        call_id=call_id,
+                    )
+                return
             for path in self._paths(tool_name, arguments):
                 digest, mode = _digest_and_mode(path, self.guard)
                 self.store.finish_file_checkpoint(
@@ -163,6 +247,83 @@ class FileCheckpointMiddleware(ToolMiddleware):
             return [self.guard.validate_mutation_path(path) for path in sorted(raw)]
         raw_path = arguments.get("file_path")
         return [self.guard.validate_mutation_path(str(raw_path))] if raw_path else []
+
+
+def _finish_unchanged_patch_checkpoints(
+    store: SessionStore, rows: list[Any], guard: SafetyGuard
+) -> None:
+    for row in rows:
+        path = guard.validate_mutation_path(str(row["path"]))
+        current_digest, current_mode = _digest_and_mode(path, guard)
+        before_digest = _checkpoint_before_digest(row)
+        before_mode = (
+            int(row["before_mode"]) if row["before_mode"] is not None else None
+        )
+        if _checkpoint_state_matches(
+            current_digest,
+            current_mode,
+            before_digest,
+            before_mode,
+        ):
+            store.finish_file_checkpoint(
+                str(row["session_id"]),
+                str(row["turn_id"]),
+                str(row["path"]),
+                before_digest,
+                after_mode=before_mode,
+                call_id=str(row["call_id"]),
+            )
+
+
+async def _expected_patch_states(
+    rows: list[Any], patch: str, guard: SafetyGuard
+) -> dict[str, tuple[str, int | None]] | None:
+    """Apply a patch to saved preimages in a private workspace for attribution."""
+
+    with tempfile.TemporaryDirectory(prefix="ash-checkpoint-patch-") as directory:
+        root = Path(directory)
+        scratch_guard = SafetyGuard(root)
+        relative_paths: dict[str, Path] = {}
+        for row in rows:
+            raw_path = str(row["path"])
+            path = guard.validate_mutation_path(raw_path)
+            try:
+                relative = path.relative_to(guard.project_root)
+            except ValueError:
+                return None
+            if not relative.parts:
+                return None
+            relative_paths[raw_path] = relative
+            scratch_path = root / relative
+            scratch_path.parent.mkdir(parents=True, exist_ok=True)
+            if bool(row["existed"]):
+                scratch_path.write_bytes(_checkpoint_content(row))
+                if row["before_mode"] is not None:
+                    scratch_path.chmod(stat.S_IMODE(int(row["before_mode"])))
+
+        if patch.startswith("*** Begin Patch"):
+            operations = parse_model_patch(patch, scratch_guard)
+            patch_to_apply = model_patch_as_unified_diff(
+                operations,
+                scratch_guard,
+                max_source_bytes=MAX_PATCH_BYTES,
+            )
+        else:
+            patch_to_apply = patch
+        check = await _git_apply(root, patch_to_apply, check=True)
+        if check[0] != 0:
+            return None
+        applied = await _git_apply(root, patch_to_apply, check=False)
+        if applied[0] != 0:
+            return None
+
+        expected: dict[str, tuple[str, int | None]] = {}
+        for raw_path, relative in relative_paths.items():
+            digest, mode = _digest_and_mode(root / relative, scratch_guard)
+            if digest == OVERSIZED_DIGEST:
+                return None
+            expected[raw_path] = (digest, mode)
+        return expected
 
 
 def _checkpoint_context(
@@ -417,16 +578,28 @@ def _recover_interrupted_turns_locked(
             restored_checkpoint_ids.extend(
                 int(row["checkpoint_id"]) for row, _ in safe_rows
             )
-            compensated_calls.append(f"{tool_name} ({call_id})")
-            turn_compensated.append(call_id)
             compensated_files.extend(path for _, path in rows_to_restore)
             turn_compensated_files.extend(
                 _relative_display(path, guard.project_root)
                 for _, path in rows_to_restore
             )
-            call_errors[call_id] = (
-                "Interrupted file edit was rolled back during startup recovery."
-            )
+            if rows_to_restore:
+                compensated_calls.append(f"{tool_name} ({call_id})")
+                turn_compensated.append(call_id)
+                call_errors[call_id] = (
+                    "Interrupted file edit was rolled back during startup recovery."
+                )
+                ambiguous = False
+            else:
+                error = (
+                    "The workspace already matches the saved checkpoint preimage; "
+                    "no file restoration was performed. The dispatched tool outcome "
+                    "remains unknown; inspect other effects before continuing."
+                )
+                call_errors[call_id] = error
+                unknown_calls.append(f"{tool_name} ({call_id})")
+                turn_unknown.append({"call_id": call_id, "tool": tool_name})
+                ambiguous = True
             turn_recovered.append(
                 RecoveredToolCall(
                     call_id=call_id,
@@ -434,7 +607,7 @@ def _recover_interrupted_turns_locked(
                     turn_id=turn_id,
                     error=call_errors[call_id],
                     dispatched=True,
-                    ambiguous=False,
+                    ambiguous=ambiguous,
                 )
             )
 

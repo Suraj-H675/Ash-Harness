@@ -582,7 +582,7 @@ MessageInput: TypeAlias = CanonicalMessage | Mapping[str, Any]
 
 
 def normalize_messages(messages: Sequence[MessageInput]) -> list[dict[str, Any]]:
-    """Validate and serialize canonical messages before provider network I/O."""
+    """Validate and serialize canonical messages without checking sequence rules."""
 
     if len(messages) > MAX_CANONICAL_MESSAGES:
         raise ValueError(f"message count exceeds the limit of {MAX_CANONICAL_MESSAGES}")
@@ -600,3 +600,54 @@ def normalize_messages(messages: Sequence[MessageInput]) -> list[dict[str, Any]]
             ) from exc
         normalized.append(canonical.to_wire())
     return normalized
+
+
+def normalize_provider_history(
+    messages: Sequence[MessageInput],
+) -> list[dict[str, Any]]:
+    """Validate a complete provider history and its visible tool associations."""
+
+    normalized = normalize_messages(messages)
+    _validate_tool_call_associations(normalized)
+    return normalized
+
+
+def _validate_tool_call_associations(
+    messages: Sequence[dict[str, Any]],
+) -> None:
+    """Require each visible tool result to match its pending assistant call batch."""
+
+    pending_call_ids: set[str] = set()
+    pending_batch_index: int | None = None
+    for index, message in enumerate(messages):
+        role = message["role"]
+        if pending_call_ids and role != "tool":
+            assert pending_batch_index is not None
+            raise ValueError(
+                "assistant tool calls at index "
+                f"{pending_batch_index} have unresolved results before message "
+                f"at index {index}"
+            )
+
+        if role == "assistant":
+            tool_calls = message.get("tool_calls") or []
+            call_ids = [call["call_id"] for call in tool_calls]
+            if len(set(call_ids)) != len(call_ids):
+                raise ValueError(
+                    f"assistant tool calls at index {index} contain duplicate IDs"
+                )
+            if call_ids:
+                pending_call_ids = set(call_ids)
+                pending_batch_index = index
+            continue
+
+        if role != "tool":
+            continue
+
+        if message["tool_call_id"] not in pending_call_ids:
+            raise ValueError(
+                f"tool result at index {index} has no matching pending call"
+            )
+        pending_call_ids.remove(message["tool_call_id"])
+        if not pending_call_ids:
+            pending_batch_index = None

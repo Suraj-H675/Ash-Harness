@@ -6,10 +6,11 @@ import asyncio
 import io
 import stat
 from collections import deque
+from dataclasses import dataclass
 from time import monotonic
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from pathlib import Path
-from typing import Any, TextIO
+from typing import Any, Literal, TextIO
 
 import regex as regex_engine
 from pydantic import BaseModel, Field
@@ -48,6 +49,84 @@ MAX_SEARCH_FILE_BYTES = 8 * 1024 * 1024
 WORKSPACE_SCAN_YIELD_INTERVAL = 64
 MAX_SEARCH_REGEX_MATCH_SECONDS = 0.05
 MAX_SEARCH_REGEX_TOTAL_SECONDS = 1.0
+MAX_SEARCH_GROUPED_CONTEXT_ROWS = HARD_MAX_RESULTS * MAX_SEARCH_CONTEXT_LINES * 2
+_SEARCH_GROUPED_ROW_OVERHEAD_BYTES = 128
+NO_MATCH_SEARCH_FEEDBACK = (
+    "No matches found; adjust the pattern or directory_path and retry."
+)
+
+
+@dataclass(frozen=True, slots=True)
+class _SearchRow:
+    path: str
+    line_number: int
+    preview: str
+    kind: Literal["match", "context"]
+    preview_start: int = 0
+    preview_truncated: bool = False
+
+    @property
+    def is_match(self) -> bool:
+        return self.kind == "match"
+
+
+@dataclass(frozen=True, slots=True)
+class _SearchGroup:
+    path: str
+    rows: tuple[_SearchRow, ...]
+
+    @property
+    def start_line(self) -> int:
+        return self.rows[0].line_number
+
+    @property
+    def end_line(self) -> int:
+        return self.rows[-1].line_number
+
+
+def _group_search_rows(rows: Iterable[_SearchRow]) -> list[_SearchGroup]:
+    """Coalesce ordered rows into contiguous, hit-bearing path ranges."""
+    path_order: list[str] = []
+    rows_by_path: dict[str, dict[int, _SearchRow]] = {}
+    for row in rows:
+        if row.path not in rows_by_path:
+            path_order.append(row.path)
+            rows_by_path[row.path] = {}
+        by_line = rows_by_path[row.path]
+        current = by_line.get(row.line_number)
+        if current is None or (row.is_match and not current.is_match):
+            by_line[row.line_number] = row
+
+    groups: list[_SearchGroup] = []
+    for path in path_order:
+        current_rows: list[_SearchRow] = []
+        for row in (rows_by_path[path][line] for line in sorted(rows_by_path[path])):
+            if current_rows and row.line_number != current_rows[-1].line_number + 1:
+                if any(item.is_match for item in current_rows):
+                    groups.append(_SearchGroup(path, tuple(current_rows)))
+                current_rows = []
+            current_rows.append(row)
+        if current_rows and any(item.is_match for item in current_rows):
+            groups.append(_SearchGroup(path, tuple(current_rows)))
+    return groups
+
+
+def _render_search_group(group: _SearchGroup) -> str:
+    rendered = [f"{group.path} (lines {group.start_line}-{group.end_line})"]
+    for row in group.rows:
+        marker = ">" if row.is_match else " "
+        column = f"[column {row.preview_start + 1}] " if row.preview_start else ""
+        rendered.append(f"{marker} {row.line_number}: {column}{row.preview}")
+    return "\n".join(rendered)
+
+
+def _render_search_groups(groups: Iterable[_SearchGroup]) -> str:
+    rendered: list[str] = []
+    for group in groups:
+        if rendered:
+            rendered.append("...")
+        rendered.append(_render_search_group(group))
+    return "\n".join(rendered)
 
 
 def _iter_workspace_paths(
@@ -362,6 +441,13 @@ class SearchTextArgs(BaseModel):
         ge=0,
         le=MAX_SEARCH_CONTEXT_LINES,
     )
+    grouped_context: bool = Field(
+        False,
+        description=(
+            "Group matching lines and optional context into numbered, inclusive "
+            "path ranges."
+        ),
+    )
     max_output_bytes: int = Field(
         DEFAULT_SEARCH_CAPTURE_BYTES, ge=1_024, le=MAX_SEARCH_CAPTURE_BYTES
     )
@@ -374,18 +460,32 @@ class SearchTextTool(BaseTool):
         "Search source text to find function definitions, call sites, and "
         "symbol usages by textual matches (not semantic reference analysis). "
         "Return file:line matches; scope with directory_path, and use "
-        "context_lines for nearby lines."
+        "context_lines for nearby lines or grouped_context for numbered ranges."
     )
     args_schema = SearchTextArgs
 
     def json_schema(self) -> dict[str, Any]:
         schema = super().json_schema()
-        for name in ("context_lines", "max_output_bytes", "files_only"):
+        for name in (
+            "context_lines",
+            "grouped_context",
+            "max_output_bytes",
+            "files_only",
+        ):
             schema["properties"][name].pop("default", None)
         return schema
 
     async def run(self, **kwargs: Any) -> ToolResult:
         args = SearchTextArgs(**kwargs)
+        if args.files_only and args.grouped_context:
+            return ToolResult(
+                success=False,
+                output="",
+                error=(
+                    "files_only=true cannot be combined with grouped_context; "
+                    "use normal search results to inspect numbered source ranges."
+                ),
+            )
         if args.files_only and args.context_lines:
             return ToolResult(
                 success=False,
@@ -544,6 +644,13 @@ class SearchTextTool(BaseTool):
         skipped_file = False
         preview_truncated = False
         skipped_generated: set[str] = set()
+        grouped_hits: list[_SearchRow] = []
+        grouped_hit_keys: set[tuple[str, int]] = set()
+        grouped_hit_paths: set[str] = set()
+        grouped_context_rows: dict[tuple[str, int], _SearchRow] = {}
+        grouped_hit_bytes = 0
+        grouped_context_bytes = 0
+        grouped_context_limited = False
 
         def append_result(rendered: str) -> bool:
             nonlocal output_bytes, output_limited
@@ -576,6 +683,46 @@ class SearchTextTool(BaseTool):
                 preview_truncated = True
                 text += " [line preview truncated]"
             return text
+
+        def add_grouped_context(
+            path: str,
+            line_number: int,
+            text: str,
+            line_truncated: bool,
+        ) -> None:
+            nonlocal grouped_context_bytes, grouped_context_limited
+            key = (path, line_number)
+            if key in grouped_hit_keys or key in grouped_context_rows:
+                return
+            preview = context_preview(text, line_truncated)
+            row = _SearchRow(
+                path=path,
+                line_number=line_number,
+                preview=preview,
+                kind="context",
+                preview_truncated=(
+                    line_truncated or len(text) > MAX_SEARCH_CONTEXT_PREVIEW_CHARS
+                ),
+            )
+            row_bytes = len(path.encode("utf-8")) + len(preview.encode("utf-8")) + 64
+            if (
+                len(grouped_context_rows) >= MAX_SEARCH_GROUPED_CONTEXT_ROWS
+                or grouped_context_bytes + row_bytes > MAX_SEARCH_CONTEXT_CAPTURE_BYTES
+            ):
+                grouped_context_limited = True
+                return
+            grouped_context_rows[key] = row
+            grouped_context_bytes += row_bytes
+
+        def discard_grouped_context(path: str, line_number: int) -> None:
+            nonlocal grouped_context_bytes
+            row = grouped_context_rows.pop((path, line_number), None)
+            if row is not None:
+                grouped_context_bytes -= (
+                    len(row.path.encode("utf-8"))
+                    + len(row.preview.encode("utf-8"))
+                    + 64
+                )
 
         def mark_scan_incomplete() -> None:
             nonlocal scan_incomplete
@@ -643,32 +790,94 @@ class SearchTextTool(BaseTool):
                                 # more model context on repeated matches here.
                                 break
                             if match_count >= args.max_results:
+                                if args.grouped_context:
+                                    discard_grouped_context(relative, line_number)
                                 match_limited = True
                                 break
-                            for previous_line, previous_text, previous_clipped in preceding:
-                                if previous_line <= last_rendered_line:
-                                    continue
-                                preview = context_preview(previous_text, previous_clipped)
+                            if args.grouped_context:
+                                for (
+                                    previous_line,
+                                    previous_text,
+                                    previous_clipped,
+                                ) in preceding:
+                                    add_grouped_context(
+                                        relative,
+                                        previous_line,
+                                        previous_text,
+                                        previous_clipped,
+                                    )
+                                preview = match_preview(text, line_truncated)
+                                row = _SearchRow(
+                                    path=relative,
+                                    line_number=line_number,
+                                    preview=preview,
+                                    kind="match",
+                                    preview_start=preview_start,
+                                    preview_truncated=(
+                                        line_truncated
+                                        or len(text.encode("utf-8"))
+                                        > match_preview_limit
+                                    ),
+                                )
+                                row_bytes = (
+                                    (
+                                        0
+                                        if relative in grouped_hit_paths
+                                        else len(relative.encode("utf-8"))
+                                    )
+                                    + len(preview.encode("utf-8"))
+                                    + _SEARCH_GROUPED_ROW_OVERHEAD_BYTES
+                                )
+                                discard_grouped_context(relative, line_number)
+                                if (
+                                    grouped_hit_bytes + row_bytes
+                                    > MAX_SEARCH_CAPTURE_BYTES
+                                ):
+                                    output_limited = True
+                                    break
+                                key = (relative, line_number)
+                                grouped_hits.append(row)
+                                grouped_hit_keys.add(key)
+                                grouped_hit_paths.add(relative)
+                                grouped_hit_bytes += row_bytes
+                                match_count += 1
+                                trailing_until = line_number + args.context_lines
+                            else:
+                                for (
+                                    previous_line,
+                                    previous_text,
+                                    previous_clipped,
+                                ) in preceding:
+                                    if previous_line <= last_rendered_line:
+                                        continue
+                                    preview = context_preview(
+                                        previous_text, previous_clipped
+                                    )
+                                    if not append_result(
+                                        f"{relative}-{previous_line}-{preview}"
+                                    ):
+                                        break
+                                    last_rendered_line = previous_line
+                                if output_limited:
+                                    break
+                                preview = match_preview(text, line_truncated)
+                                column_label = (
+                                    f"[column {preview_start + 1}] "
+                                    if preview_start
+                                    else ""
+                                )
                                 if not append_result(
-                                    f"{relative}-{previous_line}-{preview}"
+                                    f"{relative}:{line_number}:{column_label}{preview}"
                                 ):
                                     break
-                                last_rendered_line = previous_line
-                            if output_limited:
-                                break
-                            preview = match_preview(text, line_truncated)
-                            column_label = (
-                                f"[column {preview_start + 1}] "
-                                if preview_start
-                                else ""
-                            )
-                            if not append_result(
-                                f"{relative}:{line_number}:{column_label}{preview}"
-                            ):
-                                break
-                            match_count += 1
-                            last_rendered_line = line_number
-                            trailing_until = line_number + args.context_lines
+                                match_count += 1
+                                last_rendered_line = line_number
+                                trailing_until = line_number + args.context_lines
+                        elif args.grouped_context:
+                            if args.context_lines and line_number <= trailing_until:
+                                add_grouped_context(
+                                    relative, line_number, text, line_truncated
+                                )
                         elif args.context_lines and line_number <= trailing_until:
                             preview = context_preview(text, line_truncated)
                             if not append_result(f"{relative}-{line_number}-{preview}"):
@@ -683,10 +892,203 @@ class SearchTextTool(BaseTool):
                 break
             if output_limited or match_limited:
                 break
+
+        if args.grouped_context:
+
+            def available_context_rows(
+                selected_hits: list[_SearchRow],
+            ) -> list[_SearchRow]:
+                if not args.context_lines:
+                    return []
+                allowed_context: set[tuple[str, int]] = set()
+                for hit in selected_hits:
+                    for distance in range(1, args.context_lines + 1):
+                        if hit.line_number > distance:
+                            allowed_context.add(
+                                (hit.path, hit.line_number - distance)
+                            )
+                        allowed_context.add((hit.path, hit.line_number + distance))
+                return [
+                    row
+                    for key, row in grouped_context_rows.items()
+                    if key in allowed_context and key not in grouped_hit_keys
+                ]
+
+            def build_grouped_result(
+                selected_hits: list[_SearchRow],
+                *,
+                include_context: bool,
+                context_omitted: bool,
+                capture_prefix_limited: bool,
+                provider_limited: bool,
+            ) -> ToolResult:
+                rows: list[_SearchRow] = list(selected_hits)
+                if include_context:
+                    rows.extend(available_context_rows(selected_hits))
+                output = _render_search_groups(_group_search_rows(rows))
+                notes: list[str] = []
+                capture_truncated = output_limited or capture_prefix_limited
+                if (
+                    not grouped_hits
+                    and not regex_incomplete
+                    and not capture_truncated
+                    and not match_limited
+                    and not scan_truncated
+                    and not scan_incomplete
+                    and not skipped_file
+                ):
+                    output = NO_MATCH_SEARCH_FEEDBACK
+                elif regex_incomplete:
+                    notes.append(
+                        "[workspace search incomplete: regex time budget exhausted]"
+                    )
+                elif capture_truncated:
+                    notes.append(
+                        f"[search output capture truncated after {capture_limit} bytes]"
+                    )
+                elif match_limited:
+                    notes.append(f"[truncated after {args.max_results} matches]")
+                elif scan_truncated:
+                    notes.append(
+                        f"[workspace scan truncated after {MAX_SEARCH_SCAN_ENTRIES} entries]"
+                    )
+                elif scan_incomplete:
+                    notes.append("[workspace search incomplete]")
+                elif skipped_file:
+                    notes.append(
+                        "[workspace search incomplete: skipped unreadable or invalid text files]"
+                    )
+                if context_omitted:
+                    notes.append("[search context omitted to preserve matching lines]")
+                if provider_limited:
+                    other_limit = (
+                        f"; max_results={args.max_results} also reached"
+                        if match_limited
+                        else ""
+                    )
+                    notes.append(
+                        "[context budget truncated search results"
+                        + other_limit
+                        + "; narrow the pattern or directory_path to continue.]"
+                    )
+                note = _skipped_generated_note(skipped_generated)
+                if note:
+                    notes.append(note)
+                if notes:
+                    output += ("\n" if output else "") + "\n".join(notes)
+                return ToolResult(
+                    success=True,
+                    output=output,
+                    token_count=count_output_tokens(output),
+                    truncated=(
+                        regex_incomplete
+                        or capture_truncated
+                        or match_limited
+                        or scan_truncated
+                        or scan_incomplete
+                        or skipped_file
+                        or preview_truncated
+                        or context_omitted
+                        or provider_limited
+                    ),
+                )
+
+            all_hits = list(grouped_hits)
+            result = build_grouped_result(
+                all_hits,
+                include_context=True,
+                context_omitted=grouped_context_limited,
+                capture_prefix_limited=False,
+                provider_limited=False,
+            )
+            selected_hits = all_hits
+            context_omitted = grouped_context_limited
+            capture_prefix_limited = False
+            if len(result.output.encode("utf-8")) > capture_limit:
+                context_omitted = (
+                    grouped_context_limited or bool(available_context_rows(all_hits))
+                )
+                result = build_grouped_result(
+                    all_hits,
+                    include_context=False,
+                    context_omitted=context_omitted,
+                    capture_prefix_limited=False,
+                    provider_limited=False,
+                )
+                if len(result.output.encode("utf-8")) > capture_limit:
+                    low = 0
+                    high = len(all_hits)
+                    while low < high:
+                        middle = (low + high + 1) // 2
+                        hit_prefix = all_hits[:middle]
+                        candidate = build_grouped_result(
+                            hit_prefix,
+                            include_context=False,
+                            context_omitted=(
+                                grouped_context_limited
+                                or bool(available_context_rows(hit_prefix))
+                            ),
+                            capture_prefix_limited=True,
+                            provider_limited=False,
+                        )
+                        if len(candidate.output.encode("utf-8")) <= capture_limit:
+                            low = middle
+                        else:
+                            high = middle - 1
+                    selected_hits = all_hits[:low]
+                    context_omitted = (
+                        grouped_context_limited
+                        or bool(available_context_rows(selected_hits))
+                    )
+                    capture_prefix_limited = True
+                    result = build_grouped_result(
+                        selected_hits,
+                        include_context=False,
+                        context_omitted=context_omitted,
+                        capture_prefix_limited=True,
+                        provider_limited=False,
+                    )
+
+            budget = self.output_budget
+            if budget is None or budget.accepts(result):
+                return result
+
+            hit_entries = [f"{hit.path}:{hit.line_number}" for hit in selected_hits]
+
+            def build_provider_prefix(
+                selected: list[str], provider_limited: bool
+            ) -> ToolResult:
+                return build_grouped_result(
+                    selected_hits[: len(selected)],
+                    include_context=False,
+                    context_omitted=(
+                        grouped_context_limited
+                        or bool(
+                            available_context_rows(
+                                selected_hits[: len(selected)]
+                            )
+                        )
+                    ),
+                    capture_prefix_limited=capture_prefix_limited,
+                    provider_limited=provider_limited,
+                )
+
+            return budget.fit_lines(hit_entries, build_provider_prefix)
+
         def build_result(selected: list[str], context_limited: bool) -> ToolResult:
             output = "\n".join(selected)
             separator = "\n" if output else ""
-            if regex_incomplete:
+            if (
+                not matches
+                and not regex_incomplete
+                and not output_limited
+                and not match_limited
+                and not scan_truncated
+                and not scan_incomplete
+                and not skipped_file
+            ):
+                output = NO_MATCH_SEARCH_FEEDBACK
+            elif regex_incomplete:
                 output += (
                     f"{separator}[workspace search incomplete: "
                     "regex time budget exhausted]"

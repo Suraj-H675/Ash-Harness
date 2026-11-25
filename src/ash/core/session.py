@@ -8659,9 +8659,8 @@ class SessionStore:
         """
         Insert or replace a :class:`~ash.core.sprint.SprintExecution`.
 
-        The contract is serialized as JSON; checklist items are written
-        one row per item keyed by ``(sprint_id, idx)``. Existing rows
-        for the same ``idx`` are updated in place.
+        The contract is serialized as JSON; the checklist rows are replaced
+        with the execution's complete current item set in the same transaction.
         """
 
         with closing(self._connect()) as conn, conn:
@@ -8673,6 +8672,7 @@ class SessionStore:
                 )
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(sprint_id) DO UPDATE SET
+                    goal = excluded.goal,
                     state = excluded.state,
                     contract_json = excluded.contract_json,
                     started_at = excluded.started_at,
@@ -8696,6 +8696,10 @@ class SessionStore:
                 ),
             )
 
+            conn.execute(
+                "DELETE FROM checklist_items WHERE sprint_id = ?",
+                (execution.contract.contract_id,),
+            )
             for item in execution.items:
                 conn.execute(
                     """
@@ -8703,11 +8707,6 @@ class SessionStore:
                         sprint_id, idx, section, description, status, notes
                     )
                     VALUES (?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(sprint_id, idx) DO UPDATE SET
-                        section = excluded.section,
-                        description = excluded.description,
-                        status = excluded.status,
-                        notes = excluded.notes
                     """,
                     (
                         execution.contract.contract_id,

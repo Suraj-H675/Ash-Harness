@@ -565,7 +565,10 @@ class RunCommandTool(BaseTool):
         finally:
             streamer.finish()
         return _successful_command_stderr_as_output(
-            _preserve_command_tail(result, streamer)
+            _preserve_command_timeout_output(
+                _preserve_command_tail(result, streamer),
+                streamer,
+            )
         )
 
     async def _run_pty(
@@ -1195,6 +1198,48 @@ def _preserve_command_tail(
     )
 
 
+def _preserve_command_timeout_output(
+    result: ToolResult, streamer: "_CommandEventStreamer"
+) -> ToolResult:
+    """Return bounded redacted output when a timed-out command has no exit status."""
+
+    if (
+        result.outcome is not ToolExecutionOutcome.UNKNOWN
+        or not result.error
+        or "timed out after" not in result.error.casefold()
+    ):
+        return result
+
+    stdout = streamer.tail("stdout")
+    stderr = streamer.tail("stderr")
+    sections = []
+    if stdout:
+        sections.append(f"[stdout recent output]\n{stdout}")
+    if stderr:
+        sections.append(f"[stderr recent output]\n{stderr}")
+    if not sections:
+        return result
+
+    omitted = any(streamer.tail_omitted(stream) for stream in ("stdout", "stderr"))
+    notice = (
+        "Partial output before timeout; command outcome is unknown and no exit "
+        "status was observed."
+    )
+    if omitted:
+        notice += " Earlier output omitted; only bounded recent output is shown."
+    output = f"[{notice}]\n" + "\n".join(sections)
+    return ToolResult(
+        **{
+            **result.model_dump(),
+            "output": output,
+            "truncated": result.truncated or omitted,
+            "token_count": count_output_tokens(output),
+            "diagnostics": extract_diagnostics(stdout, stderr),
+            "diagnostic_summary": extract_diagnostic_summary(stdout, stderr),
+        }
+    )
+
+
 class _CommandEventStreamer:
     """Convert subprocess chunks into bounded, redacted typed events."""
 
@@ -1203,6 +1248,7 @@ class _CommandEventStreamer:
         self._emitted_characters = 0
         self._truncated = False
         self._tails = {"stdout": "", "stderr": ""}
+        self._tail_omitted = dict.fromkeys(self._tails, False)
         self._withheld_characters = dict.fromkeys(self._tails, 0)
         self._redactors = {
             "stdout": StreamingRedactor(),
@@ -1231,10 +1277,16 @@ class _CommandEventStreamer:
                 })
 
     def _retain_tail(self, stream: str, delta: str) -> None:
-        self._tails[stream] = (self._tails[stream] + delta)[-MAX_COMMAND_TAIL_CHARS:]
+        combined = self._tails[stream] + delta
+        if len(combined) > MAX_COMMAND_TAIL_CHARS:
+            self._tail_omitted[stream] = True
+        self._tails[stream] = combined[-MAX_COMMAND_TAIL_CHARS:]
 
     def tail(self, stream: str) -> str:
         return self._tails[stream]
+
+    def tail_omitted(self, stream: str) -> bool:
+        return self._tail_omitted[stream]
 
     def _send(self, stream: str, delta: str) -> None:
         if self._truncated:

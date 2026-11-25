@@ -2,6 +2,7 @@ import asyncio
 import hashlib
 import json
 import os
+import stat
 
 import pytest
 from datetime import datetime, timezone
@@ -115,6 +116,158 @@ async def test_model_patch_preserves_multifile_checkpoints_and_undo(tmp_path) ->
     }
     assert first.read_text() == "before\n"
     assert not (tmp_path / "second.txt").exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("finish_with", ["undo", "recovery"])
+async def test_stale_multifile_patch_never_checkpoints_external_bytes(
+    tmp_path, finish_with: str
+) -> None:
+    first = tmp_path / "first.txt"
+    second = tmp_path / "second.txt"
+    first.write_text("first-before\n", encoding="utf-8")
+    second.write_text("second-before\n", encoding="utf-8")
+    store = SessionStore(tmp_path / "sessions.db")
+    session = store.create_session(str(tmp_path))
+    store.start_turn(session.session_id, "turn-1", "patch both files")
+    call_id = "patch-call"
+    if finish_with == "recovery":
+        store.save_tool_call(
+            session.session_id,
+            _tool_record(call_id, "apply_patch", executed=False),
+            turn_id="turn-1",
+        )
+    guard = SafetyGuard(tmp_path)
+    middleware = FileCheckpointMiddleware(
+        store, guard, lambda: (session.session_id, "turn-1", call_id)
+    )
+    tool = ApplyPatchTool(guard)
+    arguments = {
+        "patch": (
+            "diff --git a/first.txt b/first.txt\n"
+            "--- a/first.txt\n"
+            "+++ b/first.txt\n"
+            "@@ -1 +1 @@\n"
+            "-first-before\n"
+            "+first-after\n"
+            "diff --git a/second.txt b/second.txt\n"
+            "--- a/second.txt\n"
+            "+++ b/second.txt\n"
+            "@@ -1 +1 @@\n"
+            "-stale-second\n"
+            "+patch-second\n"
+        )
+    }
+
+    await middleware.before_tool("apply_patch", arguments, tool)
+    second.write_text("external-change\n", encoding="utf-8")
+    result = await tool.run(**arguments)
+    assert result.success is False
+    assert result.outcome.value == "completed"
+    await middleware.after_tool("apply_patch", arguments, result)
+
+    assert first.read_text(encoding="utf-8") == "first-before\n"
+    assert second.read_text(encoding="utf-8") == "external-change\n"
+    rows = store.file_checkpoints_for_call(
+        session.session_id, "turn-1", call_id
+    )
+    second_row = next(row for row in rows if row["path"] == str(second))
+    assert second_row["after_sha256"] is None
+
+    if finish_with == "undo":
+        with pytest.raises(RuntimeError):
+            undo_latest_checkpoint(store, guard, session.session_id)
+    else:
+        summary = recover_interrupted_turns(store, guard, session.session_id)
+        assert summary.needs_attention is True
+        assert summary.compensated_calls == 0
+        assert summary.compensated_files == ()
+        assert summary.unresolved_files == (second,)
+
+    assert first.read_text(encoding="utf-8") == "first-before\n"
+    assert second.read_text(encoding="utf-8") == "external-change\n"
+
+
+@pytest.mark.asyncio
+async def test_successful_patch_does_not_checkpoint_divergent_concurrent_bytes(
+    tmp_path,
+) -> None:
+    path = tmp_path / "file.txt"
+    path.write_text("before\n", encoding="utf-8")
+    store = SessionStore(tmp_path / "sessions.db")
+    session = store.create_session(str(tmp_path))
+    guard = SafetyGuard(tmp_path)
+    middleware = FileCheckpointMiddleware(
+        store, guard, lambda: (session.session_id, "turn-1", "patch-call")
+    )
+    tool = ApplyPatchTool(guard)
+    arguments = {
+        "patch": (
+            "diff --git a/file.txt b/file.txt\n"
+            "--- a/file.txt\n"
+            "+++ b/file.txt\n"
+            "@@ -1 +1 @@\n"
+            "-before\n"
+            "+after\n"
+        )
+    }
+
+    await middleware.before_tool("apply_patch", arguments, tool)
+    result = await tool.run(**arguments)
+    assert result.success is True
+    path.write_text("external-change\n", encoding="utf-8")
+
+    with pytest.raises(RuntimeError):
+        await middleware.after_tool("apply_patch", arguments, result)
+
+    row = store.file_checkpoints_for_call(
+        session.session_id, "turn-1", "patch-call"
+    )[0]
+    assert row["after_sha256"] is None
+    assert undo_latest_checkpoint(store, guard, session.session_id) == []
+    assert path.read_text(encoding="utf-8") == "external-change\n"
+
+
+@pytest.mark.asyncio
+async def test_recovery_does_not_claim_rollback_when_checkpoint_preimage_is_present(
+    tmp_path,
+) -> None:
+    path = tmp_path / "file.txt"
+    path.write_text("before", encoding="utf-8")
+    store = SessionStore(tmp_path / "sessions.db")
+    session = store.create_session(str(tmp_path))
+    store.start_turn(session.session_id, "turn-1", "edit file")
+    call_id = "call-pending"
+    store.save_tool_call(
+        session.session_id,
+        _tool_record(call_id, "apply_patch", executed=False),
+        turn_id="turn-1",
+    )
+    guard = SafetyGuard(tmp_path)
+    middleware = FileCheckpointMiddleware(
+        store, guard, lambda: (session.session_id, "turn-1", call_id)
+    )
+    await middleware.before_tool(
+        "apply_patch",
+        {"patch": "diff --git a/file.txt b/file.txt\n"},
+        ApplyPatchTool(guard),
+    )
+
+    summary = recover_interrupted_turns(store, guard, session.session_id)
+
+    assert path.read_text(encoding="utf-8") == "before"
+    assert summary.compensated_calls == 0
+    assert summary.compensated_files == ()
+    assert summary.unknown_calls == ("apply_patch (call-pending)",)
+    assert summary.needs_attention is True
+    recovered = store.load_session(session.session_id).tool_calls[0]
+    assert "preimage" in (recovered.error or "").lower()
+    assert "no file restoration" in (recovered.error or "").lower()
+    assert "rolled back" not in (recovered.error or "").lower()
+    report = store.interrupted_recovery_reports(session.session_id)[0]
+    assert report["status"] == "needs_attention"
+    assert report["compensated_calls"] == []
+    assert report["compensated_files"] == []
 
 
 @pytest.mark.asyncio
@@ -578,17 +731,18 @@ async def test_checkpoint_diff_reports_agent_file_mode_change(tmp_path) -> None:
     )
     patch = "diff --git a/file.txt b/file.txt\nold mode 100640\nnew mode 100755\n"
 
-    await middleware.before_tool("apply_patch", {"patch": patch}, WholeEditTool(guard))
-    path.chmod(0o755)
-    await middleware.after_tool(
-        "apply_patch",
-        {"patch": patch},
-        ToolResult(success=True, output="mode changed"),
-    )
+    tool = ApplyPatchTool(guard)
+    await middleware.before_tool("apply_patch", {"patch": patch}, tool)
+    result = await tool.run(patch=patch)
+    assert result.success, result.error
+    actual_mode = stat.S_IMODE(path.stat().st_mode)
+    assert actual_mode & stat.S_IXUSR
+    assert path.read_text(encoding="utf-8") == "unchanged\n"
+    await middleware.after_tool("apply_patch", {"patch": patch}, result)
 
     rendered = diff_latest_checkpoint(store, guard, session.session_id)
 
-    assert "File mode changed: file.txt 0o640 -> 0o755" in rendered
+    assert f"File mode changed: file.txt 0o640 -> {actual_mode:#o}" in rendered
 
 
 @pytest.mark.asyncio
@@ -970,8 +1124,10 @@ async def test_startup_recovery_compensates_only_the_pending_file_call(
     )
 
 
-def test_recovery_retry_after_restoration_but_failed_database_commit(tmp_path) -> None:
-    """A rolled-back DB recovery commit must not undo a completed restoration."""
+def test_recovery_retry_reports_preimage_without_claiming_a_second_restore(
+    tmp_path,
+) -> None:
+    """An uncommitted restore attempt cannot be attributed on the next pass."""
     import sqlite3
 
     from ash.core.session import get_db_connection
@@ -1031,13 +1187,22 @@ def test_recovery_retry_after_restoration_but_failed_database_commit(tmp_path) -
         store, SafetyGuard(tmp_path), session.session_id
     )
     assert summary.interrupted_turns == 1
-    assert summary.compensated_calls == 1
+    assert summary.compensated_calls == 0
     assert summary.compensated_files == ()
-    assert summary.unknown_calls == ()
+    assert summary.unknown_calls == ("whole_edit (call-edit)",)
     assert file.read_text(encoding="utf-8") == "before"
     assert len(store.list_audit_logs(session.session_id)) == 1
     assert len(store.interrupted_recovery_reports(session.session_id)) == 1
-    assert store.interrupted_recovery_reports(session.session_id)[0]["compensated_files"] == []
+    report = store.interrupted_recovery_reports(session.session_id)[0]
+    assert report["status"] == "needs_attention"
+    assert report["compensated_calls"] == []
+    assert report["compensated_files"] == []
+    assert report["unknown_calls"] == [
+        {"call_id": "call-edit", "tool": "whole_edit"}
+    ]
+    recovered = store.load_session(session.session_id).tool_calls[0]
+    assert "no file restoration" in (recovered.error or "").lower()
+    assert "rolled back" not in (recovered.error or "").lower()
     assert store.verify_audit_log(session.session_id) == []
     assert (
         recover_interrupted_turns(
@@ -1045,6 +1210,75 @@ def test_recovery_retry_after_restoration_but_failed_database_commit(tmp_path) -
         ).interrupted_turns
         == 0
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    os.name != "posix" or os.geteuid() == 0,
+    reason="requires POSIX permission denial for a partial git apply",
+)
+async def test_partial_patch_recovery_restores_only_verified_patch_output(
+    tmp_path,
+) -> None:
+    first = tmp_path / "first.txt"
+    blocked = tmp_path / "locked"
+    second = blocked / "second.txt"
+    first.write_text("first-before\n", encoding="utf-8")
+    blocked.mkdir()
+    second.write_text("second-before\n", encoding="utf-8")
+    blocked.chmod(0o555)
+    store = SessionStore(tmp_path / "sessions.db")
+    session = store.create_session(str(tmp_path))
+    store.start_turn(session.session_id, "turn-1", "patch both files")
+    call_id = "partial-patch"
+    store.save_tool_call(
+        session.session_id,
+        _tool_record(call_id, "apply_patch", executed=False),
+        turn_id="turn-1",
+    )
+    guard = SafetyGuard(tmp_path)
+    middleware = FileCheckpointMiddleware(
+        store, guard, lambda: (session.session_id, "turn-1", call_id)
+    )
+    tool = ApplyPatchTool(guard)
+    arguments = {
+        "patch": (
+            "diff --git a/first.txt b/first.txt\n"
+            "--- a/first.txt\n"
+            "+++ b/first.txt\n"
+            "@@ -1 +1 @@\n"
+            "-first-before\n"
+            "+first-after\n"
+            "diff --git a/locked/second.txt b/locked/second.txt\n"
+            "--- a/locked/second.txt\n"
+            "+++ b/locked/second.txt\n"
+            "@@ -1 +1 @@\n"
+            "-second-before\n"
+            "+second-after\n"
+        )
+    }
+
+    await middleware.before_tool("apply_patch", arguments, tool)
+    result = await tool.run(**arguments)
+    blocked.chmod(0o755)
+    assert result.success is False
+    assert result.outcome.value == "unknown"
+    assert first.read_text(encoding="utf-8") == "first-after\n"
+    assert second.read_text(encoding="utf-8") == "second-before\n"
+    await middleware.after_tool("apply_patch", arguments, result)
+
+    rows = store.file_checkpoints_for_call(
+        session.session_id, "turn-1", call_id
+    )
+    assert len(rows) == 2
+    assert all(row["after_sha256"] is not None for row in rows)
+    summary = recover_interrupted_turns(store, guard, session.session_id)
+
+    assert first.read_text(encoding="utf-8") == "first-before\n"
+    assert second.read_text(encoding="utf-8") == "second-before\n"
+    assert summary.compensated_calls == 1
+    assert summary.compensated_files == (first,)
+    assert summary.needs_attention is False
 
 
 def test_recovery_resumes_after_process_exit_midway_through_multi_file_restore(
@@ -1762,3 +1996,36 @@ def test_recovery_repairs_oversized_legacy_assistant_arguments_atomically(
     tool_payload = json.loads(tool_message.content)
     assert tool_payload["dispatched"] is False
     assert tool_payload["replayed"] is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("dry_run", [True, "true", "false"])
+async def test_patch_checkpoint_distinguishes_dry_run_from_real_edit(tmp_path, dry_run) -> None:
+    path = tmp_path / "file.txt"
+    path.write_text("before\n", encoding="utf-8")
+    store = SessionStore(tmp_path / "sessions.db")
+    session = store.create_session(str(tmp_path))
+    guard = SafetyGuard(tmp_path)
+    tool = ApplyPatchTool(guard)
+    middleware = FileCheckpointMiddleware(
+        store, guard, lambda: (session.session_id, "turn", "call")
+    )
+    arguments = {"dry_run": dry_run, "patch": (
+        "diff --git a/file.txt b/file.txt\n--- a/file.txt\n+++ b/file.txt\n"
+        "@@ -1 +1 @@\n-before\n+after\n"
+    )}
+    await middleware.before_tool("apply_patch", arguments, tool)
+    result = await tool.run(**arguments)
+    assert result.success, result.error
+    if dry_run != "false":
+        assert path.read_text(encoding="utf-8") == "before\n"
+        path.write_text("after\n", encoding="utf-8")
+    await middleware.after_tool("apply_patch", arguments, result)
+    restored = undo_latest_checkpoint(store, guard, session.session_id)
+    if dry_run == "false":
+        assert restored == [path]
+        assert path.read_text(encoding="utf-8") == "before\n"
+    else:
+        assert restored == []
+        assert not store.file_checkpoints_for_call(session.session_id, "turn", "call")
+        assert path.read_text(encoding="utf-8") == "after\n"

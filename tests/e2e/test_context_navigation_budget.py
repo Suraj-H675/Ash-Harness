@@ -893,6 +893,207 @@ async def test_single_read_early_error_fits_budget_before_tool_result_history(
 
 
 @pytest.mark.asyncio
+async def test_budgeted_long_file_reads_fill_budget_and_continue_exactly(
+    tmp_path: Path,
+) -> None:
+    import hashlib
+    import re
+
+    from ash.core.loop import _execute_tool_once
+    from ash.tools.base import ToolOutputBudget, ToolResult
+
+    class Provider(ProviderABC):
+        model_name = "large-file-budget-fit"
+        _ash_declared_capabilities = ProviderCapabilities(native_tools=True)
+
+        def count_tokens(self, text: str) -> int:
+            return max(1, (len(str(text)) + 3) // 4)
+
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            raise AssertionError("the budget fixture must not call a model")
+            yield StreamChunk(is_done=True)
+
+    reader = ReadFileTool(SafetyGuard(tmp_path))
+    loop = AshLoop(
+        SessionStore(tmp_path / "large-file-budget.db"),
+        Provider(),
+        reader.safety_guard,
+        HeadlessUI(output_format="stream-json", stream=io.StringIO()),
+        tmp_path,
+        tools={"read_file": reader},
+        config=AshConfig(
+            model="custom/large-file-budget-fit",
+            workspace_root=tmp_path,
+            db_directory=tmp_path / "large-file-budget-db",
+            memory_backend="off",
+            max_context_tokens=16_000,
+            max_completion_tokens=2_000,
+        ),
+    )
+    padding = "x" * 44_000
+    line_shapes = [
+        (
+            "minified_crlf.py",
+            1,
+            "# " + "a" * 24_000 + "Ω漢🌱" + "b" * 56_000,
+            "\r\ndef answer():\r\n    return 41\r\n",
+            "utf-8",
+        ),
+        (
+            "generated_utf16.py",
+            1_201,
+            "# GENERATED PAYLOAD " + "λ" * 72_000 + " END",
+            None,
+            "utf-16",
+        ),
+    ]
+
+    def make_budget(
+        *, call_id: str, arguments: dict[str, Any]
+    ) -> ToolOutputBudget:
+        budgets = loop._navigation_output_budgets(
+            messages=[
+                {"role": "system", "content": "Read only the requested source."},
+                {"role": "user", "content": padding},
+            ],
+            assistant_text="Inspect the requested source range.",
+            tool_calls=[{
+                "call_id": call_id,
+                "name": "read_file",
+                "arguments": arguments,
+            }],
+            provider_state=[{
+                "type": "reasoning",
+                "id": f"state-{call_id}",
+                "summary": [],
+                "status": "completed",
+                "encrypted_content": "fixture-only-replay",
+            }],
+            tool_schema=[],
+            request_budget=loop._resolve_request_token_budget(),
+            tools_snapshot={"read_file": reader},
+        )
+        budget = budgets[call_id]
+        assert budget.can_dispatch
+        return budget
+
+    try:
+        for shape_index, (file_name, line_number, target, suffix, encoding) in enumerate(line_shapes):
+            path = tmp_path / file_name
+            if suffix is None:
+                generated = [
+                    f"# GENERATED SECTION {index:04d} " + "g" * 80
+                    for index in range(1, 1_201)
+                ]
+                generated.extend((target, "def answer():", "    return 41"))
+                raw = ("\r\n".join(generated) + "\r\n").encode(encoding)
+            else:
+                raw = (target + suffix).encode(encoding)
+            path.write_bytes(raw)
+            digest = hashlib.sha256(raw).hexdigest()
+            call_id = f"large-read-{shape_index}"
+            arguments = {
+                "file_path": file_name,
+                "start_line": line_number,
+                "end_line": line_number,
+                "start_column": 1,
+                "max_chars": 20_000,
+                "expected_sha256": digest,
+            }
+            budget = make_budget(
+                call_id=call_id,
+                arguments=arguments,
+            )
+
+            low, high, largest_accepted = 1, 20_000, 0
+            while low <= high:
+                midpoint = (low + high) // 2
+                candidate = await reader.run(**{**arguments, "max_chars": midpoint})
+                if budget.accepts(candidate):
+                    largest_accepted = midpoint
+                    low = midpoint + 1
+                else:
+                    high = midpoint - 1
+            assert largest_accepted > 0
+
+            chunks: list[str] = []
+            start_column = 1
+            result: ToolResult
+            while True:
+                call_arguments = {**arguments, "start_column": start_column}
+                active_call_id = f"{call_id}-{len(chunks)}"
+                active_budget = make_budget(
+                    call_id=active_call_id,
+                    arguments=call_arguments,
+                )
+                payload = await _execute_tool_once(
+                    reader,
+                    call_arguments,
+                    output_budget=active_budget,
+                )
+                result = ToolResult.model_validate(payload)
+                assert result.success, result.error
+                assert active_budget.accepts(result)
+                row = re.search(
+                    rf"(?m)^{line_number}(?: \[column (\d+)\])?: (.*)$",
+                    result.output,
+                )
+                assert row is not None, result.output
+                displayed_column = int(row.group(1)) if row.group(1) else 1
+                assert displayed_column == start_column
+                chunks.append(row.group(2))
+                if not result.truncated:
+                    break
+                cursor = re.search(
+                    r"next_start_line=(\d+); next_start_column=(\d+)",
+                    result.output,
+                )
+                assert cursor is not None, result.output
+                assert int(cursor.group(1)) == line_number
+                next_column = int(cursor.group(2))
+                assert next_column > start_column
+                if len(chunks) == 1:
+                    assert len(row.group(2)) / largest_accepted >= 0.9
+                start_column = next_column
+
+            assert "".join(chunks) == target
+            assert hashlib.sha256("".join(chunks).encode("utf-8")).hexdigest() == hashlib.sha256(
+                target.encode("utf-8")
+            ).hexdigest()
+            assert path.read_bytes() == raw
+
+        small_raw = b"def ordinary():\r\n    return 42\r\n"
+        (tmp_path / "small.py").write_bytes(small_raw)
+        small_arguments = {"file_path": "small.py", "max_chars": 4_096}
+        small_budget = make_budget(
+            call_id="ordinary-small-read",
+            arguments=small_arguments,
+        )
+        small_payload = await _execute_tool_once(
+            reader,
+            small_arguments,
+            output_budget=small_budget,
+        )
+        small_result = ToolResult.model_validate(small_payload)
+        assert small_result.success
+        assert not small_result.truncated
+        assert "1: def ordinary():" in small_result.output
+        assert (tmp_path / "small.py").read_bytes() == small_raw
+
+        stale = await reader.run(
+            file_path="minified_crlf.py",
+            expected_sha256="0" * 64,
+        )
+        assert not stale.success
+        assert "changed since" in (stale.error or "")
+        outside = await reader.run(file_path=str(tmp_path.parent / "outside.py"))
+        assert not outside.success
+        assert "outside" in (outside.error or "").lower()
+    finally:
+        await loop.aclose()
+
+
+@pytest.mark.asyncio
 async def test_growing_opaque_state_leaves_room_for_patch_repair_and_test(
     tmp_path: Path,
 ) -> None:

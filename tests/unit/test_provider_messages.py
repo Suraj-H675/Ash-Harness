@@ -8,6 +8,8 @@ import pytest
 
 from ash.providers.anthropic import prepare_anthropic_messages
 from ash.providers.base import StreamChunk
+from ash.providers.ollama import prepare_ollama_messages
+from ash.providers.openai_responses import prepare_openai_responses_input
 from ash.providers.messages import (
     MAX_CANONICAL_CONTENT_BLOCKS,
     MAX_CANONICAL_CONTENT_BYTES,
@@ -20,6 +22,7 @@ from ash.providers.messages import (
     ImageContentBlock,
     TextContentBlock,
     normalize_messages,
+    normalize_provider_history,
 )
 from ash.providers.ollama import OllamaProvider
 from ash.providers.openai import prepare_openai_messages
@@ -504,6 +507,182 @@ def test_provider_translators_validate_before_encoding() -> None:
         prepare_openai_messages(invalid)
     with pytest.raises(ValueError, match="index 0"):
         prepare_anthropic_messages(invalid)
+
+
+@pytest.mark.parametrize(
+    "prepare",
+    [
+        prepare_openai_messages,
+        prepare_anthropic_messages,
+        prepare_openai_responses_input,
+        prepare_ollama_messages,
+    ],
+    ids=["openai-chat", "anthropic", "openai-responses", "ollama"],
+)
+def test_provider_adapters_reject_mismatched_tool_result_call_id(prepare) -> None:
+    history = [
+        {
+            "role": "assistant",
+            "tool_calls": [
+                {"call_id": "call-expected", "name": "read_file", "arguments": {}}
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call-other",
+            "content": "SYNTHETIC_SECRET_TASK13_CANARY",
+        },
+    ]
+
+    with pytest.raises(ValueError, match="tool result at index 1") as failure:
+        prepare(history)
+
+    assert "call-other" not in str(failure.value)
+    assert "SYNTHETIC_SECRET_TASK13_CANARY" not in str(failure.value)
+
+
+@pytest.mark.parametrize(
+    "prepare",
+    [
+        prepare_openai_messages,
+        prepare_anthropic_messages,
+        prepare_openai_responses_input,
+        prepare_ollama_messages,
+    ],
+    ids=["openai-chat", "anthropic", "openai-responses", "ollama"],
+)
+def test_provider_adapters_accept_parallel_results_in_reverse_order(prepare) -> None:
+    history = [
+        {
+            "role": "assistant",
+            "tool_calls": [
+                {"call_id": "call-read", "name": "read_file", "arguments": {}},
+                {"call_id": "call-search", "name": "search", "arguments": {}},
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call-search", "content": "matches"},
+        {"role": "tool", "tool_call_id": "call-read", "content": "source"},
+    ]
+
+    prepare(history)
+
+
+def test_provider_history_accepts_partial_final_batch_and_completed_id_reuse() -> None:
+    history = [
+        {
+            "role": "assistant",
+            "tool_calls": [
+                {"call_id": "reused-id", "name": "read_file", "arguments": {}},
+                {"call_id": "search-id", "name": "search", "arguments": {}},
+            ],
+        },
+        {"role": "tool", "tool_call_id": "search-id", "content": "matches"},
+        {"role": "tool", "tool_call_id": "reused-id", "content": "source"},
+        {
+            "role": "assistant",
+            "tool_calls": [
+                {"call_id": "reused-id", "name": "read_file", "arguments": {}}
+            ],
+        },
+        {"role": "tool", "tool_call_id": "reused-id", "content": "source again"},
+        {
+            "role": "assistant",
+            "tool_calls": [
+                {"call_id": "pending-final", "name": "search", "arguments": {}}
+            ],
+        },
+    ]
+
+    assert normalize_provider_history(history) == normalize_messages(history)
+
+
+@pytest.mark.parametrize(
+    ("history", "message_index", "reason"),
+    [
+        (
+            [{"role": "tool", "tool_call_id": "orphan", "content": "result"}],
+            0,
+            "tool result at index 0",
+        ),
+        (
+            [
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {"call_id": "expected", "name": "read_file", "arguments": {}}
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "unknown", "content": "result"},
+            ],
+            1,
+            "tool result at index 1",
+        ),
+        (
+            [
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {"call_id": "duplicate", "name": "read_file", "arguments": {}},
+                        {"call_id": "duplicate", "name": "search", "arguments": {}},
+                    ],
+                }
+            ],
+            0,
+            "duplicate IDs",
+        ),
+        (
+            [
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {"call_id": "one", "name": "read_file", "arguments": {}}
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "one", "content": "result"},
+                {"role": "tool", "tool_call_id": "one", "content": "duplicate"},
+            ],
+            2,
+            "tool result at index 2",
+        ),
+        (
+            [
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {"call_id": "unfinished", "name": "read_file", "arguments": {}}
+                    ],
+                },
+                {"role": "user", "content": "next turn"},
+            ],
+            1,
+            "unresolved results before message at index 1",
+        ),
+        (
+            [
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {"call_id": "one", "name": "read_file", "arguments": {}},
+                        {"call_id": "two", "name": "search", "arguments": {}},
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "one", "content": "result"},
+                {"role": "assistant", "content": "continue"},
+            ],
+            2,
+            "unresolved results before message at index 2",
+        ),
+    ],
+)
+def test_provider_history_rejects_invalid_tool_result_sequences(
+    history: list[dict[str, object]],
+    message_index: int,
+    reason: str,
+) -> None:
+    with pytest.raises(ValueError, match=reason) as failure:
+        normalize_provider_history(history)
+
+    assert f"index {message_index}" in str(failure.value)
 
 
 def test_message_count_is_bounded() -> None:

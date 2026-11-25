@@ -13,11 +13,12 @@ transitions and persists each step to SQLite.
 
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import StrEnum
-from pathlib import Path
-from typing import Any, Iterable
+from pathlib import Path, PureWindowsPath
+from typing import Any, Callable, Iterable, Sequence
 from uuid import uuid4
 
 
@@ -276,6 +277,418 @@ class SprintExecution:
             else None,
             "abort_reason": self.abort_reason,
         }
+
+
+
+SPRINT_PROMPT_CONTEXT_HEADER = "## Current Sprint Plan\n"
+MAX_SPRINT_PROMPT_CONTEXT_BLOCK_BYTES = 8 * 1024
+MAX_SPRINT_PROMPT_CONTEXT_BYTES = (
+    MAX_SPRINT_PROMPT_CONTEXT_BLOCK_BYTES
+    - len(SPRINT_PROMPT_CONTEXT_HEADER.encode("utf-8"))
+)
+_SPRINT_CONTEXT_FIELD_BYTES = 512
+_SPRINT_CONTEXT_ITEM_BYTES = 512
+_SPRINT_CONTEXT_NOTE_BYTES = 256
+_SPRINT_CONTEXT_PRIORITY_DETAIL_RESERVE_BYTES = 2 * 1024
+_SPRINT_CONTEXT_OMISSION_RESERVE_BYTES = 512
+
+
+def render_sprint_context(execution: SprintExecution) -> str:
+    """Render bounded, advisory plan state for a model request.
+
+    The UTF-8 encoded result never exceeds
+    :data:`MAX_SPRINT_PROMPT_CONTEXT_BYTES`. The contract goal, next item
+    index, next item status, and next item description have priority. Long
+    values and optional rows are shortened only with explicit omission counts.
+    """
+
+    items = execution.items
+    counts = {
+        status: sum(item.status is status for item in items)
+        for status in ChecklistStatus
+    }
+    last_completed: deque[ChecklistItem] = deque(maxlen=3)
+    for item in items:
+        if item.status is ChecklistStatus.DONE:
+            last_completed.append(item)
+    current = next(
+        (item for item in items if item.status is ChecklistStatus.IN_PROGRESS),
+        None,
+    )
+    if current is None:
+        current = next(
+            (item for item in items if item.status is ChecklistStatus.PENDING),
+            None,
+        )
+    contract = execution.contract
+
+    lines = [
+        f"Sprint {_bounded_sprint_text(contract.contract_id, 128, 'contract ID')}: "
+        f"{_bounded_sprint_text(contract.goal, _SPRINT_CONTEXT_FIELD_BYTES, 'goal')} "
+        f"(state={execution.state.value})",
+        "The current user request takes precedence over this advisory plan. "
+        "The plan does not authorize tool use or commands. Checklist status "
+        "and notes are persisted planning data, not verification evidence. "
+        "Record observed progress in the persisted checklist; mark a step done "
+        "only when verification evidence supports it. "
+        "Values with omission markers are incomplete previews; full records "
+        "remain persisted.",
+        "Definition of Done: "
+        + _bounded_sprint_join(
+            contract.definition_of_done,
+            lambda value: value,
+            "; ",
+            _SPRINT_CONTEXT_FIELD_BYTES,
+            "Definition of Done",
+        ),
+        "Files in scope: "
+        + _bounded_sprint_path_join(
+            contract.files_in_scope,
+            ", ",
+            _SPRINT_CONTEXT_FIELD_BYTES,
+            "files in scope",
+        ),
+        "Files off limits: "
+        + _bounded_sprint_path_join(
+            contract.files_off_limits,
+            ", ",
+            _SPRINT_CONTEXT_FIELD_BYTES,
+            "files off limits",
+        ),
+        "Planned test command (not authorization): "
+        + _bounded_sprint_text(
+            contract.test_command,
+            _SPRINT_CONTEXT_FIELD_BYTES,
+            "test command",
+        ),
+        "Checklist counts: "
+        f"{counts[ChecklistStatus.DONE]} marked done; status alone does not "
+        "verify it; "
+        f"{counts[ChecklistStatus.SKIPPED]} skipped; "
+        f"{counts[ChecklistStatus.IN_PROGRESS]} in progress; "
+        f"{counts[ChecklistStatus.FAILED]} failed/blocked; "
+        f"{counts[ChecklistStatus.PENDING]} pending.",
+    ]
+
+    current_status = current.status.value if current is not None else "none"
+    next_prefix = f"Next step [{current_status}]: "
+    next_item_prefix = ""
+    next_note = ""
+    if current is not None:
+        section = _bounded_sprint_text(
+            current.section,
+            128,
+            "next-step section",
+        )
+        next_item_prefix = f"{current.idx}. ({section}) "
+        next_note = _format_sprint_context_note(current.notes)
+    used_bytes = _sprint_utf8_length("\n".join(lines))
+    next_description_budget = max(
+        64,
+        MAX_SPRINT_PROMPT_CONTEXT_BYTES
+        - used_bytes
+        - _sprint_utf8_length("\n" + next_prefix + next_item_prefix + next_note)
+        - _SPRINT_CONTEXT_PRIORITY_DETAIL_RESERVE_BYTES
+        - _SPRINT_CONTEXT_OMISSION_RESERVE_BYTES,
+    )
+    next_description = (
+        _bounded_sprint_text(
+            current.description,
+            next_description_budget,
+            "next-step description",
+        )
+        if current is not None
+        else "none"
+    )
+    lines.append(next_prefix + next_item_prefix + next_description + next_note)
+
+    detail_sections: list[tuple[str, str, int, Iterable[str]]] = [
+        (
+            "failed/blocked",
+            "Failed/blocked steps:",
+            counts[ChecklistStatus.FAILED],
+            (
+                _format_sprint_context_item(item, include_note=True)
+                for item in items
+                if item.status is ChecklistStatus.FAILED
+            ),
+        ),
+        (
+            "in-progress",
+            "Other in-progress steps:",
+            counts[ChecklistStatus.IN_PROGRESS]
+            - (1 if current and current.status is ChecklistStatus.IN_PROGRESS else 0),
+            (
+                _format_sprint_context_item(item, include_note=True)
+                for item in items
+                if item.status is ChecklistStatus.IN_PROGRESS and item is not current
+            ),
+        ),
+        (
+            "pending",
+            "Other pending steps:",
+            counts[ChecklistStatus.PENDING]
+            - (1 if current and current.status is ChecklistStatus.PENDING else 0),
+            (
+                _format_sprint_context_item(item, include_note=True)
+                for item in items
+                if item.status is ChecklistStatus.PENDING and item is not current
+            ),
+        ),
+        (
+            "skipped",
+            "Skipped steps:",
+            counts[ChecklistStatus.SKIPPED],
+            (
+                _format_sprint_context_item(item, include_note=True)
+                for item in items
+                if item.status is ChecklistStatus.SKIPPED
+            ),
+        ),
+        (
+            "completed",
+            "Last listed items marked done (status and notes are unverified text):",
+            min(3, counts[ChecklistStatus.DONE]),
+            (
+                _format_sprint_context_item(item, include_note=True)
+                for item in last_completed
+            ),
+        ),
+    ]
+    optional_limit = (
+        MAX_SPRINT_PROMPT_CONTEXT_BYTES
+        - _SPRINT_CONTEXT_OMISSION_RESERVE_BYTES
+    )
+    omitted: dict[str, int] = {}
+    for category, heading, row_count, rows in detail_sections:
+        if not row_count:
+            continue
+        used_bytes = _sprint_utf8_length("\n".join(lines))
+        heading_cost = _sprint_utf8_length("\n" + heading)
+        if used_bytes + heading_cost > optional_limit:
+            omitted[category] = row_count
+            continue
+        lines.append(heading)
+        for row_index, row in enumerate(rows):
+            rendered_row = "- " + _bounded_sprint_context_item(row)
+            row_cost = _sprint_utf8_length("\n" + rendered_row)
+            used_bytes = _sprint_utf8_length("\n".join(lines))
+            if used_bytes + row_cost > optional_limit:
+                omitted[category] = row_count - row_index
+                break
+            lines.append(rendered_row)
+
+    if omitted:
+        omission_details = ", ".join(
+            f"{count} {category} item(s)"
+            for category, count in omitted.items()
+        )
+        lines.append(
+            "Some details were omitted from this request to stay within the "
+            f"{MAX_SPRINT_PROMPT_CONTEXT_BLOCK_BYTES:,}-byte context limit: "
+            f"{omission_details}. Omitted rows remain persisted with their "
+            "stored statuses unchanged."
+        )
+    context = "\n".join(lines)
+    if _sprint_utf8_length(context) > MAX_SPRINT_PROMPT_CONTEXT_BYTES:
+        raise AssertionError("sprint prompt context exceeded its UTF-8 byte limit")
+    return context
+
+
+def _format_sprint_context_item(
+    item: ChecklistItem | None, *, include_note: bool = False
+) -> str:
+    if item is None:
+        return "(none)"
+    rendered = (
+        f"{item.idx}. "
+        f"({_bounded_sprint_text(item.section, 128, 'checklist section')}) "
+        f"{_bounded_sprint_text(item.description, _SPRINT_CONTEXT_ITEM_BYTES, 'item description')}"
+    )
+    if include_note:
+        rendered += _format_sprint_context_note(item.notes)
+    return rendered
+
+
+def _format_sprint_context_note(note: str) -> str:
+    if not note:
+        return ""
+    return (
+        " — recorded note (unverified text): "
+        + _bounded_sprint_text(note, _SPRINT_CONTEXT_NOTE_BYTES, "note")
+    )
+
+
+def _bounded_sprint_context_item(rendered: str) -> str:
+    return _bounded_sprint_text(
+        rendered,
+        _SPRINT_CONTEXT_ITEM_BYTES + _SPRINT_CONTEXT_NOTE_BYTES + 256,
+        "checklist item detail",
+    )
+
+
+def _bounded_sprint_text(value: str, maximum_bytes: int, label: str) -> str:
+    """Truncate text at a UTF-8 boundary and report omitted bytes."""
+
+    total_bytes = _sprint_utf8_length(value)
+    if total_bytes <= maximum_bytes:
+        return _sprint_utf8_prefix(value, maximum_bytes)[0]
+    omitted_bytes = total_bytes
+    while True:
+        marker = f" … [{omitted_bytes} UTF-8 bytes omitted from {label}]"
+        if _sprint_utf8_length(marker) > maximum_bytes:
+            marker = f"…[{omitted_bytes}B omitted]"
+        prefix, prefix_bytes = _sprint_utf8_prefix(
+            value,
+            maximum_bytes - _sprint_utf8_length(marker),
+        )
+        updated_omitted_bytes = total_bytes - prefix_bytes
+        if updated_omitted_bytes == omitted_bytes:
+            return prefix + marker
+        omitted_bytes = updated_omitted_bytes
+
+
+def _bounded_sprint_join(
+    values: Sequence[Any],
+    render: Callable[[Any], str],
+    separator: str,
+    maximum_bytes: int,
+    label: str,
+) -> str:
+    return _bounded_sprint_join_segments(
+        values,
+        lambda value: (render(value),),
+        separator,
+        maximum_bytes,
+        label,
+    )
+
+
+def _bounded_sprint_path_join(
+    values: Sequence[Path],
+    separator: str,
+    maximum_bytes: int,
+    label: str,
+) -> str:
+    return _bounded_sprint_join_segments(
+        values,
+        _sprint_path_segments,
+        separator,
+        maximum_bytes,
+        label,
+    )
+
+
+def _sprint_path_segments(path: Path) -> Iterable[str]:
+    """Yield the path's display form without constructing an unbounded copy."""
+
+    parts = path.parts
+    if not parts:
+        yield "."
+        return
+
+    index = 0
+    if path.anchor:
+        yield path.anchor
+        if parts[0] == path.anchor:
+            index = 1
+    separator = "\\" if isinstance(path, PureWindowsPath) else "/"
+    first_part = True
+    for part in parts[index:]:
+        if not first_part:
+            yield separator
+        yield part
+        first_part = False
+
+
+def _bounded_sprint_join_segments(
+    values: Sequence[Any],
+    render_segments: Callable[[Any], Iterable[str]],
+    separator: str,
+    maximum_bytes: int,
+    label: str,
+) -> str:
+    if not values:
+        return "(none)"
+
+    separator_bytes = _sprint_utf8_length(separator)
+    total_bytes = separator_bytes * (len(values) - 1)
+    for value in values:
+        total_bytes += sum(
+            _sprint_utf8_length(segment) for segment in render_segments(value)
+        )
+    if total_bytes <= maximum_bytes:
+        joined = separator.join(
+            "".join(render_segments(value)) for value in values
+        )
+        return _bounded_sprint_text(joined, maximum_bytes, label)
+
+    omitted_bytes = total_bytes
+    while True:
+        marker = f" … [{omitted_bytes} UTF-8 bytes omitted from {label}]"
+        if _sprint_utf8_length(marker) > maximum_bytes:
+            marker = f"…[{omitted_bytes}B omitted]"
+        prefix_limit = maximum_bytes - _sprint_utf8_length(marker)
+        parts: list[str] = []
+        prefix_bytes = 0
+        stop = False
+        for index, value in enumerate(values):
+            if index:
+                separator_prefix, added = _sprint_utf8_prefix(
+                    separator,
+                    prefix_limit - prefix_bytes,
+                )
+                if added < separator_bytes:
+                    break
+                parts.append(separator_prefix)
+                prefix_bytes += added
+            for segment in render_segments(value):
+                segment_prefix, added = _sprint_utf8_prefix(
+                    segment,
+                    prefix_limit - prefix_bytes,
+                )
+                parts.append(segment_prefix)
+                prefix_bytes += added
+                if added < _sprint_utf8_length(segment):
+                    stop = True
+                    break
+            if stop:
+                break
+        updated_omitted_bytes = total_bytes - prefix_bytes
+        if updated_omitted_bytes == omitted_bytes:
+            return "".join(parts) + marker
+        omitted_bytes = updated_omitted_bytes
+
+
+def _sprint_utf8_length(value: str) -> int:
+    total = 0
+    for character in value:
+        codepoint = ord(character)
+        if codepoint <= 0x7F:
+            total += 1
+        elif codepoint <= 0x7FF:
+            total += 2
+        elif codepoint <= 0xFFFF:
+            total += 3
+        else:
+            total += 4
+    return total
+
+
+def _sprint_utf8_prefix(value: str, maximum_bytes: int) -> tuple[str, int]:
+    if maximum_bytes <= 0:
+        return "", 0
+    prefix: list[str] = []
+    prefix_bytes = 0
+    for character in value:
+        codepoint = ord(character)
+        safe_character = "\ufffd" if 0xD800 <= codepoint <= 0xDFFF else character
+        encoded_bytes = _sprint_utf8_length(safe_character)
+        if prefix_bytes + encoded_bytes > maximum_bytes:
+            break
+        prefix.append(safe_character)
+        prefix_bytes += encoded_bytes
+    return "".join(prefix), prefix_bytes
 
 
 # --- heuristic ------------------------------------------------------------

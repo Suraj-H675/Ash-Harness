@@ -8070,6 +8070,285 @@ def test_provider_history_replays_images_only_after_active_turn_start(
     assert recent["tool_result_images"] == [image]
 
 
+@pytest.mark.asyncio
+async def test_repeated_read_reference_requires_exact_visible_current_turn_result(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from ash.core.checkpoints import FileCheckpointMiddleware
+    from ash.tools import filesystem as filesystem_module
+    from ash.tools.filesystem import ReplaceFileEditsTool
+
+    initial = (
+        "def combine(a, b):\n"
+        "    total = a + b\n"
+        "    return total\n"
+        "\n"
+        "# source marker: base\n"
+    )
+    source = tmp_path / "src" / "sample.py"
+    source.parent.mkdir(parents=True)
+    source.write_text(initial, encoding="utf-8")
+    guard = SafetyGuard(tmp_path)
+    reader = ReadFileTool(guard)
+    editor = ReplaceFileEditsTool(guard)
+    store = SessionStore(tmp_path / "repeated-read-reference.db")
+    loop = AshLoop(
+        store,
+        MockProvider(),
+        guard,
+        EventUI(),
+        tmp_path,
+        tools={"read_file": reader, "replace_file_edits": editor},
+        safety_tier="auto_approve",
+    )
+    session = store.create_session(str(tmp_path), model="read-reference-test")
+    turn_id = "read-reference-turn"
+    active_user = Message(
+        role="user", content="inspect and edit the source", timestamp=datetime.now(timezone.utc)
+    )
+    session.messages.append(active_user)
+    loop.current_session = session
+    loop._turn_running = True
+    loop._active_turn_user_message = active_user
+    loop.turn_context = TurnContext(session_id=session.session_id, turn_id=turn_id)
+
+    scoped_reads: list[int] = []
+    original_read = filesystem_module.read_scoped_bytes
+
+    def counted_read(path, safety_guard, **kwargs):
+        scoped = original_read(path, safety_guard, **kwargs)
+        scoped_reads.append(len(scoped[1]))
+        return scoped
+
+    monkeypatch.setattr(filesystem_module, "read_scoped_bytes", counted_read)
+
+    async def invoke_read(call_id: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        call = {"call_id": call_id, "name": "read_file", "arguments": arguments}
+        session.messages.append(
+            Message(
+                role="assistant",
+                content="",
+                timestamp=datetime.now(timezone.utc),
+                metadata={
+                    "tool_calls": [call],
+                    **(
+                        {"provider_state": [{"type": "reasoning", "opaque": "state"}]}
+                        if call_id == "read-first"
+                        else {}
+                    ),
+                },
+            )
+        )
+        results = await loop._execute_tool_calls(
+            [call], session, persist_tool_messages=True
+        )
+        assert len(results) == 1
+        return results[0]
+
+    try:
+        common = {"file_path": "src/sample.py", "max_chars": 4096}
+        first = await invoke_read("read-first", common)
+        second = await invoke_read("read-repeat", common)
+        assert first["success"] is True
+        assert second["success"] is True
+        assert "def combine(a, b):" in first["output"]
+        assert "At the time of this fresh scoped read" in second["output"]
+        assert "re-read before acting if the file may have changed" in second[
+            "output"
+        ]
+        assert "before use in a later turn" in second["output"]
+        assert "read-first" in second["output"]
+        assert len(second["output"].encode("utf-8")) < len(
+            first["output"].encode("utf-8")
+        )
+        assert scoped_reads == [len(initial.encode("utf-8"))] * 2
+
+        first_tool_message = next(
+            message
+            for message in session.messages
+            if message.role == "tool" and message.metadata.get("call_id") == "read-first"
+        )
+        first_tool_content = first_tool_message.content
+        provider_messages = loop._build_messages(session)
+        first_provider_result = next(
+            message
+            for message in provider_messages
+            if message.get("tool_call_id") == "read-first"
+        )
+        repeated_provider_result = next(
+            message
+            for message in provider_messages
+            if message.get("tool_call_id") == "read-repeat"
+        )
+        assert "def combine(a, b):" in first_provider_result["content"]
+        assert "At the time of this fresh scoped read" in repeated_provider_result[
+            "content"
+        ]
+        assert "before use in a later turn" in repeated_provider_result["content"]
+        assert first_tool_message.content == first_tool_content
+        first_assistant = next(
+            message
+            for message in provider_messages
+            if message.get("tool_calls", [{}])[0].get("call_id") == "read-first"
+        )
+        assert first_assistant["provider_state"] == [
+            {"type": "reasoning", "opaque": "state"}
+        ]
+
+        overlap = await invoke_read(
+            "read-overlap",
+            {
+                "file_path": "src/sample.py",
+                "start_line": 2,
+                "end_line": 4,
+                "max_chars": 4096,
+            },
+        )
+        assert overlap["success"] is True
+        assert "At the time of this fresh scoped read" not in overlap["output"]
+        assert "2:     total = a + b" in overlap["output"]
+
+        initial_digest = hashlib.sha256(initial.encode("utf-8")).hexdigest()
+        edit_arguments = {
+            "file_path": "src/sample.py",
+            "edits": [
+                {
+                    "start_line": 2,
+                    "end_line": 2,
+                    "target_content": "    total = a + b",
+                    "replacement_content": "    total = a + b + 1",
+                }
+            ],
+            "expected_sha256": initial_digest,
+        }
+        edit_call_id = "edit-source"
+        checkpoint_context = (session.session_id, turn_id, edit_call_id)
+        middleware = FileCheckpointMiddleware(
+            store, guard, lambda: checkpoint_context
+        )
+        await middleware.before_tool("replace_file_edits", edit_arguments, editor)
+        edit_result = await editor.run(**edit_arguments)
+        await middleware.after_tool("replace_file_edits", edit_arguments, edit_result)
+        assert edit_result.success is True, edit_result.error
+
+        edited_content = initial.replace(
+            "total = a + b", "total = a + b + 1"
+        )
+        edited_digest = hashlib.sha256(edited_content.encode("utf-8")).hexdigest()
+        edited_read = await invoke_read("read-after-ash-edit", common)
+        assert edited_read["success"] is True
+        assert "At the time of this fresh scoped read" not in edited_read["output"]
+        assert "total = a + b + 1" in edited_read["output"]
+
+        external_content = edited_content.replace(
+            "# source marker: base", "# source marker: external"
+        )
+        source.write_text(external_content, encoding="utf-8")
+        stale = await invoke_read(
+            "read-stale", {**common, "expected_sha256": edited_digest}
+        )
+        assert stale["success"] is False
+        assert stale["output"] == ""
+        assert edited_digest in stale["error"]
+        assert hashlib.sha256(external_content.encode("utf-8")).hexdigest() in stale[
+            "error"
+        ]
+
+        fresh = await invoke_read("read-after-external-edit", common)
+        assert fresh["success"] is True
+        assert "At the time of this fresh scoped read" not in fresh["output"]
+        assert "# source marker: external" in fresh["output"]
+        assert len(scoped_reads) == 7
+
+        truncated_arguments = {"file_path": "src/sample.py", "max_chars": 20}
+        truncated_first = await invoke_read("read-truncated-first", truncated_arguments)
+        truncated_repeat = await invoke_read("read-truncated-repeat", truncated_arguments)
+        assert truncated_first["truncated"] is True
+        assert truncated_repeat["truncated"] is True
+        assert "At the time of this fresh scoped read" not in truncated_repeat[
+            "output"
+        ]
+
+        redaction_source = tmp_path / "src" / "redaction-example.txt"
+        redaction_source.write_text("api_key=EXAMPLE_PLACEHOLDER\n", encoding="utf-8")
+        redaction_arguments = {"file_path": "src/redaction-example.txt"}
+        await invoke_read("read-redaction-before", redaction_arguments)
+        loop.tool_middlewares.append(SecretRedactionMiddleware())
+        redacted = await invoke_read("read-redaction-after", redaction_arguments)
+        loop.tool_middlewares.clear()
+        assert "[REDACTED]" in redacted["output"]
+        assert "At the time of this fresh scoped read" not in redacted["output"]
+
+        loop.provider.server_side_compaction_enabled = True
+        server_compacted = await invoke_read("read-server-compaction", common)
+        del loop.provider.server_side_compaction_enabled
+        assert "At the time of this fresh scoped read" not in server_compacted[
+            "output"
+        ]
+        session.messages.append(
+            Message(
+                role="assistant",
+                content="",
+                timestamp=datetime.now(timezone.utc),
+                metadata={
+                    "provider_state": [
+                        {"type": "responses_server_compaction_output"}
+                    ]
+                },
+            )
+        )
+        anchor_compacted = await invoke_read("read-server-compaction-anchor", common)
+        assert "At the time of this fresh scoped read" not in anchor_compacted[
+            "output"
+        ]
+
+        next_turn_user = Message(
+            role="user", content="continue in a new turn", timestamp=datetime.now(timezone.utc)
+        )
+        session.messages.append(next_turn_user)
+        loop._active_turn_user_message = next_turn_user
+        loop.turn_context = TurnContext(
+            session_id=session.session_id, turn_id="read-reference-next-turn"
+        )
+        next_turn_read = await invoke_read("read-next-turn", common)
+        assert "At the time of this fresh scoped read" not in next_turn_read[
+            "output"
+        ]
+        history_in_next_turn = loop._build_messages(session)
+        prior_reference = next(
+            message
+            for message in history_in_next_turn
+            if message.get("tool_call_id") == "read-repeat"
+        )
+        assert "before use in a later turn" in prior_reference["content"]
+
+        other_root = tmp_path / "other-workspace"
+        other_source = other_root / "src" / "sample.py"
+        other_source.parent.mkdir(parents=True)
+        other_source.write_text(external_content, encoding="utf-8")
+        other_reader = ReadFileTool(SafetyGuard(other_root))
+        other_result = await other_reader.run(**common)
+        assert loop._verified_prior_read_reference(
+            session=session,
+            tool=other_reader,
+            call_arguments=common,
+            result=other_result,
+            original_result=other_result,
+        ) is None
+
+        other_session = store.create_session(str(tmp_path), model="other-session")
+        assert loop._verified_prior_read_reference(
+            session=other_session,
+            tool=reader,
+            call_arguments=common,
+            result=other_result,
+            original_result=other_result,
+        ) is None
+    finally:
+        loop._turn_running = False
+        await loop.aclose()
+
+
 def test_failed_nested_instruction_refresh_falls_back_to_baseline(tmp_path: Path) -> None:
     baseline = tmp_path
     nested_a = tmp_path / "a"
@@ -11209,6 +11488,27 @@ async def test_parallel_read_batch_with_success_resets_failure_streak(tmp_path) 
         )
         assert [result["success"] for result in results] == [False, True]
         assert breaker.failure_counter == 0
+        persisted = store.load_session(session.session_id)
+        assert [record.call_id for record in persisted.tool_calls] == [
+            "a",
+            "b",
+            "c",
+            "d",
+        ]
+        assert [record.success for record in persisted.tool_calls] == [
+            False,
+            False,
+            False,
+            True,
+        ]
+        assert "outside project scope" in (persisted.tool_calls[2].error or "")
+        assert "1: present" in persisted.tool_calls[3].result
+        assert [message.metadata["call_id"] for message in persisted.messages if message.role == "tool"] == [
+            "a",
+            "b",
+            "c",
+            "d",
+        ]
         assert store.verify_audit_log(session.session_id) == []
     finally:
         await loop.aclose()
@@ -11922,6 +12222,490 @@ async def test_read_only_tool_calls_run_concurrently_with_stable_order(tmp_path)
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("permission_decision", ["allow", "ask"])
+async def test_parallel_read_approvals_are_ordered_before_dispatch(
+    tmp_path, permission_decision: str
+):
+    first_approval_started = asyncio.Event()
+    release_first_approval = asyncio.Event()
+    second_approval_started = asyncio.Event()
+    release_second_approval = asyncio.Event()
+    approval_starts: list[str] = []
+    approval_ends: list[str] = []
+    dispatch_order: list[str] = []
+    approved_intent_snapshots: list[dict[str, bool]] = []
+    active = 0
+    max_active = 0
+
+    class GatedReadTool(ReadFileTool):
+        async def run(self, **kwargs):
+            nonlocal active, max_active
+            path = kwargs["file_path"]
+            dispatch_order.append(path)
+            persisted = store.load_session(session.session_id).tool_calls
+            approved_intent_snapshots.append(
+                {record.call_id: record.approved for record in persisted}
+            )
+            active += 1
+            max_active = max(max_active, active)
+            try:
+                await asyncio.sleep(0.01)
+                return await super().run(**kwargs)
+            finally:
+                active -= 1
+
+    async def approve(_tool_name: str, arguments: dict[str, Any]) -> bool:
+        path = arguments["file_path"]
+        approval_starts.append(path)
+        if path == "first.txt":
+            first_approval_started.set()
+            await release_first_approval.wait()
+        else:
+            second_approval_started.set()
+            await release_second_approval.wait()
+        approval_ends.append(path)
+        return True
+
+    root = tmp_path / "workspace"
+    root.mkdir()
+    (root / "first.txt").write_text("first result\n", encoding="utf-8")
+    (root / "second.txt").write_text("second result\n", encoding="utf-8")
+    guard = SafetyGuard(root)
+    store = SessionStore(tmp_path / "ordered-read-approval.db")
+    safety_tier = "auto_approve" if permission_decision == "allow" else "interactive"
+    loop = AshLoop(
+        store,
+        MockProvider(),
+        guard,
+        EventUI(safety_tier=safety_tier),
+        root,
+        tools={"read_file": GatedReadTool(guard)},
+        on_tool_approval=approve,
+        safety_tier=safety_tier,
+    )
+    try:
+        session = await loop.start_session()
+        if permission_decision == "ask":
+            loop.permission_policy.set_persistent_rules(
+                [PermissionRule.create(RuleEffect.ASK, "read_file")]
+            )
+        calls = [
+            {
+                "call_id": "approval-first",
+                "name": "read_file",
+                "arguments": {"file_path": "first.txt"},
+            },
+            {
+                "call_id": "approval-second",
+                "name": "read_file",
+                "arguments": {"file_path": "second.txt"},
+            },
+        ]
+        batch = asyncio.create_task(
+            loop._execute_tool_calls(calls, session, persist_tool_messages=True)
+        )
+        try:
+            await asyncio.wait_for(first_approval_started.wait(), timeout=1)
+            await asyncio.sleep(0.02)
+            assert approval_starts == ["first.txt"]
+            assert dispatch_order == []
+
+            release_first_approval.set()
+            await asyncio.wait_for(second_approval_started.wait(), timeout=1)
+            saved_during_second_approval = store.load_session(
+                session.session_id
+            ).tool_calls
+            assert [record.call_id for record in saved_during_second_approval] == [
+                "approval-first"
+            ]
+            assert saved_during_second_approval[0].approved is True
+            assert saved_during_second_approval[0].dispatched is False
+            assert dispatch_order == []
+
+            release_second_approval.set()
+            results = await batch
+        finally:
+            release_first_approval.set()
+            release_second_approval.set()
+            if not batch.done():
+                await asyncio.gather(batch, return_exceptions=True)
+
+        assert approval_starts == ["first.txt", "second.txt"]
+        assert approval_ends == ["first.txt", "second.txt"]
+        assert dispatch_order == ["first.txt", "second.txt"]
+        assert approved_intent_snapshots == [
+            {
+                "approval-first": True,
+                "approval-second": True,
+            },
+            {
+                "approval-first": True,
+                "approval-second": True,
+            },
+        ]
+        assert max_active == 2
+        assert [item["success"] for item in results] == [True, True]
+        saved = store.load_session(session.session_id)
+        assert [message.metadata["call_id"] for message in saved.messages if message.role == "tool"] == [
+            "approval-first", "approval-second"
+        ]
+        assert [record.call_id for record in saved.tool_calls] == [
+            "approval-first", "approval-second"
+        ]
+        assert all(record.approved and record.dispatched and record.executed for record in saved.tool_calls)
+        requested_ids = [
+            event["call_id"]
+            for event in loop.ui.events
+            if event["type"] == "tool.requested"
+        ]
+        assert requested_ids == ["approval-first", "approval-second"]
+        assert [
+            event["call_id"]
+            for event in loop.ui.events
+            if event["type"] == "tool.started"
+        ] == ["approval-first", "approval-second"]
+        assert [
+            event["call_id"]
+            for event in loop.ui.events
+            if event["type"] == "tool.completed"
+        ] == ["approval-first", "approval-second"]
+        assert len(approval_starts) == len(approval_ends) == 2
+        approval_audit = [
+            record
+            for record in store.list_audit_logs(session.session_id)
+            if record.action_type == "user_approval"
+        ]
+        assert [record.details["call_id"] for record in approval_audit] == [
+            "approval-first", "approval-second"
+        ]
+        assert [record.result for record in approval_audit] == [
+            "APPROVED", "APPROVED"
+        ]
+        assert store.verify_audit_log(session.session_id) == []
+    finally:
+        await loop.aclose()
+
+
+@pytest.mark.asyncio
+async def test_parallel_read_approval_denial_does_not_dispatch_denied_call(tmp_path):
+    approval_order: list[str] = []
+    dispatch_order: list[str] = []
+
+    class TracedReadTool(ReadFileTool):
+        async def run(self, **kwargs):
+            dispatch_order.append(kwargs["file_path"])
+            return await super().run(**kwargs)
+
+    async def approve(_tool_name: str, arguments: dict[str, Any]) -> bool:
+        path = arguments["file_path"]
+        approval_order.append(path)
+        return path != "denied.txt"
+
+    root = tmp_path / "workspace"
+    root.mkdir()
+    (root / "denied.txt").write_text("denied source\n", encoding="utf-8")
+    (root / "approved.txt").write_text("approved source\n", encoding="utf-8")
+    guard = SafetyGuard(root)
+    store = SessionStore(tmp_path / "denied-read-approval.db")
+    loop = AshLoop(
+        store,
+        MockProvider(),
+        guard,
+        EventUI(safety_tier="interactive"),
+        root,
+        tools={"read_file": TracedReadTool(guard)},
+        on_tool_approval=approve,
+        safety_tier="interactive",
+    )
+    try:
+        session = await loop.start_session()
+        loop.permission_policy.set_persistent_rules(
+            [PermissionRule.create(RuleEffect.ASK, "read_file")]
+        )
+        calls = [
+            {
+                "call_id": "approval-denied",
+                "name": "read_file",
+                "arguments": {"file_path": "denied.txt"},
+            },
+            {
+                "call_id": "approval-allowed",
+                "name": "read_file",
+                "arguments": {"file_path": "approved.txt"},
+            },
+        ]
+        results = await loop._execute_tool_calls(
+            calls, session, persist_tool_messages=True
+        )
+
+        assert approval_order == ["denied.txt", "approved.txt"]
+        assert dispatch_order == ["approved.txt"]
+        assert [item["success"] for item in results] == [False, True]
+        saved = store.load_session(session.session_id)
+        assert [record.call_id for record in saved.tool_calls] == [
+            "approval-denied", "approval-allowed"
+        ]
+        denied, approved = saved.tool_calls
+        assert not denied.approved and not denied.dispatched and not denied.executed
+        assert approved.approved and approved.dispatched and approved.executed
+        assert [message.metadata["call_id"] for message in saved.messages if message.role == "tool"] == [
+            "approval-denied", "approval-allowed"
+        ]
+        assert [
+            event["call_id"]
+            for event in loop.ui.events
+            if event["type"] == "tool.requested"
+        ] == ["approval-denied", "approval-allowed"]
+        assert [
+            event["call_id"]
+            for event in loop.ui.events
+            if event["type"] == "tool.started"
+        ] == ["approval-allowed"]
+        assert [
+            event["call_id"]
+            for event in loop.ui.events
+            if event["type"] == "tool.completed"
+        ] == ["approval-allowed"]
+        approval_audit = [
+            record
+            for record in store.list_audit_logs(session.session_id)
+            if record.action_type == "user_approval"
+        ]
+        assert [record.details["call_id"] for record in approval_audit] == [
+            "approval-denied", "approval-allowed"
+        ]
+        assert [record.result for record in approval_audit] == [
+            "DENIED", "APPROVED"
+        ]
+        assert store.verify_audit_log(session.session_id) == []
+    finally:
+        await loop.aclose()
+
+
+@pytest.mark.asyncio
+async def test_parallel_read_policy_tightening_after_approval_audits_safety_block(
+    tmp_path,
+):
+    approval_order: list[str] = []
+    dispatch_order: list[str] = []
+
+    class TracedReadTool(ReadFileTool):
+        async def run(self, **kwargs):
+            dispatch_order.append(kwargs["file_path"])
+            return await super().run(**kwargs)
+
+    root = tmp_path / "workspace"
+    root.mkdir()
+    (root / "first.txt").write_text("first source\n", encoding="utf-8")
+    (root / "second.txt").write_text("second source\n", encoding="utf-8")
+    guard = SafetyGuard(root)
+    store = SessionStore(tmp_path / "policy-tightening-read-approval.db")
+    loop: AshLoop
+
+    async def approve(_tool_name: str, arguments: dict[str, Any]) -> bool:
+        path = arguments["file_path"]
+        approval_order.append(path)
+        if path == "first.txt":
+            loop.permission_policy.set_persistent_rules(
+                [
+                    PermissionRule.create(
+                        RuleEffect.DENY,
+                        "read_file",
+                        (
+                            ArgumentMatcher(
+                                "file_path", MatchOperator.EXACT, "second.txt"
+                            ),
+                        ),
+                    )
+                ]
+            )
+        return True
+
+    loop = AshLoop(
+        store,
+        MockProvider(),
+        guard,
+        EventUI(safety_tier="interactive"),
+        root,
+        tools={"read_file": TracedReadTool(guard)},
+        on_tool_approval=approve,
+        safety_tier="interactive",
+    )
+    try:
+        session = await loop.start_session()
+        results = await loop._execute_tool_calls(
+            [
+                {
+                    "call_id": "policy-tighten-first",
+                    "name": "read_file",
+                    "arguments": {"file_path": "first.txt"},
+                },
+                {
+                    "call_id": "policy-tighten-second",
+                    "name": "read_file",
+                    "arguments": {"file_path": "second.txt"},
+                },
+            ],
+            session,
+            persist_tool_messages=True,
+        )
+
+        assert approval_order == ["first.txt", "second.txt"]
+        assert dispatch_order == ["first.txt"]
+        assert [item["success"] for item in results] == [True, False]
+        saved = store.load_session(session.session_id)
+        assert [message.metadata["call_id"] for message in saved.messages if message.role == "tool"] == [
+            "policy-tighten-first",
+            "policy-tighten-second",
+        ]
+        assert [record.call_id for record in saved.tool_calls] == [
+            "policy-tighten-first",
+            "policy-tighten-second",
+        ]
+        first, second = saved.tool_calls
+        assert first.approved and first.dispatched and first.executed
+        assert second.approved and not second.dispatched and not second.executed
+        assert second.error == "matched deny rule"
+        assert [
+            event["call_id"]
+            for event in loop.ui.events
+            if event["type"] == "tool.started"
+        ] == ["policy-tighten-first"]
+        assert [
+            event["call_id"]
+            for event in loop.ui.events
+            if event["type"] == "tool.denied"
+        ] == ["policy-tighten-second"]
+        approval_and_block_audit = [
+            record
+            for record in store.list_audit_logs(session.session_id)
+            if record.action_type in {"user_approval", "safety_block"}
+        ]
+        assert [record.action_type for record in approval_and_block_audit] == [
+            "user_approval",
+            "user_approval",
+            "safety_block",
+        ]
+        assert [record.details["call_id"] for record in approval_and_block_audit] == [
+            "policy-tighten-first",
+            "policy-tighten-second",
+            "policy-tighten-second",
+        ]
+        assert [record.result for record in approval_and_block_audit] == [
+            "APPROVED",
+            "APPROVED",
+            "BLOCKED_BY_GUARD",
+        ]
+        assert store.verify_audit_log(session.session_id) == []
+    finally:
+        await loop.aclose()
+
+
+@pytest.mark.asyncio
+async def test_parallel_read_cancellation_after_approval_does_not_dispatch(tmp_path):
+    second_approval_started = asyncio.Event()
+    hold_second_approval = asyncio.Event()
+    dispatch_order: list[str] = []
+    approval_order: list[str] = []
+
+    class TracedReadTool(ReadFileTool):
+        async def run(self, **kwargs):
+            dispatch_order.append(kwargs["file_path"])
+            return await super().run(**kwargs)
+
+    async def approve(_tool_name: str, arguments: dict[str, Any]) -> bool:
+        approval_order.append(arguments["file_path"])
+        if arguments["file_path"] == "second.txt":
+            second_approval_started.set()
+            await hold_second_approval.wait()
+        return True
+
+    root = tmp_path / "workspace"
+    root.mkdir()
+    (root / "first.txt").write_text("first result\n", encoding="utf-8")
+    (root / "second.txt").write_text("second result\n", encoding="utf-8")
+    guard = SafetyGuard(root)
+    store = SessionStore(tmp_path / "cancel-read-approval.db")
+    loop = AshLoop(
+        store,
+        MockProvider(),
+        guard,
+        EventUI(safety_tier="interactive"),
+        root,
+        tools={"read_file": TracedReadTool(guard)},
+        on_tool_approval=approve,
+        safety_tier="interactive",
+    )
+    try:
+        session = await loop.start_session()
+        loop.permission_policy.set_persistent_rules(
+            [PermissionRule.create(RuleEffect.ASK, "read_file")]
+        )
+        batch = asyncio.create_task(
+            loop._execute_tool_calls(
+                [
+                    {
+                        "call_id": "cancel-approved-first",
+                        "name": "read_file",
+                        "arguments": {"file_path": "first.txt"},
+                    },
+                    {
+                        "call_id": "cancel-pending-second",
+                        "name": "read_file",
+                        "arguments": {"file_path": "second.txt"},
+                    },
+                ],
+                session,
+                persist_tool_messages=True,
+            )
+        )
+        await asyncio.wait_for(second_approval_started.wait(), timeout=1)
+        before_cancel = store.load_session(session.session_id).tool_calls
+        assert len(before_cancel) == 1
+        assert before_cancel[0].call_id == "cancel-approved-first"
+        assert before_cancel[0].approved is True
+        assert before_cancel[0].dispatched is False
+        assert before_cancel[0].executed is False
+        assert dispatch_order == []
+
+        batch.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await batch
+
+        after_cancel = store.load_session(session.session_id)
+        assert approval_order == ["first.txt", "second.txt"]
+        assert dispatch_order == []
+        assert [record.call_id for record in after_cancel.tool_calls] == [
+            "cancel-approved-first"
+        ]
+        assert after_cancel.tool_calls[0].approved is True
+        assert after_cancel.tool_calls[0].dispatched is False
+        assert after_cancel.tool_calls[0].executed is False
+        assert not any(message.role == "tool" for message in after_cancel.messages)
+        approval_audit = [
+            record
+            for record in store.list_audit_logs(session.session_id)
+            if record.action_type == "user_approval"
+        ]
+        assert [record.details["call_id"] for record in approval_audit] == [
+            "cancel-approved-first"
+        ]
+        assert [
+            event["call_id"]
+            for event in loop.ui.events
+            if event["type"] == "tool.requested"
+        ] == ["cancel-approved-first", "cancel-pending-second"]
+        assert not any(
+            event["type"] in {"tool.started", "tool.completed", "tool.error"}
+            for event in loop.ui.events
+        )
+        assert store.verify_audit_log(session.session_id) == []
+    finally:
+        hold_second_approval.set()
+        await loop.aclose()
+
+
+@pytest.mark.asyncio
 async def test_parallel_tool_runtime_events_have_task_local_call_identity(tmp_path):
     first_started = asyncio.Event()
     second_started = asyncio.Event()
@@ -12400,36 +13184,20 @@ async def test_parallel_read_only_calls_drain_siblings_after_repeated_cancellati
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("interrupt_cleanup", [False, True])
-async def test_parallel_read_only_calls_drain_siblings_after_intent_store_failure(
-    tmp_path, monkeypatch, interrupt_cleanup
+async def test_parallel_read_batch_fails_closed_before_dispatch_when_intent_cannot_persist(
+    tmp_path, monkeypatch
 ):
-    sibling_started = asyncio.Event()
-    sibling_release = asyncio.Event()
-    sibling_cleanup_started = asyncio.Event()
-    allow_sibling_cleanup = asyncio.Event()
-    sibling_finished = asyncio.Event()
     failure_raised = asyncio.Event()
-    failed_call_started = asyncio.Event()
+    dispatches: list[int] = []
+    approvals: list[int] = []
 
-    class SlowReadTool(BaseTool):
+    class NeverRunReadTool(BaseTool):
         name = "test_slow_read"
         args_schema = None
         execution_contract = ToolExecutionContract(parallel_safe=True)
 
         async def run(self, **kwargs):
-            if kwargs["index"] == 0:
-                failed_call_started.set()
-            else:
-                sibling_started.set()
-                try:
-                    await sibling_release.wait()
-                except asyncio.CancelledError:
-                    sibling_cleanup_started.set()
-                    await allow_sibling_cleanup.wait()
-                    sibling_finished.set()
-                    raise
-                sibling_finished.set()
+            dispatches.append(kwargs["index"])
             return ToolResult(success=True, output=f"result-{kwargs['index']}")
 
     guard = SafetyGuard(project_root=tmp_path)
@@ -12440,7 +13208,7 @@ async def test_parallel_read_only_calls_drain_siblings_after_intent_store_failur
         guard,
         EventUI(safety_tier="auto_approve"),
         tmp_path,
-        tools={"test_slow_read": SlowReadTool(guard)},
+        tools={"test_slow_read": NeverRunReadTool(guard)},
         safety_tier="auto_approve",
     )
     session = await loop.start_session()
@@ -12469,8 +13237,7 @@ async def test_parallel_read_only_calls_drain_siblings_after_intent_store_failur
     monkeypatch.setattr(store, "save_tool_call", observe_intent_save_failure)
 
     async def approve_tool(_tool_name, arguments):
-        if arguments["index"] == 0:
-            await asyncio.wait_for(sibling_started.wait(), timeout=1)
+        approvals.append(arguments["index"])
         return True
 
     loop.on_tool_approval = approve_tool
@@ -12493,33 +13260,138 @@ async def test_parallel_read_only_calls_drain_siblings_after_intent_store_failur
         )
     )
 
+    with pytest.raises(sqlite3.IntegrityError, match="injected tool intent store failure"):
+        await batch
+
+    assert failure_raised.is_set()
+    assert approvals == [0]
+    assert dispatches == []
+    saved = store.load_session(session.session_id)
+    assert saved.tool_calls == []
+    assert [
+        event["call_id"]
+        for event in loop.ui.events
+        if event["type"] == "tool.requested"
+    ] == ["db-failure"]
+
+
+@pytest.mark.asyncio
+async def test_parallel_read_dispatched_intent_store_failure_drains_started_sibling(
+    tmp_path, monkeypatch
+):
+    sibling_started = asyncio.Event()
+    sibling_cleanup_started = asyncio.Event()
+    allow_sibling_cleanup = asyncio.Event()
+    sibling_finished = asyncio.Event()
+    failed_child_started = asyncio.Event()
+    failure_raised = asyncio.Event()
+
+    class SlowReadTool(BaseTool):
+        name = "test_slow_read"
+        args_schema = None
+        execution_contract = ToolExecutionContract(parallel_safe=True)
+
+        async def run(self, **kwargs):
+            if kwargs["index"] == 1:
+                failed_child_started.set()
+                return ToolResult(success=True, output="unexpected dispatch")
+
+            sibling_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                sibling_cleanup_started.set()
+                await allow_sibling_cleanup.wait()
+                sibling_finished.set()
+                raise
+
+    guard = SafetyGuard(project_root=tmp_path)
+    store = SessionStore(tmp_path / "parallel-dispatched-store-failure.db")
+    loop = AshLoop(
+        store,
+        MockProvider(),
+        guard,
+        EventUI(safety_tier="auto_approve"),
+        tmp_path,
+        tools={"test_slow_read": SlowReadTool(guard)},
+        safety_tier="auto_approve",
+    )
+    session = await loop.start_session()
+    save_tool_call = store.save_tool_call
+
+    with get_db_connection(store.db_path) as connection:
+        connection.executescript(
+            """
+            CREATE TRIGGER fail_dispatched_tool_intent
+            BEFORE UPDATE ON tool_calls
+            WHEN NEW.call_id = 'db-failure' AND NEW.dispatched = 1
+            BEGIN
+                SELECT RAISE(ABORT, 'injected dispatched intent store failure');
+            END;
+            """
+        )
+
+    def observe_dispatched_intent_failure(session_id, record, *, turn_id=None):
+        try:
+            save_tool_call(session_id, record, turn_id=turn_id)
+        except sqlite3.IntegrityError:
+            if record.call_id == "db-failure" and record.dispatched:
+                failure_raised.set()
+            raise
+
+    monkeypatch.setattr(store, "save_tool_call", observe_dispatched_intent_failure)
+    batch = asyncio.create_task(
+        loop._execute_tool_calls(
+            [
+                {
+                    "call_id": "sibling",
+                    "name": "test_slow_read",
+                    "arguments": {"index": 0},
+                },
+                {
+                    "call_id": "db-failure",
+                    "name": "test_slow_read",
+                    "arguments": {"index": 1},
+                },
+            ],
+            session,
+            persist_tool_messages=True,
+        )
+    )
+
     try:
+        await asyncio.wait_for(sibling_started.wait(), timeout=1)
         await asyncio.wait_for(failure_raised.wait(), timeout=1)
         await asyncio.wait_for(sibling_cleanup_started.wait(), timeout=1)
-        if interrupt_cleanup:
-            batch.cancel()
+        assert not failed_child_started.is_set()
         done, _ = await asyncio.wait({batch}, timeout=0.05)
-        returned_before_sibling_finished = bool(done)
-        assert not returned_before_sibling_finished, (
-            "batch returned from the tool intent-store failure while its sibling "
-            "was still running"
-        )
-        assert sibling_cleanup_started.is_set()
+        assert not done, "batch returned before its started sibling finished cleanup"
     finally:
-        sibling_release.set()
         allow_sibling_cleanup.set()
-        outcome = await asyncio.gather(batch, return_exceptions=True)
 
-    if interrupt_cleanup:
-        assert isinstance(outcome[0], asyncio.CancelledError)
-    else:
-        assert isinstance(outcome[0], sqlite3.IntegrityError)
-        assert "injected tool intent store failure" in str(outcome[0])
-    assert not failed_call_started.is_set()
+    with pytest.raises(
+        sqlite3.IntegrityError,
+        match="injected dispatched intent store failure",
+    ):
+        await batch
+
     assert sibling_finished.is_set()
-    records = {record.call_id: record for record in store.load_session(session.session_id).tool_calls}
+    saved = store.load_session(session.session_id)
+    records = {record.call_id: record for record in saved.tool_calls}
+    assert set(records) == {"sibling", "db-failure"}
+    assert records["sibling"].approved is True
     assert records["sibling"].dispatched is True
     assert records["sibling"].executed is False
+    assert records["db-failure"].approved is True
+    assert records["db-failure"].dispatched is False
+    assert records["db-failure"].executed is False
+    assert not any(message.role == "tool" for message in saved.messages)
+    assert [
+        event["call_id"]
+        for event in loop.ui.events
+        if event["type"] == "tool.started"
+    ] == ["sibling"]
+    assert store.verify_audit_log(session.session_id) == []
 
 
 @pytest.mark.asyncio

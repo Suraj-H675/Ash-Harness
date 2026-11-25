@@ -6,6 +6,7 @@ import os
 import sys
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
@@ -54,6 +55,54 @@ def fake_config(log_path: Path) -> LSPServerConfig:
         settings={"fake": {"enabled": True}},
         source="test",
     )
+
+
+class _DelayedNavigationClient:
+    def __init__(self, response: list[dict[str, object]]) -> None:
+        self.config = SimpleNamespace(name="delayed")
+        self.capabilities = {"definitionProvider": True}
+        self.position_encoding = "utf-8"
+        self.healthy = True
+        self.response = response
+        self.request_started = asyncio.Event()
+        self.release_request = asyncio.Event()
+        self._document_text: str | None = None
+        self._document_version = 0
+
+    async def sync_document(self, path: Path, language_id: str) -> DocumentSyncResult:
+        current_text = path.read_text(encoding="utf-8")
+        changed = current_text != self._document_text
+        if changed:
+            self._document_version += 1
+            self._document_text = current_text
+        return DocumentSyncResult(path.as_uri(), changed)
+
+    def document_text(self, uri: str) -> str:
+        assert self._document_text is not None
+        return self._document_text
+
+    def position(self, uri: str, line: int, character: int) -> dict[str, int]:
+        return {"line": line - 1, "character": character - 1}
+
+    async def request(
+        self, method: str, params: dict[str, object]
+    ) -> list[dict[str, object]]:
+        self.request_started.set()
+        await self.release_request.wait()
+        return self.response
+
+
+def _delayed_navigation_manager(
+    workspace: Path,
+    client: _DelayedNavigationClient,
+) -> LanguageServerManager:
+    manager = LanguageServerManager(workspace, {})
+
+    async def clients_for(_path: Path) -> list[tuple[_DelayedNavigationClient, str]]:
+        return [(client, "python")]
+
+    manager.clients_for = clients_for  # type: ignore[method-assign]
+    return manager
 
 
 def test_custom_config_allows_no_root_markers(tmp_path: Path) -> None:
@@ -1740,3 +1789,63 @@ async def test_lsp_query_preserves_query_failure_when_manager_close_fails(
     assert any(
         "LSP manager cleanup failed" in note for note in captured.value.__notes__
     )
+
+
+@pytest.mark.asyncio
+async def test_navigation_rejects_source_changed_during_lsp_request(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source.py"
+    source.write_text("def old_symbol():\n    return 1\n", encoding="utf-8")
+    target = tmp_path / "target.py"
+    target.write_text("def old_symbol():\n    pass\n", encoding="utf-8")
+    client = _DelayedNavigationClient(
+        [
+            {
+                "uri": target.as_uri(),
+                "range": {
+                    "start": {"line": 0, "character": 4},
+                    "end": {"line": 0, "character": 14},
+                },
+            }
+        ]
+    )
+    manager = _delayed_navigation_manager(tmp_path, client)
+    query = asyncio.create_task(
+        manager.query("definition", file_path="source.py", line=1, character=5)
+    )
+    try:
+        await asyncio.wait_for(client.request_started.wait(), timeout=1)
+        assert client.document_text(source.as_uri()).startswith("def old_symbol")
+        source.write_text("def new_symbol():\n    return 2\n", encoding="utf-8")
+        client.release_request.set()
+
+        with pytest.raises(LSPError, match="source changed during navigation"):
+            await query
+    finally:
+        client.release_request.set()
+        await manager.aclose()
+
+
+@pytest.mark.asyncio
+async def test_navigation_preserves_valid_definition_with_different_alias(tmp_path: Path) -> None:
+    source = tmp_path / "consumer.py"
+    source.write_text("from library import original as alias\nalias()\n", encoding="utf-8")
+    target = tmp_path / "library.py"
+    target.write_text("def original():\n    return 42\n", encoding="utf-8")
+    client = _DelayedNavigationClient([
+        {"uri": target.as_uri(), "range": {
+            "start": {"line": 0, "character": 4},
+            "end": {"line": 0, "character": 12},
+        }}
+    ])
+    manager = _delayed_navigation_manager(tmp_path, client)
+    client.release_request.set()
+    try:
+        result = await manager.query("definition", file_path="consumer.py", line=2, character=2)
+        assert result == [{"uri": "library.py", "range": {
+            "start": {"line": 0, "character": 4},
+            "end": {"line": 0, "character": 12},
+        }}]
+    finally:
+        await manager.aclose()

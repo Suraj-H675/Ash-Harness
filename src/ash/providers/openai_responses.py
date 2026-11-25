@@ -25,7 +25,7 @@ from ash.providers.messages import (
     MAX_PROVIDER_STATE_BYTES,
     CanonicalToolCall,
     MessageInput,
-    normalize_messages,
+    normalize_provider_history,
 )
 from ash.providers.openai import (
     _api_key_replay_identity,
@@ -107,7 +107,7 @@ def prepare_openai_responses_input(
 
     instructions: list[str] = []
     items: list[dict[str, Any]] = []
-    for message in normalize_messages(messages):
+    for message in normalize_provider_history(messages):
         role = message["role"]
         content = message.get("content", "")
         if role == "system":

@@ -256,6 +256,13 @@ file's basename or its project-relative path.
 This improves focused code inspection without raising the 16,384-byte default
 search capture or the 24,576-byte contextual hard cap; result truncation remains
 explicit. Use `fixed_strings=true` for literal symbols containing regex syntax.
+Set `grouped_context=true` to render matching lines and optional nearby context
+as numbered, contiguous range blocks. Each block starts with
+`path (lines START-END)`, uses `>` for matching physical lines and spaces for
+context, and has inclusive bounds that can be passed to `read_file`. This mode
+is opt-in, accepts `context_lines=0` for hit-only ranges, and cannot be combined
+with `files_only=true`. If output limits require dropping optional context, the
+result says so; matching lines retain their scan order.
 
 `find_symbol` and `find_references` use a bounded repository index. If
 discovery stops at its entry/depth limit, a directory cannot be enumerated,

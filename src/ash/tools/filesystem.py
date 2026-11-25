@@ -521,12 +521,33 @@ class ReadFileTool(BaseTool):
         if budget is None or budget.accepts(result):
             return result
 
+        nearest_rejected_limit = args.max_chars
+        accepted_source_char_limit: int | None = None
+        accepted_result: ToolResult | None = None
         source_char_limit = args.max_chars
         while source_char_limit > 1:
             source_char_limit = max(1, source_char_limit // 2)
             result = build_result(source_char_limit)
             if budget.accepts(result):
-                return result
+                accepted_source_char_limit = source_char_limit
+                accepted_result = result
+                break
+            nearest_rejected_limit = source_char_limit
+
+        if accepted_result is not None and accepted_source_char_limit is not None:
+            gap = nearest_rejected_limit - accepted_source_char_limit
+            for divisor in (2, 4, 8):
+                candidate_limit = accepted_source_char_limit + gap // divisor
+                if (
+                    candidate_limit <= accepted_source_char_limit
+                    or candidate_limit >= nearest_rejected_limit
+                ):
+                    continue
+                candidate_result = build_result(candidate_limit)
+                if budget.accepts(candidate_result):
+                    accepted_result = candidate_result
+                    break
+            return accepted_result
         return ToolResult(
             success=False,
             output="",

@@ -4,11 +4,11 @@ Given a workspace, the map:
   1. Walks supported source files, parses each with the tree-sitter
      :class:`~ash.repo.parser.SymbolExtractor`, and records every
      class/function/method/import symbol.
-  2. Builds a file-level dependency graph: an edge ``A -> B`` means some
-     symbol in file ``A`` imports or references a symbol in file ``B``.
-  3. Runs :func:`calculate_personalized_pagerank` from the user's
-     currently-active files so the highest-ranked files appear first
-     in the rendered map.
+  2. Builds a directed file-level dependency graph: an edge ``A -> B`` means
+     file ``A`` imports a module resolved to file ``B``.
+  3. With an indexed active file, derives a temporary reciprocal view for
+     Personalized PageRank so dependencies and importers can both rank highly.
+     Graph inspection continues to use the directed dependency graph.
   4. Renders a Markdown snippet containing the top-N files' top-K
      symbols each, suitable for injection into the system prompt.
 """
@@ -92,6 +92,28 @@ class _SparseAdjacency:
 
     columns: tuple[tuple[tuple[int, float], ...], ...]
     column_sums: tuple[float, ...]
+
+
+def _build_reciprocal_ranking_adjacency(
+    dependencies: _SparseAdjacency,
+) -> _SparseAdjacency:
+    """Add importer transitions to a temporary ranking-only graph."""
+
+    columns: list[dict[int, float]] = [{} for _ in dependencies.columns]
+    for source, outgoing in enumerate(dependencies.columns):
+        for target, weight in outgoing:
+            columns[source][target] = columns[source].get(target, 0.0) + weight
+            columns[target][source] = columns[target].get(source, 0.0) + weight
+
+    frozen_columns = tuple(
+        tuple(sorted(column.items())) for column in columns
+    )
+    return _SparseAdjacency(
+        columns=frozen_columns,
+        column_sums=tuple(
+            sum(weight for _, weight in column) for column in frozen_columns
+        ),
+    )
 
 
 def _normalize_module_name(path: Path, project_root: Path) -> str | None:
@@ -789,11 +811,17 @@ class RepoMap:
             index = self._index.get(path)
             if index is not None:
                 teleport_indices.append(index)
-        if not teleport_indices:
+        has_indexed_active_path = bool(teleport_indices)
+        if not has_indexed_active_path:
             teleport_indices = list(range(len(self._files)))
 
+        ranking_adjacency = self._adjacency
+        if has_indexed_active_path:
+            ranking_adjacency = _build_reciprocal_ranking_adjacency(
+                self._adjacency
+            )
         scores = _calculate_sparse_personalized_pagerank(
-            self._adjacency,
+            ranking_adjacency,
             teleport_indices=teleport_indices,
             alpha=alpha,
             max_iter=max_iter,

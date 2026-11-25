@@ -1,5 +1,6 @@
 import asyncio
 import os
+import re
 import shlex
 import signal
 import sys
@@ -865,6 +866,52 @@ async def test_background_process_handles_long_lines_and_bounds_output(tmp_path)
 
 
 @pytest.mark.asyncio
+async def test_background_process_retains_late_failure_after_output_limit(
+    tmp_path: Path,
+) -> None:
+    canary = "SYNTHETIC_TASK21_CANARY"
+    script = (
+        "import sys,time;"
+        "sys.stdout.write('early-marker\\n');sys.stdout.flush();time.sleep(.2);"
+        "sys.stdout.write('noise\\n'*22000+"
+        "'FAILED tests/test_late.py::test_failure - AssertionError\\n'"
+        "+'1 failed, 2 passed in 0.12s\\n');"
+        "sys.stderr.write('token=" + canary + "\\n');"
+        "sys.exit(1)"
+    )
+    tool = BackgroundProcessTool(SafetyGuard(tmp_path))
+
+    started = await tool.run(action="start", command=_python_shell_command(script))
+    job_id = started.output.split()[1]
+    job = tool.jobs[job_id]
+    first = await tool.run(action="wait", job_id=job_id, timeout_seconds=1)
+    _, first_payload = first.output.split("\n", 1)
+    assert "early-marker" in first_payload
+    cursor_before_overflow = job.cursor
+    await asyncio.wait_for(
+        asyncio.gather(job.process.wait(), *job.readers), timeout=5.0
+    )
+    polled = await tool.run(action="poll", job_id=job_id)
+    _, payload = polled.output.split("\n", 1)
+
+    assert job.process.returncode == 1
+    assert job.cursor > cursor_before_overflow
+    assert "exited(1)" in polled.output
+    assert "early-marker" not in payload
+    assert BACKGROUND_OUTPUT_TRUNCATION_MARKER.strip() in payload
+    assert "FAILED tests/test_late.py::test_failure" in payload
+    assert "1 failed, 2 passed in 0.12s" in payload
+    assert "[REDACTED]" in payload
+    assert canary not in payload
+    assert polled.truncated
+    assert job.output_size <= MAX_BACKGROUND_OUTPUT_CHARS
+    second = await tool.run(action="poll", job_id=job_id)
+    second_payload = second.output.split("\n", 1)[1] if "\n" in second.output else ""
+    assert second_payload == ""
+    await tool.aclose()
+
+
+@pytest.mark.asyncio
 async def test_background_process_limits_running_job_count_and_argument_size(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1354,3 +1401,40 @@ async def test_background_process_fails_closed_without_descriptor_cwd(
     assert result.success is False
     assert "race-resistant cwd launch unavailable" in (result.error or "")
     assert not tool.jobs
+
+
+@pytest.mark.asyncio
+async def test_background_process_does_not_replay_polled_middle_after_truncation(tmp_path: Path) -> None:
+    script = (
+        "import sys;"
+        "sys.stdout.write(''.join(f'OLD-{n:05d}\\n' for n in range(8000))+'FIRST-END\\n');"
+        "sys.stdout.flush();sys.stdin.readline();"
+        "sys.stdout.write(''.join(f'NEW-{n:05d}\\n' for n in range(3000))+'SECOND-END\\n');"
+        "sys.stdout.flush()"
+    )
+    tool = BackgroundProcessTool(SafetyGuard(tmp_path))
+    try:
+        started = await tool.run(action="start", command=_python_shell_command(script))
+        assert started.success
+        job_id = started.output.split()[1]
+        job = tool.jobs[job_id]
+        received = []
+        for _ in range(25):
+            result = await tool.run(action="wait", job_id=job_id, timeout_seconds=0.2)
+            received.append(result.output.partition("\n")[2])
+            if job.cursor >= 70_000:
+                break
+        assert job.cursor >= 70_000
+        prior = set(re.findall(r"OLD-\d{5}", "\n".join(received)))
+        assert len(prior) >= 6_900
+        assert (await tool.run(action="write", job_id=job_id, input="\n")).success
+        await asyncio.wait_for(asyncio.gather(job.process.wait(), *job.readers), 10)
+        final = await tool.run(action="poll", job_id=job_id)
+        assert final.truncated and "SECOND-END" in final.output
+        assert not prior.intersection(re.findall(r"OLD-\d{5}", final.output))
+        assert job.process.returncode == 0
+        assert job.output_size <= MAX_BACKGROUND_OUTPUT_CHARS
+        again = await tool.run(action="poll", job_id=job_id)
+        assert again.output.partition("\n")[2] == ""
+    finally:
+        await tool.aclose()

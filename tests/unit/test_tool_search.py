@@ -1098,6 +1098,10 @@ async def test_default_runtime_discovers_tools_for_natural_language_intents(
             for item in json.loads(discovered.result or "{}")["tools"]
             if item["name"] == expected_tool
         )
+        if context_window == 4_096:
+            # The next native-tool request carries the full declaration. Keep
+            # the compact discovery result to its name in the tightest window.
+            assert matched == {"name": expected_tool}
         if expected_tool == "apply_patch" and context_window == 4_096:
             search_result = json.loads(discovered.result or "{}")
             assert [item["name"] for item in search_result["tools"]] == [

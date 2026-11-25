@@ -42,6 +42,7 @@ from typing import (
     Sequence,
 )
 from uuid import uuid4
+from xml.etree import ElementTree
 from xml.sax.saxutils import escape as xml_escape, quoteattr
 
 from pydantic import ValidationError
@@ -177,6 +178,7 @@ MAX_BACKGROUND_AGENT_REPORT_SUMMARY_BYTES = 16_384
 MAX_BACKGROUND_AGENT_REPORT_TASK_BYTES = 4_096
 MAX_SCHEDULED_HOOK_LIFECYCLE_TASKS = 32
 HOOK_LIFECYCLE_SHUTDOWN_GRACE_SECONDS = 5.0
+_APPROVAL_RESULT_UNSET = object()
 
 
 class _TurnToolResultImages:
@@ -4408,32 +4410,13 @@ class AshLoop:
             self._pending_plan_context = ""
             self._pending_goal_context = ""
             if self.enable_sprint_planning:
+                from ash.core.sprint import render_sprint_context
+
                 latest_sprint = self.session_store.load_latest_active_sprint(
                     session.session_id
                 )
                 if latest_sprint is not None:
-                    done_count, total_count = latest_sprint.progress
-                    plan_lines = []
-                    for item in latest_sprint.items:
-                        marker = {
-                            "done": "[x]",
-                            "skipped": "[-]",
-                            "in_progress": "[>]",
-                            "failed": "[!]",
-                            "pending": "[ ]",
-                        }.get(item.status.value, "[ ]")
-                        notes = f" — {item.notes}" if item.notes else ""
-                        plan_lines.append(
-                            f"{marker} {item.idx}. ({item.section}) "
-                            f"{item.description}{notes}"
-                        )
-                    self._pending_plan_context = (
-                        f"Sprint {latest_sprint.contract.contract_id}: "
-                        f"{latest_sprint.contract.goal} "
-                        f"(state={latest_sprint.state.value}, "
-                        f"progress={done_count}/{total_count})\n"
-                        + "\n".join(plan_lines)
-                    )
+                    self._pending_plan_context = render_sprint_context(latest_sprint)
             goal = self.session_store.load_current_goal(session.session_id)
             if goal is not None and goal.state is GoalState.ACTIVE:
                 evidence = (
@@ -7126,6 +7109,10 @@ class AshLoop:
         tool_result_images: _TurnToolResultImages | None = None,
         _defer_terminal_persistence: bool = False,
         _defer_breaker_outcomes: list[tuple[str, bool]] | None = None,
+        _approval_override: object = _APPROVAL_RESULT_UNSET,
+        _tool_request_already_emitted: bool = False,
+        _preapproved_record: ToolCallRecord | None = None,
+        _approval_audit_already_recorded: bool = False,
     ) -> list[dict[str, Any]]:
         """Execute approved tool calls, gating each on the safety guard."""
 
@@ -7143,15 +7130,187 @@ class AshLoop:
 
         def parallel_safe(call: dict[str, Any]) -> bool:
             tool_name = call.get("name")
-            tool = active_tools.get(tool_name) if isinstance(tool_name, str) else None
+            if not isinstance(tool_name, str):
+                return False
+            tool = active_tools.get(tool_name)
             contract = getattr(tool, "execution_contract", None)
-            return (
+            safe_by_contract = (
                 tool_name in READ_ONLY_TOOLS
                 and isinstance(contract, ToolExecutionContract)
                 and contract.parallel_safe
             )
+            if not safe_by_contract:
+                return False
+            if self.on_tool_approval is not None or self.ui.has_approval_callback:
+                return True
+            arguments = call.get("arguments")
+            if not isinstance(arguments, dict):
+                return False
+            try:
+                decision = self.permission_policy.evaluate(
+                    tool_name, deepcopy(arguments)
+                )
+            except (TypeError, ValueError):
+                return False
+            # Calls that would prompt without an explicit approval callback
+            # remain on the ordered path. A synchronous approval prompt must
+            # never be opened by multiple fan-out children at once.
+            return decision.action == PolicyAction.ALLOW
 
-        if len(tool_calls) > 1 and all(parallel_safe(call) for call in tool_calls):
+        parallel_batch = len(tool_calls) > 1 and all(
+            parallel_safe(call) for call in tool_calls
+        )
+        approval_overrides: list[object] | None = None
+        approved_records: list[ToolCallRecord] | None = None
+        requests_emitted_before_dispatch = False
+        has_approval_callback = (
+            self.on_tool_approval is not None or self.ui.has_approval_callback
+        )
+        if parallel_batch and has_approval_callback:
+            # Approval callbacks are an ordered boundary. Validate the whole
+            # read batch before calling any callback, gather decisions in
+            # submission order, and durably save approved intent before any
+            # child is allowed to dispatch a read.
+            approval_inputs: list[
+                tuple[str, str, dict[str, Any], BaseTool, PolicyDecision]
+            ] = []
+            for call in tool_calls:
+                try:
+                    call_id, tool_name, arguments = _validate_direct_tool_call(
+                        call_id=call.get("call_id"),
+                        tool_name=call.get("name"),
+                        arguments=call.get("arguments"),
+                    )
+                    tool = active_tools.get(tool_name)
+                    if tool is None:
+                        parallel_batch = False
+                        break
+                    if tool.args_schema is not None:
+                        tool.validate_args(**deepcopy(arguments))
+                except (TypeError, ValueError):
+                    parallel_batch = False
+                    break
+
+                decision = self.permission_policy.evaluate(
+                    tool_name, deepcopy(arguments)
+                )
+                navigation_budget = (
+                    navigation_output_budgets.get(call_id)
+                    if navigation_output_budgets is not None
+                    else None
+                )
+                if decision.action == PolicyAction.DENY or (
+                    navigation_budget is not None
+                    and not navigation_budget.can_dispatch
+                ):
+                    parallel_batch = False
+                    break
+                approval_inputs.append(
+                    (call_id, tool_name, arguments, tool, decision)
+                )
+
+            if parallel_batch:
+                approval_overrides = []
+                approved_records = []
+                requests_emitted_before_dispatch = True
+                for call_id, tool_name, arguments, tool, decision in approval_inputs:
+                    record = ToolCallRecord(
+                        call_id=call_id,
+                        tool_name=tool_name,
+                        arguments=redact_tool_arguments(tool, arguments),
+                        approved=False,
+                        executed=False,
+                        timestamp=_utc_now(),
+                    )
+                    event_base = {
+                        "call_id": record.call_id,
+                        "tool": tool_name,
+                        "arguments": record.arguments,
+                    }
+                    self._emit_event({"type": "tool.requested", **event_base})
+
+                    if self.on_tool_approval is not None:
+                        approval_result = await self.on_tool_approval(
+                            tool_name, deepcopy(arguments)
+                        )
+                        approved = (
+                            bool(approval_result[0])
+                            if isinstance(approval_result, tuple)
+                            else not isinstance(approval_result, str)
+                            and bool(approval_result)
+                        )
+                    else:
+                        approval_result = self.ui.request_tool_approval(
+                            tool_name, deepcopy(arguments)
+                        )
+                        approved = (
+                            False
+                            if isinstance(approval_result, str)
+                            else bool(approval_result)
+                        )
+
+                    if approved:
+                        record.approved = True
+                        self._append_tool_audit(
+                            session,
+                            action_type="user_approval",
+                            target_resource=tool_name,
+                            details={
+                                "call_id": record.call_id,
+                                "arguments": record.arguments,
+                                "decision": decision.action.value,
+                                "reason": decision.reason,
+                                "rule_id": decision.rule_id,
+                            },
+                            result="APPROVED",
+                        )
+                        self.session_store.save_tool_call(
+                            session.session_id,
+                            record,
+                            turn_id=(
+                                self.turn_context.turn_id
+                                if self.turn_context
+                                else None
+                            ),
+                        )
+                    else:
+                        denial_feedback = ""
+                        if isinstance(approval_result, str):
+                            denial_feedback = approval_result.strip()
+                        elif isinstance(approval_result, tuple) and len(approval_result) > 1:
+                            denial_feedback = str(approval_result[1]).strip()
+                        record.error = _bounded_durable_tool_error(
+                            f"Denied by user: {denial_feedback}"
+                            if denial_feedback
+                            else "Denied by user",
+                            fallback="Denied by user",
+                        )
+                        self.session_store.save_tool_call(
+                            session.session_id,
+                            record,
+                            turn_id=(
+                                self.turn_context.turn_id
+                                if self.turn_context
+                                else None
+                            ),
+                        )
+                        self._append_tool_audit(
+                            session,
+                            action_type="user_approval",
+                            target_resource=tool_name,
+                            details={
+                                "call_id": record.call_id,
+                                "arguments": record.arguments,
+                                "decision": decision.action.value,
+                                "reason": record.error,
+                                "rule_id": decision.rule_id,
+                            },
+                            result="DENIED",
+                        )
+                    approval_overrides.append(approval_result)
+                    approved_records.append(record)
+
+        if parallel_batch:
             concurrency = asyncio.Semaphore(MAX_PARALLEL_READ_ONLY_TOOL_CALLS)
             # A parallel read batch comes from one model response. Collect its
             # outcomes before scoring the breaker, so sibling failures cannot
@@ -7163,7 +7322,9 @@ class AshLoop:
                 else []
             )
 
-            async def execute_read_only(call: dict[str, Any]) -> list[dict[str, Any]]:
+            async def execute_read_only(
+                index: int, call: dict[str, Any]
+            ) -> list[dict[str, Any]]:
                 async with concurrency:
                     completed = await self._execute_tool_calls(
                         [call],
@@ -7174,6 +7335,23 @@ class AshLoop:
                             persist_tool_messages or _defer_terminal_persistence
                         ),
                         _defer_breaker_outcomes=batch_outcomes,
+                        _approval_override=(
+                            approval_overrides[index]
+                            if approval_overrides is not None
+                            else _APPROVAL_RESULT_UNSET
+                        ),
+                        _tool_request_already_emitted=(
+                            requests_emitted_before_dispatch
+                        ),
+                        _preapproved_record=(
+                            approved_records[index]
+                            if approved_records is not None
+                            else None
+                        ),
+                        _approval_audit_already_recorded=(
+                            approval_overrides is not None
+                            and approved_records is not None
+                        ),
                     )
                     if persist_tool_messages:
                         # A sibling can stall or be cancelled after this read
@@ -7195,7 +7373,8 @@ class AshLoop:
                     return completed
 
             tasks = [
-                asyncio.create_task(execute_read_only(call)) for call in tool_calls
+                asyncio.create_task(execute_read_only(index, call))
+                for index, call in enumerate(tool_calls)
             ]
             grouped_tasks = asyncio.gather(*tasks)
             try:
@@ -7258,20 +7437,25 @@ class AshLoop:
                 tool_name,
                 sorted(arguments),
             )
-            record = ToolCallRecord(
-                call_id=call_id,
-                tool_name=tool_name,
-                arguments=redact_tool_arguments(tool, arguments),
-                approved=False,
-                executed=False,
-                timestamp=_utc_now(),
+            record = (
+                _preapproved_record
+                if _preapproved_record is not None
+                else ToolCallRecord(
+                    call_id=call_id,
+                    tool_name=tool_name,
+                    arguments=redact_tool_arguments(tool, arguments),
+                    approved=False,
+                    executed=False,
+                    timestamp=_utc_now(),
+                )
             )
             event_base = {
                 "call_id": record.call_id,
                 "tool": tool_name,
                 "arguments": record.arguments,
             }
-            self._emit_event({"type": "tool.requested", **event_base})
+            if not _tool_request_already_emitted:
+                self._emit_event({"type": "tool.requested", **event_base})
 
             def can_attest_navigation_rejection() -> bool:
                 if not self._safe_edit_preflight or tool is None or tool.name != tool_name:
@@ -7454,8 +7638,12 @@ class AshLoop:
             if decision.action == PolicyAction.DENY:
                 approved = False
             elif self.on_tool_approval is not None:
-                decision_result = await self.on_tool_approval(
-                    tool_name, deepcopy(arguments)
+                decision_result = (
+                    _approval_override
+                    if _approval_override is not _APPROVAL_RESULT_UNSET
+                    else await self.on_tool_approval(
+                        tool_name, deepcopy(arguments)
+                    )
                 )
                 if isinstance(decision_result, str):
                     approved = False
@@ -7470,33 +7658,47 @@ class AshLoop:
                 else:
                     approved = bool(decision_result)
             elif self.ui.has_approval_callback:
-                approved = self.ui.request_tool_approval(
-                    tool_name, deepcopy(arguments)
+                ui_approval_result = (
+                    _approval_override
+                    if _approval_override is not _APPROVAL_RESULT_UNSET
+                    else self.ui.request_tool_approval(
+                        tool_name, deepcopy(arguments)
+                    )
                 )
-                if isinstance(approved, str):
-                    denial_feedback = approved.strip()
+                if isinstance(ui_approval_result, str):
+                    denial_feedback = ui_approval_result.strip()
                     approved = False
+                else:
+                    approved = bool(ui_approval_result)
             elif decision.action == PolicyAction.ALLOW:
                 approved = True
             else:
                 approved = self.ui.request_tool_approval(
                     tool_name, deepcopy(arguments)
                 )
-            record.approved = bool(approved)
+            if not (
+                decision.action == PolicyAction.DENY
+                and _preapproved_record is not None
+            ):
+                # A policy tightened after the ordered approval gate may now
+                # refuse dispatch. Preserve the durable user approval state;
+                # the separate safety-block audit records why execution stopped.
+                record.approved = bool(approved)
             if approved:
-                self._append_tool_audit(
-                    session,
-                    action_type="user_approval",
-                    target_resource=tool_name,
-                    details={
-                        "call_id": record.call_id,
-                        "arguments": record.arguments,
-                        "decision": decision.action.value,
-                        "reason": decision.reason,
-                        "rule_id": decision.rule_id,
-                    },
-                    result="APPROVED",
-                )
+                if not _approval_audit_already_recorded:
+                    self._append_tool_audit(
+                        session,
+                        action_type="user_approval",
+                        target_resource=tool_name,
+                        details={
+                            "call_id": record.call_id,
+                            "arguments": record.arguments,
+                            "decision": decision.action.value,
+                            "reason": decision.reason,
+                            "rule_id": decision.rule_id,
+                        },
+                        result="APPROVED",
+                    )
             if not approved:
                 record.executed = False
                 if denial_feedback:
@@ -7521,27 +7723,31 @@ class AshLoop:
                             self.turn_context.turn_id if self.turn_context else None
                         ),
                     )
-                self._append_tool_audit(
-                    session,
-                    action_type=(
-                        "safety_block"
-                        if decision.action == PolicyAction.DENY
-                        else "user_approval"
-                    ),
-                    target_resource=tool_name,
-                    details={
-                        "call_id": record.call_id,
-                        "arguments": record.arguments,
-                        "decision": decision.action.value,
-                        "reason": record.error,
-                        "rule_id": decision.rule_id,
-                    },
-                    result=(
-                        "BLOCKED_BY_GUARD"
-                        if decision.action == PolicyAction.DENY
-                        else "DENIED"
-                    ),
-                )
+                if (
+                    not _approval_audit_already_recorded
+                    or decision.action == PolicyAction.DENY
+                ):
+                    self._append_tool_audit(
+                        session,
+                        action_type=(
+                            "safety_block"
+                            if decision.action == PolicyAction.DENY
+                            else "user_approval"
+                        ),
+                        target_resource=tool_name,
+                        details={
+                            "call_id": record.call_id,
+                            "arguments": record.arguments,
+                            "decision": decision.action.value,
+                            "reason": record.error,
+                            "rule_id": decision.rule_id,
+                        },
+                        result=(
+                            "BLOCKED_BY_GUARD"
+                            if decision.action == PolicyAction.DENY
+                            else "DENIED"
+                        ),
+                    )
                 self._emit_event(
                     {
                         "type": "tool.denied",
@@ -7799,6 +8005,21 @@ class AshLoop:
                             }
                         )
                         tool_result = ToolResult.model_validate(payload)
+                    if tool_started and tool_name == "read_file" and tool_result.success:
+                        reference = self._verified_prior_read_reference(
+                            session=session,
+                            tool=tool,
+                            call_arguments=arguments,
+                            result=tool_result,
+                            original_result=pre_post_result,
+                        )
+                        if reference is not None:
+                            tool_result = tool_result.model_copy(
+                                update={
+                                    "output": reference,
+                                    "token_count": count_output_tokens(reference),
+                                }
+                            )
                 if self.turn_context is not None:
                     self.turn_context.data.pop("tool_call_id", None)
             except asyncio.CancelledError:
@@ -8126,6 +8347,138 @@ class AshLoop:
                 image_blocks = visible_result.get("image_blocks")
                 if isinstance(image_blocks, list):
                     tool_result_images.capture(call["call_id"], image_blocks)
+
+    def _verified_prior_read_reference(
+        self,
+        *,
+        session: Session,
+        tool: BaseTool,
+        call_arguments: dict[str, Any],
+        result: ToolResult,
+        original_result: ToolResult,
+    ) -> str | None:
+        """Return a short reference only when a full current read repeats visible text.
+
+        This intentionally keeps no read cache. ``ReadFileTool`` has already
+        performed its scoped read and digest check before this method runs.
+        The earlier source result must still be present in this active turn's
+        canonical transcript, where active-turn messages are protected from
+        local history pruning.
+        """
+
+        from ash.tools.filesystem import ReadFileTool
+
+        if type(tool) is not ReadFileTool:
+            return None
+        if tool.safety_guard is not self.safety_guard:
+            return None
+        if (
+            self.current_session is None
+            or self.current_session.session_id != session.session_id
+            or self.turn_context is None
+            or self.turn_context.session_id != session.session_id
+            or not self._turn_running
+            or self._active_turn_user_message is None
+        ):
+            return None
+        if getattr(self.provider, "server_side_compaction_enabled", False):
+            return None
+        if any(
+            message.role == "assistant"
+            and isinstance(message.metadata.get("provider_state"), list)
+            and any(
+                isinstance(item, dict)
+                and item.get("type") == "responses_server_compaction_output"
+                for item in message.metadata["provider_state"]
+            )
+            for message in session.messages
+        ):
+            return None
+        if (
+            not result.success
+            or result.truncated
+            or result.error is not None
+            or not original_result.success
+            or original_result.truncated
+            or original_result.error is not None
+            or result.output != original_result.output
+        ):
+            return None
+
+        try:
+            self._verify_project_root_identity()
+        except RuntimeError:
+            # The scoped tool already produced its result. Do not attach a
+            # reference if the runtime can no longer prove its root identity.
+            return None
+
+        active_turn_index = next(
+            (
+                index
+                for index, message in enumerate(session.messages)
+                if message is self._active_turn_user_message
+            ),
+            None,
+        )
+        if active_turn_index is None:
+            return None
+
+        prior_read_arguments: dict[str, dict[str, Any]] = {}
+        for message in session.messages[active_turn_index + 1 :]:
+            if message.role == "assistant":
+                calls = message.metadata.get("tool_calls")
+                if not isinstance(calls, list):
+                    continue
+                for call in calls:
+                    if not isinstance(call, dict):
+                        continue
+                    call_id = call.get("call_id")
+                    arguments = call.get("arguments")
+                    if (
+                        call.get("name") == "read_file"
+                        and isinstance(call_id, str)
+                        and isinstance(arguments, dict)
+                    ):
+                        prior_read_arguments[call_id] = arguments
+                continue
+
+            if message.role != "tool":
+                continue
+            call_id = message.metadata.get("call_id")
+            if (
+                not isinstance(call_id, str)
+                or prior_read_arguments.get(call_id) != call_arguments
+            ):
+                continue
+            try:
+                root = ElementTree.fromstring(message.content)
+                payload = json.loads(root.text or "")
+            except (ElementTree.ParseError, TypeError, ValueError):
+                continue
+            if (
+                root.tag != "tool_response"
+                or root.attrib.get("name") != "read_file"
+                or root.attrib.get("call_id") != call_id
+                or not isinstance(payload, dict)
+                or payload.get("success") is not True
+                or payload.get("error") is not None
+                or payload.get("truncated") is not False
+                or payload.get("tool_response_truncated") is True
+                or payload.get("output") != result.output
+            ):
+                continue
+
+            reference = (
+                "At the time of this fresh scoped read, output exactly "
+                "matched the complete, untruncated result of prior read_file "
+                f"call {json.dumps(call_id)}. That result is current-turn "
+                "evidence only; re-read before acting if the file may have "
+                "changed, and before use in a later turn."
+            )
+            if len(reference.encode("utf-8")) >= len(result.output.encode("utf-8")):
+                return None
+            return reference
+        return None
 
     def _remember_repo_file(self, path: Path) -> None:
         """Keep a bounded least-recently-used list of files relevant to context."""
@@ -8848,9 +9201,10 @@ class AshLoop:
                 "user-authored text; follow the normal safety and permission policy."
             )
         if self._pending_plan_context:
+            from ash.core.sprint import SPRINT_PROMPT_CONTEXT_HEADER
+
             sprint_section = (
-                f"## Current Sprint Plan\n{self._pending_plan_context}\n\n"
-                "Keep this persisted checklist current as work progresses."
+                f"{SPRINT_PROMPT_CONTEXT_HEADER}{self._pending_plan_context}"
             )
             memory_section = (
                 f"{memory_section}\n\n{sprint_section}"

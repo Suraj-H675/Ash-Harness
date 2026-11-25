@@ -217,6 +217,48 @@ def test_repomap_rank_emphasizes_active_file(tmp_path: Path) -> None:
     assert by_path["active.py"] > by_path["isolated.py"]
 
 
+def test_repomap_rank_includes_importers_without_reversing_dot_edges(
+    tmp_path: Path,
+) -> None:
+    package = tmp_path / "sample"
+    package.mkdir()
+    active = package / "console.py"
+    active.write_text(
+        "from sample.engine import run_flow\n\n"
+        "def handle_batch(rows):\n    return run_flow(rows)\n"
+    )
+    dependency = package / "engine.py"
+    dependency.write_text(
+        "from sample.wire import encode_batch\n\n"
+        "def run_flow(rows):\n    return encode_batch(rows)\n"
+    )
+    wire = package / "wire.py"
+    wire.write_text("def encode_batch(rows):\n    return tuple(rows)\n")
+    test_file = tmp_path / "tests" / "test_console.py"
+    test_file.parent.mkdir()
+    test_file.write_text(
+        "from sample.console import handle_batch\n\n"
+        "def test_handle_batch():\n    assert handle_batch([1]) == (1,)\n"
+    )
+    unrelated = tmp_path / "unrelated.py"
+    unrelated.write_text("def unrelated_task():\n    return None\n")
+
+    repo_map = RepoMap(tmp_path)
+    no_active_before = repo_map.rank([])
+    ranked = repo_map.rank([active])
+    top_paths = {path for path, _score in ranked[:4]}
+
+    assert {active, dependency, wire, test_file} <= top_paths
+    assert unrelated not in top_paths
+    assert repo_map.rank([]) == no_active_before
+
+    graph = repo_map.to_dot_graph([active, dependency, wire, test_file])
+    assert '"sample/console.py" -> "sample/engine.py";' in graph
+    assert '"sample/engine.py" -> "sample/wire.py";' in graph
+    assert '"tests/test_console.py" -> "sample/console.py";' in graph
+    assert '"sample/console.py" -> "tests/test_console.py";' not in graph
+
+
 def test_repomap_includes_late_active_file_within_file_limit(tmp_path: Path) -> None:
     (tmp_path / "a.py").write_text("def first(): pass\n")
     (tmp_path / "b.py").write_text("def second(): pass\n")

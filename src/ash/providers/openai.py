@@ -17,7 +17,11 @@ from ash.providers.base import (
     TokenCounterLike,
     managed_async_stream,
 )
-from ash.providers.messages import CanonicalToolCall, MessageInput, normalize_messages
+from ash.providers.messages import (
+    CanonicalToolCall,
+    MessageInput,
+    normalize_provider_history,
+)
 from ash.providers.readiness import (
     normalize_provider_base_url,
     redact_provider_error,
@@ -183,7 +187,7 @@ def prepare_openai_messages(
 
     prepared: list[dict[str, Any]] = []
     pending_tool_images: list[dict[str, Any]] = []
-    for message in normalize_messages(messages):
+    for message in normalize_provider_history(messages):
         role = message.get("role")
         if role != "tool" and pending_tool_images:
             prepared.extend(pending_tool_images)

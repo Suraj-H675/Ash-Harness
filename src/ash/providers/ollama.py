@@ -14,7 +14,7 @@ from ash.providers.base import ProviderABC, StreamChunk, TokenCounterLike
 from ash.providers.messages import (
     CanonicalToolCall,
     MessageInput,
-    normalize_messages,
+    normalize_provider_history,
 )
 from ash.providers.readiness import normalize_provider_base_url
 from ash.providers.retry import ProviderHTTPError
@@ -28,7 +28,7 @@ MAX_OLLAMA_ERROR_BYTES = 64 * 1024
 def prepare_ollama_messages(messages: Sequence[MessageInput]) -> list[dict[str, Any]]:
     """Translate canonical tool-result images to Ollama's message image field."""
 
-    prepared = normalize_messages(messages)
+    prepared = normalize_provider_history(messages)
     for message in prepared:
         tool_result_images = message.pop("tool_result_images", None)
         if isinstance(tool_result_images, list) and tool_result_images:

@@ -25,6 +25,9 @@ MAX_LSP_RESTART_ATTEMPTS = 3
 MAX_LSP_CLIENT_ROOTS = 64
 MAX_LSP_FAILURE_RECORDS = 256
 _DROP = object()
+_NAVIGATION_OPERATIONS = frozenset(
+    {"definition", "references", "implementation", "incomingCalls", "outgoingCalls"}
+)
 
 
 @dataclass(frozen=True)
@@ -52,6 +55,10 @@ class LSPFormattingProposal:
 
 class _UnsafeWorkspaceEdit(LSPError):
     """A server proposed an edit outside Ash's advisory safety contract."""
+
+
+class _StaleNavigationResult(LSPError):
+    """The request source changed while its navigation result was pending."""
 
 
 class LanguageServerManager:
@@ -152,6 +159,11 @@ class LanguageServerManager:
         for client, language_id in clients:
             try:
                 await client.sync_document(path, language_id)
+                navigation_source = (
+                    client.document_text(uri)
+                    if operation in _NAVIGATION_OPERATIONS
+                    else None
+                )
                 _require_capability(client, operation)
                 params = {
                     "textDocument": {"uri": uri},
@@ -231,6 +243,18 @@ class LanguageServerManager:
                 else:
                     assert method is not None
                     value = await client.request(method, params)
+                if navigation_source is not None:
+                    try:
+                        await client.sync_document(path, language_id)
+                        current_source = client.document_text(uri)
+                    except (OSError, ValueError, LSPError, asyncio.TimeoutError) as exc:
+                        raise _StaleNavigationResult(
+                            "navigation source could not be rechecked; retry against current source"
+                        ) from exc
+                    if current_source != navigation_source:
+                        raise _StaleNavigationResult(
+                            "source changed during navigation; retry against current source"
+                        )
                 if isinstance(value, list):
                     results.extend(value[: max(0, MAX_LSP_RESULTS - len(results))])
                 elif value is not None:
@@ -238,7 +262,7 @@ class LanguageServerManager:
             except (OSError, ValueError, asyncio.TimeoutError) as exc:
                 errors.append(f"{client.config.name}: {exc}")
             except LSPError as exc:
-                if isinstance(exc, _UnsafeWorkspaceEdit):
+                if isinstance(exc, (_UnsafeWorkspaceEdit, _StaleNavigationResult)):
                     raise
                 errors.append(f"{client.config.name}: {exc}")
                 if not client.healthy:

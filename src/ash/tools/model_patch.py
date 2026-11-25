@@ -8,6 +8,7 @@ Actual mutation and authorization remain owned by ApplyPatchTool.
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
 from difflib import unified_diff
 from pathlib import Path
@@ -19,6 +20,9 @@ from ash.safety.scoped_io import read_scoped_bytes
 MAX_MODEL_PATCH_FILES = 128
 MAX_MODEL_PATCH_CHUNKS = 256
 MAX_MODEL_PATCH_SOURCE_BYTES = 32 * 1024 * 1024
+MAX_PATCH_FEEDBACK_MATCHES = 4
+MAX_PATCH_FEEDBACK_LINE_REFS = 4
+MAX_PATCH_FEEDBACK_PATH_CHARS = 256
 
 
 @dataclass(frozen=True)
@@ -35,6 +39,19 @@ class _Operation:
     path: str
     additions: tuple[str, ...] = ()
     chunks: tuple[_Chunk, ...] = ()
+
+
+class _PatchContextMismatch(ValueError):
+    def __init__(
+        self,
+        message: str,
+        positions: tuple[int, ...] = (),
+        *,
+        match_count: int = 0,
+    ) -> None:
+        super().__init__(message)
+        self.positions = positions
+        self.match_count = match_count
 
 
 def parse_model_patch(patch: str, guard: SafetyGuard) -> tuple[_Operation, ...]:
@@ -180,16 +197,133 @@ def _source_lines(content: bytes) -> tuple[list[str], str, bool]:
 
 
 def _find_unique(lines: list[str], block: tuple[str, ...], start: int) -> int:
-    matches = [
-        index
-        for index in range(start, len(lines) - len(block) + 1)
-        if tuple(lines[index : index + len(block)]) == block
-    ]
-    if not matches:
-        raise ValueError("patch context was not found in the current file")
-    if len(matches) != 1:
-        raise ValueError("ambiguous patch context; provide a larger unique hunk")
-    return matches[0]
+    positions: list[int] = []
+    match_count = 0
+    for index in range(start, len(lines) - len(block) + 1):
+        if tuple(lines[index : index + len(block)]) != block:
+            continue
+        match_count += 1
+        if len(positions) < MAX_PATCH_FEEDBACK_MATCHES + 1:
+            positions.append(index)
+    if match_count == 0:
+        raise _PatchContextMismatch("patch context was not found in the current file")
+    if match_count != 1:
+        raise _PatchContextMismatch(
+            "ambiguous patch context; provide a larger unique hunk",
+            tuple(positions),
+            match_count=match_count,
+        )
+    return positions[0]
+
+
+def _verified_hunk_line_refs(
+    source_lines: list[str], old_lines: tuple[str, ...], start: int
+) -> str:
+    """Return bounded exact single-line landmarks without echoing source text."""
+
+    candidate_lines = tuple(
+        dict.fromkeys(line for line in old_lines[:32] if line)
+    )
+    if not candidate_lines:
+        return "verified_hunk_line_refs=none"
+    candidates = set(candidate_lines)
+    found: dict[str, tuple[int, int]] = {}
+    for line_number, source_line in enumerate(source_lines[start:], start=start + 1):
+        if source_line not in candidates:
+            continue
+        count, first = found.get(source_line, (0, line_number))
+        found[source_line] = (count + 1, first)
+
+    references: list[str] = []
+    for hunk_line, old_line in enumerate(old_lines, start=1):
+        count_and_line = found.get(old_line)
+        if count_and_line is None or count_and_line[0] != 1:
+            continue
+        references.append(f"hunk:{hunk_line}->file:{count_and_line[1]}")
+        if len(references) == MAX_PATCH_FEEDBACK_LINE_REFS:
+            break
+    if not references:
+        return "verified_hunk_line_refs=none"
+    return "verified_hunk_line_refs=" + ",".join(references)
+
+
+def _format_match_positions(positions: tuple[int, ...], match_count: int) -> str:
+    visible = positions[:MAX_PATCH_FEEDBACK_MATCHES]
+    formatted = ",".join(str(position + 1) for position in visible)
+    omitted = match_count - len(visible)
+    suffix = f",+{omitted} more" if omitted else ""
+    return (
+        f"verified_exact_hunk_matches={match_count}"
+        f";exact_match_start_lines={formatted}{suffix}"
+    )
+
+
+def _verified_anchor_locations(
+    source_lines: list[str], anchor: str, start: int
+) -> str:
+    positions: list[int] = []
+    match_count = 0
+    for index in range(start, len(source_lines)):
+        if source_lines[index].strip() != anchor:
+            continue
+        match_count += 1
+        if len(positions) < MAX_PATCH_FEEDBACK_MATCHES + 1:
+            positions.append(index)
+    if match_count == 0:
+        return "verified_anchor_locations=none"
+    visible = positions[:MAX_PATCH_FEEDBACK_MATCHES]
+    formatted = ",".join(str(position + 1) for position in visible)
+    omitted = match_count - len(visible)
+    suffix = f",+{omitted} more" if omitted else ""
+    return (
+        f"verified_anchor_matches={match_count};"
+        f"exact_anchor_lines={formatted}{suffix}"
+    )
+
+
+def _format_hunk_failure(
+    reason: ValueError,
+    *,
+    path: str,
+    hunk_index: int,
+    content: bytes,
+    source_lines: list[str],
+    chunk: _Chunk,
+    cursor: int,
+) -> str:
+    path_label = path
+    path_truncated = len(path_label) > MAX_PATCH_FEEDBACK_PATH_CHARS
+    if path_truncated:
+        path_label = path_label[: MAX_PATCH_FEEDBACK_PATH_CHARS - 3] + "..."
+    path_suffix = " (path display truncated)" if path_truncated else ""
+    read_target = (
+        "the exact path from the failed Update File header"
+        if path_truncated
+        else path_label
+    )
+    revision = hashlib.sha256(content).hexdigest()
+    if isinstance(reason, _PatchContextMismatch) and reason.positions:
+        location = _format_match_positions(reason.positions, reason.match_count)
+    elif chunk.anchor is not None:
+        location = _verified_anchor_locations(source_lines, chunk.anchor, cursor)
+    else:
+        location = _verified_hunk_line_refs(source_lines, chunk.old, cursor)
+    detail = str(reason)
+    if "ambiguous" in detail:
+        next_step = (
+            f"Read {read_target} and add exact context until only one match remains; "
+            "do not choose among matches automatically."
+        )
+    else:
+        next_step = (
+            f"Read {read_target} and rebuild this hunk with exact current context; "
+            "Do not retry the unchanged patch."
+        )
+    return (
+        f"{path_label}{path_suffix}: hunk {hunk_index}: {detail}; "
+        f"current_sha256={revision}; current_file_lines={len(source_lines)}; "
+        f"{location}. {next_step}"
+    )
 
 
 def _updated_content(content: bytes, chunks: tuple[_Chunk, ...], *, path: str) -> str:
@@ -222,7 +356,17 @@ def _updated_content(content: bytes, chunks: tuple[_Chunk, ...], *, path: str) -
             else:
                 raise ValueError("unanchored insertion; include an @@ anchor or context")
         except ValueError as exc:
-            raise ValueError(f"{path}: hunk {hunk_index}: {exc}") from exc
+            raise ValueError(
+                _format_hunk_failure(
+                    exc,
+                    path=path,
+                    hunk_index=hunk_index,
+                    content=content,
+                    source_lines=source_lines,
+                    chunk=chunk,
+                    cursor=cursor,
+                )
+            ) from exc
         result.extend(source_lines[cursor:position])
         result.extend(chunk.new)
         cursor = position + len(chunk.old)

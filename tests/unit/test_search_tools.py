@@ -373,7 +373,10 @@ async def test_workspace_scans_allow_other_tasks_to_run(
 
     assert result.success is True
     assert result.truncated is False
-    assert result.output == ""
+    if tool_type is SearchTextTool:
+        assert "No matches found" in result.output
+    else:
+        assert result.output == ""
     assert progressed_during_scan
 
 
@@ -513,6 +516,412 @@ async def test_search_text_opt_in_context_merges_adjacent_match_windows(tmp_path
     assert limited.truncated is True
     default = await tool.run(pattern="needle", fixed_strings=True)
     assert default.output == "app.py:3:needle first\napp.py:5:needle second"
+
+
+def _parse_grouped_search_output(output: str):
+    groups = []
+    current = None
+    header_pattern = re.compile(r"^(.*) \(lines (\d+)-(\d+)\)$")
+    row_pattern = re.compile(r"^(> |  )(\d+): (.*)$")
+    for line in output.splitlines():
+        header = header_pattern.match(line)
+        if header:
+            if current is not None:
+                groups.append(current)
+            current = {
+                "path": header.group(1),
+                "start": int(header.group(2)),
+                "end": int(header.group(3)),
+                "rows": [],
+            }
+            continue
+        if line == "...":
+            if current is not None:
+                groups.append(current)
+                current = None
+            continue
+        row = row_pattern.match(line)
+        if row and current is not None:
+            current["rows"].append(
+                (int(row.group(2)), row.group(1) == "> ", row.group(3))
+            )
+    if current is not None:
+        groups.append(current)
+
+    matches = []
+    for group in groups:
+        rows = group["rows"]
+        assert rows, "range headers must have at least one numbered row"
+        assert any(is_match for _, is_match, _ in rows), (
+            "range blocks must contain a matching line"
+        )
+        line_numbers = [line_number for line_number, _, _ in rows]
+        assert line_numbers == list(range(group["start"], group["end"] + 1))
+        matches.extend(
+            (group["path"], line_number)
+            for line_number, is_match, _ in rows
+            if is_match
+        )
+    return matches, groups
+
+
+def _make_grouped_fixture(root: Path, shape: str) -> list[tuple[str, int]]:
+    if shape == "compact-repeated-names":
+        expected = []
+        for module in (
+            "packages/runtime/providers/cache/backend.py",
+            "packages/runtime/providers/cache/restore.py",
+            "packages/runtime/providers/cache/warmup.py",
+        ):
+            path = root / module
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(
+                "# repeated-name fixture\n"
+                "class CacheStore:\n"
+                "    def read(self): return None\n"
+                "def create_cache(): return CacheStore()\n"
+                "# unrelated separator\n"
+                "def restore_cache(store): return CacheStore()\n"
+                "# trailing comment\n",
+                encoding="utf-8",
+            )
+            expected.extend((module, line) for line in (2, 4, 6))
+        return expected
+
+    if shape == "overlapping-context":
+        relative = "src/deeply/nested/storage/backends/cache/provider/store.py"
+        path = root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        lines = ["# overlapping context fixture"]
+        for index in range(15):
+            lines.extend(
+                (
+                    f"def use_store_{index}():",
+                    f"    return CacheStore({index})",
+                    f"    # context for repeated CacheStore name {index}",
+                )
+            )
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return [
+            (relative, line)
+            for index in range(15)
+            for line in (3 + 3 * index, 4 + 3 * index)
+        ]
+
+    raise AssertionError(f"unknown fixture shape: {shape}")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("shape", "capture_cap"),
+    [
+        ("compact-repeated-names", 1_024),
+        ("overlapping-context", 2_922),
+    ],
+)
+async def test_search_text_grouped_context_preserves_fixture_matches_and_budget(
+    tmp_path,
+    shape: str,
+    capture_cap: int,
+) -> None:
+    expected = _make_grouped_fixture(tmp_path, shape)
+    tool = SearchTextTool(SafetyGuard(tmp_path))
+    common = {
+        "pattern": "CacheStore",
+        "fixed_strings": True,
+        "context_lines": 2,
+        "max_output_bytes": 2_000_000,
+    }
+
+    legacy = await tool.run(**common)
+    grouped = await tool.run(**common, grouped_context=True)
+    limited = await tool.run(
+        **{**common, "max_output_bytes": capture_cap},
+        grouped_context=True,
+    )
+
+    grouped_matches, groups = _parse_grouped_search_output(grouped.output)
+    limited_matches, limited_groups = _parse_grouped_search_output(limited.output)
+    assert grouped.success and not grouped.truncated
+    assert grouped_matches == expected
+    assert limited.success and not limited.truncated
+    assert limited_matches == expected
+    assert all(
+        any(is_match for _, is_match, _ in block["rows"])
+        for block in groups + limited_groups
+    )
+    assert len(grouped.output.encode("utf-8")) <= int(
+        len(legacy.output.encode("utf-8")) * 0.9
+    )
+
+
+@pytest.mark.asyncio
+async def test_search_text_grouped_context_sheds_context_before_provider_drops_hits(
+    tmp_path,
+) -> None:
+    source = tmp_path / "deep" / "cache.py"
+    source.parent.mkdir()
+    lines = []
+    for index in range(6):
+        lines.extend(
+            (
+                "x" * 300,
+                f"needle_{index} = {index}",
+                "y" * 300,
+            )
+        )
+    source.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    budget_inputs = []
+
+    def accepts(result) -> bool:
+        budget_inputs.append(result.output)
+        return len(result.output.encode("utf-8")) <= 1_200
+
+    budget = ToolOutputBudget(
+        accepts=accepts,
+        can_dispatch=True,
+    )
+    tool = SearchTextTool(SafetyGuard(tmp_path))
+
+    with tool.output_budget_context(budget):
+        result = await tool.run(
+            pattern="needle_",
+            fixed_strings=True,
+            context_lines=1,
+            grouped_context=True,
+            max_output_bytes=20_000,
+        )
+
+    matches, groups = _parse_grouped_search_output(result.output)
+    assert result.success and result.truncated
+    assert matches == [("deep/cache.py", line) for line in (2, 5, 8, 11, 14, 17)]
+    assert "context omitted" in result.output
+    assert all(len(block["rows"]) == 1 for block in groups)
+    assert len(result.output.encode("utf-8")) <= 1_200
+    assert len(budget_inputs[0].encode("utf-8")) > 1_200
+    assert "  1: " in budget_inputs[0]
+
+
+@pytest.mark.asyncio
+async def test_search_text_grouped_context_sheds_context_before_capture_drops_hits(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (tmp_path / "deep").mkdir()
+    (tmp_path / "deep" / "cache.py").write_text(
+        "x" * 510 + "\nneedle\n" + "y" * 510 + "\n", encoding="utf-8"
+    )
+    monkeypatch.setattr(search_module, "MAX_SEARCH_CONTEXT_CAPTURE_BYTES", 600)
+
+    result = await SearchTextTool(SafetyGuard(tmp_path)).run(
+        pattern="needle",
+        fixed_strings=True,
+        context_lines=1,
+        grouped_context=True,
+        max_output_bytes=1_024,
+    )
+
+    matches, groups = _parse_grouped_search_output(result.output)
+    assert matches == [("deep/cache.py", 2)]
+    assert len(groups) == 1 and len(groups[0]["rows"]) == 1
+    assert "context omitted" in result.output
+    assert "search output capture truncated" not in result.output
+    assert result.truncated
+    assert len(result.output.encode("utf-8")) <= 600
+
+
+@pytest.mark.asyncio
+async def test_grouped_hit_only_search_uses_explicit_output_cap_above_context_cap(
+    tmp_path,
+) -> None:
+    (tmp_path / "large.py").write_text(
+        "".join(f"needle_{index} " + "x" * 8_000 + "\n" for index in range(4)),
+        encoding="utf-8",
+    )
+
+    result = await SearchTextTool(SafetyGuard(tmp_path)).run(
+        pattern="needle_",
+        fixed_strings=True,
+        context_lines=0,
+        grouped_context=True,
+        max_output_bytes=100_000,
+    )
+
+    matches, _ = _parse_grouped_search_output(result.output)
+    assert matches == [("large.py", line) for line in range(1, 5)]
+    assert len(result.output.encode("utf-8")) > 24_576
+    assert result.truncated is False
+
+
+@pytest.mark.asyncio
+async def test_grouped_hit_only_capture_does_not_claim_context_was_omitted(
+    tmp_path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (tmp_path / "all_hits.py").write_text(
+        "".join(f"needle_{index} " + "x" * 350 + "\n" for index in range(3)),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(search_module, "MAX_SEARCH_CONTEXT_CAPTURE_BYTES", 1_024)
+
+    result = await SearchTextTool(SafetyGuard(tmp_path)).run(
+        pattern="needle_",
+        fixed_strings=True,
+        context_lines=1,
+        grouped_context=True,
+        max_output_bytes=1_024,
+    )
+
+    matches, groups = _parse_grouped_search_output(result.output)
+    assert matches == [("all_hits.py", 1), ("all_hits.py", 2)]
+    assert all(all(is_match for _, is_match, _ in group["rows"]) for group in groups)
+    assert "search output capture truncated" in result.output
+    assert "context omitted" not in result.output
+    assert result.truncated is True
+
+
+@pytest.mark.asyncio
+async def test_grouped_provider_fallback_does_not_claim_absent_context_was_dropped(
+    tmp_path,
+) -> None:
+    (tmp_path / "all_hits.py").write_text(
+        "".join(f"needle_{index:02d} = {index}\n" for index in range(40)),
+        encoding="utf-8",
+    )
+    tool = SearchTextTool(SafetyGuard(tmp_path))
+    arguments = {
+        "pattern": "needle_",
+        "fixed_strings": True,
+        "context_lines": 1,
+        "grouped_context": True,
+        "max_output_bytes": 100_000,
+    }
+    full = await tool.run(**arguments)
+    expected = [("all_hits.py", line) for line in range(1, 41)]
+    assert _parse_grouped_search_output(full.output)[0] == expected
+
+    limit = len(full.output.encode("utf-8")) - 1
+    budget = ToolOutputBudget(
+        accepts=lambda result: len(result.output.encode("utf-8")) <= limit,
+        can_dispatch=True,
+    )
+    with tool.output_budget_context(budget):
+        result = await tool.run(**arguments)
+
+    matches, groups = _parse_grouped_search_output(result.output)
+    assert result.success and result.truncated
+    assert matches == expected[: len(matches)]
+    assert 0 < len(matches) < len(expected)
+    assert all(all(is_match for _, is_match, _ in group["rows"]) for group in groups)
+    assert "context budget truncated search results" in result.output
+    assert "context omitted" not in result.output
+
+
+@pytest.mark.asyncio
+async def test_grouped_hit_collection_counts_path_storage_once_per_file(tmp_path) -> None:
+    directory_names = ["d" * 140 for _ in range(20)]
+    relative = "/".join([*directory_names, "cache.py"])
+    source = tmp_path / relative
+    source.parent.mkdir(parents=True)
+    source.write_text("needle\n" * 700, encoding="utf-8")
+
+    result = await SearchTextTool(SafetyGuard(tmp_path)).run(
+        pattern="needle",
+        fixed_strings=True,
+        context_lines=0,
+        grouped_context=True,
+        max_results=1_000,
+        max_output_bytes=100_000,
+    )
+
+    matches, groups = _parse_grouped_search_output(result.output)
+    assert matches == [(relative, line) for line in range(1, 701)]
+    assert len(groups) == 1
+    assert result.truncated is False
+
+
+@pytest.mark.asyncio
+async def test_search_text_grouped_context_zero_matches_and_incompatible_files_only(
+    tmp_path,
+) -> None:
+    (tmp_path / "app.py").write_text("no matching content\n", encoding="utf-8")
+    tool = SearchTextTool(SafetyGuard(tmp_path))
+    grouped_schema = tool.json_schema()["properties"]["grouped_context"]
+
+    assert grouped_schema["type"] == "boolean"
+    assert "default" not in grouped_schema
+
+    zero = await tool.run(
+        pattern="missing",
+        fixed_strings=True,
+        context_lines=0,
+        grouped_context=True,
+    )
+    incompatible = await tool.run(
+        pattern="missing",
+        fixed_strings=True,
+        files_only=True,
+        grouped_context=True,
+    )
+
+    assert zero.success and "No matches found" in zero.output and not zero.truncated
+    assert incompatible.success is False
+    assert incompatible.output == ""
+    assert "grouped_context" in (incompatible.error or "")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("grouped_context", [False, True])
+async def test_search_text_zero_matches_returns_bounded_correction_hint(
+    tmp_path, grouped_context: bool
+) -> None:
+    (tmp_path / "app.py").write_text("existing marker\n", encoding="utf-8")
+
+    result = await SearchTextTool(SafetyGuard(tmp_path)).run(
+        pattern="missing-marker",
+        fixed_strings=True,
+        directory_path=".",
+        grouped_context=grouped_context,
+    )
+
+    assert result.success is True
+    assert result.error is None
+    assert result.truncated is False
+    assert "No matches found" in result.output
+    assert "adjust the pattern or directory_path" in result.output
+    assert len(result.output.encode("utf-8")) <= 120
+
+
+@pytest.mark.asyncio
+async def test_search_text_grouped_context_keeps_regex_and_literal_matching(
+    tmp_path,
+) -> None:
+    (tmp_path / "app.py").write_text(
+        "CacheStore CacheClient\nCacheStore\nCacheClient\n", encoding="utf-8"
+    )
+    tool = SearchTextTool(SafetyGuard(tmp_path))
+
+    regex_result = await tool.run(
+        pattern="Cache(Store|Client)",
+        context_lines=0,
+        grouped_context=True,
+    )
+    literal_result = await tool.run(
+        pattern="CacheStore",
+        fixed_strings=True,
+        context_lines=0,
+        grouped_context=True,
+    )
+
+    assert _parse_grouped_search_output(regex_result.output)[0] == [
+        ("app.py", 1),
+        ("app.py", 2),
+        ("app.py", 3),
+    ]
+    assert _parse_grouped_search_output(literal_result.output)[0] == [
+        ("app.py", 1),
+        ("app.py", 2),
+    ]
 
 
 @pytest.mark.asyncio
@@ -796,6 +1205,18 @@ async def test_search_text_late_match_keeps_relevant_excerpt_and_column(tmp_path
     assert "[line preview truncated]" in result.output
     assert len(result.output.encode("utf-8")) < 10_000
 
+    grouped = await SearchTextTool(SafetyGuard(tmp_path)).run(
+        pattern="NEEDLE",
+        fixed_strings=True,
+        context_lines=0,
+        grouped_context=True,
+    )
+    assert grouped.success is True
+    assert grouped.truncated is True
+    assert grouped.output.startswith("minified.js (lines 1-1)\n> 1: [column 29921] ")
+    assert "NEEDLE" in grouped.output
+    assert "[line preview truncated]" in grouped.output
+
 
 @pytest.mark.asyncio
 async def test_search_text_accepts_a_single_file_path(tmp_path) -> None:
@@ -828,7 +1249,7 @@ async def test_search_text_accepts_a_single_file_path(tmp_path) -> None:
     assert basename.output == result.output
     assert project_relative.output == result.output
     assert excluded.success is True
-    assert excluded.output == ""
+    assert "No matches found" in excluded.output
 
 
 @pytest.mark.parametrize(
@@ -1466,17 +1887,26 @@ async def test_narrow_source_search_skips_nested_generated_but_explicit_root_can
     source_search = await SearchTextTool(guard).run(
         pattern="real_source_marker", fixed_strings=True, directory_path="src"
     )
+    grouped_source_search = await SearchTextTool(guard).run(
+        pattern="real_source_marker",
+        fixed_strings=True,
+        directory_path="src",
+        grouped_context=True,
+    )
     absent = await SearchTextTool(guard).run(
         pattern="generated_only_marker", fixed_strings=True,
         directory_path="src",
     )
-    for result in (paths, source_search, absent):
+    for result in (paths, source_search, grouped_source_search, absent):
         assert result.success and not result.truncated
         assert "shadow.py" not in result.output
         assert "workspace search incomplete" not in result.output
         assert f"skipped generated directories: {generated_name}" in result.output
     assert "src/pkg/actual.py" in paths.output
     assert "src/pkg/actual.py:1:real_source_marker" in source_search.output
+    assert _parse_grouped_search_output(grouped_source_search.output)[0] == [
+        ("src/pkg/actual.py", 1)
+    ]
 
     # Explicitly requesting the generated subtree opts into its contents.
     relative_generated = f"src/pkg/{generated_name}"
@@ -1488,9 +1918,19 @@ async def test_narrow_source_search_skips_nested_generated_but_explicit_root_can
         directory_path=relative_generated,
         glob="**/*.py",
     )
+    explicit_grouped_text = await SearchTextTool(guard).run(
+        pattern="generated_only_marker",
+        fixed_strings=True,
+        directory_path=relative_generated,
+        glob="**/*.py",
+        grouped_context=True,
+    )
     assert explicit_glob.success and "shadow.py" in explicit_glob.output
     assert "explicit.py" in explicit_glob.output
     assert explicit_text.success and "shadow.py:1:generated_only_marker" in explicit_text.output
+    assert _parse_grouped_search_output(explicit_grouped_text.output)[0] == [
+        ("src/pkg/" + generated_name + "/nested/shadow.py", 1)
+    ]
 
 
 @pytest.mark.asyncio

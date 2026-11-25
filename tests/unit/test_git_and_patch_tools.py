@@ -2527,3 +2527,367 @@ async def test_model_patch_names_failed_file_and_hunk_without_mutation(
     assert missing not in error
     assert first.read_text() == "first = 1\n"
     assert second.read_text() == original
+
+
+@pytest.mark.asyncio
+async def test_precision_edit_journeys_preserve_exact_source_and_recover_safely(
+    tmp_path: Path,
+) -> None:
+    import hashlib
+    import re
+    import shlex
+    import stat
+    import sys
+
+    from ash.tools.command import RunCommandTool
+    from ash.tools.filesystem import ReadFileTool, ReplaceFileContentTool
+
+    guard = SafetyGuard(tmp_path)
+    reader = ReadFileTool(guard)
+    replacer = ReplaceFileContentTool(guard)
+    patcher = ApplyPatchTool(guard)
+    runner = RunCommandTool(guard)
+
+    repeated_path = tmp_path / "repeated.py"
+    repeated_before = (
+        'def first():\r\n    return "café"\r\n\r\n'
+        'def second():\r\n    return "café"\r\n'
+    ).encode("utf-8")
+    repeated_path.write_bytes(repeated_before)
+
+    repeated_read = await reader.run(file_path="repeated.py")
+    assert repeated_read.success
+    repeated_mode = stat.S_IMODE(repeated_path.stat().st_mode)
+    repeated_digest_match = re.search(r"sha256=([0-9a-f]{64})", repeated_read.output)
+    assert repeated_digest_match is not None
+    repeated_digest = repeated_digest_match.group(1)
+    assert "2:     return \"café\"" in repeated_read.output
+    assert "5:     return \"café\"" in repeated_read.output
+
+    ambiguous = await replacer.run(
+        file_path="repeated.py",
+        target_content='    return "café"',
+        replacement_content='    return "taxed"',
+        expected_sha256=repeated_digest,
+    )
+    assert not ambiguous.success
+    assert "multiple full-line blocks" in (ambiguous.error or "")
+    assert "Specify both start_line and end_line" in (ambiguous.error or "")
+    assert repeated_path.read_bytes() == repeated_before
+
+    precise = await replacer.run(
+        file_path="repeated.py",
+        start_line=2,
+        end_line=2,
+        target_content='    return "café"',
+        replacement_content='    return "taxed"',
+        expected_sha256=repeated_digest,
+    )
+    repeated_after = (
+        'def first():\r\n    return "taxed"\r\n\r\n'
+        'def second():\r\n    return "café"\r\n'
+    ).encode("utf-8")
+    assert precise.success, precise.error
+    assert repeated_path.read_bytes() == repeated_after
+    assert stat.S_IMODE(repeated_path.stat().st_mode) == repeated_mode
+    assert hashlib.sha256(repeated_before).hexdigest() != hashlib.sha256(
+        repeated_after
+    ).hexdigest()
+    repeated_script = (
+        "from pathlib import Path; scope = {}; source = Path('repeated.py').read_text(); "
+        "exec(compile(source, 'repeated.py', 'exec'), scope); "
+        "assert scope['first']() == 'taxed'; assert scope['second']() == 'café'"
+    )
+    repeated_check = await runner.run(
+        command_line=f"{shlex.quote(sys.executable)} -c {shlex.quote(repeated_script)}",
+        cwd=".",
+    )
+    assert repeated_check.success, repeated_check.error
+
+    shifted_path = tmp_path / "shifted.py"
+    shifted_before = 'def render():\n\tlabel = "café"\n\treturn label\n'.encode(
+        "utf-8"
+    )
+    shifted_path.write_bytes(shifted_before)
+    shifted_read = await reader.run(file_path="shifted.py")
+    assert shifted_read.success
+    assert "3: \treturn label" in shifted_read.output
+    shifted_mode = stat.S_IMODE(shifted_path.stat().st_mode)
+    shifted_digest_match = re.search(r"sha256=([0-9a-f]{64})", shifted_read.output)
+    assert shifted_digest_match is not None
+    shifted_digest = shifted_digest_match.group(1)
+
+    external_source = b"# external editor inserted this line\n" + shifted_before
+    shifted_path.write_bytes(external_source)
+    stale = await replacer.run(
+        file_path="shifted.py",
+        start_line=3,
+        end_line=3,
+        target_content="\treturn label",
+        replacement_content="\treturn label + '!'",
+        expected_sha256=shifted_digest,
+    )
+    assert not stale.success
+    assert "File changed since it was read" in (stale.error or "")
+    assert shifted_path.read_bytes() == external_source
+
+    refreshed = await reader.run(file_path="shifted.py")
+    assert refreshed.success
+    assert "4: \treturn label" in refreshed.output
+    refreshed_digest_match = re.search(r"sha256=([0-9a-f]{64})", refreshed.output)
+    assert refreshed_digest_match is not None
+    refreshed_digest = refreshed_digest_match.group(1)
+    assert refreshed_digest != shifted_digest
+    model_patch = (
+        "*** Begin Patch\n*** Update File: shifted.py\n@@ def render():\n"
+        '-\treturn label\n+\treturn label + "✓"\n*** End Patch'
+    )
+    corrected = await patcher.run(patch=model_patch)
+    shifted_after = (
+        b"# external editor inserted this line\n"
+        b"def render():\n\tlabel = \"caf\xc3\xa9\"\n\treturn label + \"\xe2\x9c\x93\"\n"
+    )
+    assert corrected.success, corrected.error
+    assert shifted_path.read_bytes() == shifted_after
+    assert stat.S_IMODE(shifted_path.stat().st_mode) == shifted_mode
+    assert hashlib.sha256(external_source).hexdigest() != hashlib.sha256(
+        shifted_after
+    ).hexdigest()
+    shifted_script = (
+        "from pathlib import Path; scope = {}; source = Path('shifted.py').read_text(); "
+        "exec(compile(source, 'shifted.py', 'exec'), scope); "
+        "assert scope['render']() == 'café✓'"
+    )
+    shifted_check = await runner.run(
+        command_line=f"{shlex.quote(sys.executable)} -c {shlex.quote(shifted_script)}",
+        cwd=".",
+    )
+    assert shifted_check.success, shifted_check.error
+
+
+@pytest.mark.asyncio
+async def test_model_patch_hunk_errors_report_bounded_verified_recovery_info(
+    tmp_path: Path,
+) -> None:
+    import hashlib
+
+    stale_path = tmp_path / "stale.py"
+    stale_source = (
+        "def render(item):\n"
+        "    return item.name\n"
+        "# unrelated diagnostic marker\n"
+    )
+    stale_path.write_text(stale_source, encoding="utf-8")
+    stale_before = stale_path.read_bytes()
+    stale = await ApplyPatchTool(SafetyGuard(tmp_path)).run(
+        patch=(
+            "*** Begin Patch\n*** Update File: stale.py\n@@\n"
+            " def render(item):\n-    return item.label\n"
+            "+    return item.name.upper()\n*** End Patch"
+        )
+    )
+    stale_error = stale.error or ""
+    assert not stale.success
+    assert stale.outcome is ToolExecutionOutcome.COMPLETED
+    assert "stale.py: hunk 1" in stale_error
+    assert f"current_sha256={hashlib.sha256(stale_before).hexdigest()}" in stale_error
+    assert "current_file_lines=3" in stale_error
+    assert "verified_hunk_line_refs=hunk:1->file:1" in stale_error
+    assert "Read stale.py and rebuild this hunk" in stale_error
+    assert "Do not retry the unchanged patch" in stale_error
+    assert "unrelated diagnostic marker" not in stale_error
+    assert len(stale_error.encode("utf-8")) < 800
+    assert stale_path.read_bytes() == stale_before
+
+    repeated_path = tmp_path / "repeated.py"
+    repeated_source = (
+        "def first():\n    return 1\n\n"
+        "def second():\n    return 1\n"
+    )
+    repeated_path.write_text(repeated_source, encoding="utf-8")
+    repeated_before = repeated_path.read_bytes()
+    repeated = await ApplyPatchTool(SafetyGuard(tmp_path)).run(
+        patch=(
+            "*** Begin Patch\n*** Update File: repeated.py\n@@\n"
+            "-    return 1\n+    return 2\n*** End Patch"
+        )
+    )
+    repeated_error = repeated.error or ""
+    assert not repeated.success
+    assert repeated.outcome is ToolExecutionOutcome.COMPLETED
+    assert "repeated.py: hunk 1" in repeated_error
+    assert "verified_exact_hunk_matches=2" in repeated_error
+    assert "exact_match_start_lines=2,5" in repeated_error
+    assert "do not choose among matches automatically" in repeated_error
+    assert "def first" not in repeated_error
+    assert "def second" not in repeated_error
+    assert len(repeated_error.encode("utf-8")) < 800
+    assert repeated_path.read_bytes() == repeated_before
+
+    many_repeated = tmp_path / "many-repeated.py"
+    many_repeated_source = "".join("value = 1\n" for _ in range(12))
+    many_repeated.write_text(many_repeated_source, encoding="utf-8")
+    many_repeated_before = many_repeated.read_bytes()
+    many_ambiguous = await ApplyPatchTool(SafetyGuard(tmp_path)).run(
+        patch=(
+            "*** Begin Patch\n*** Update File: many-repeated.py\n@@\n"
+            "-value = 1\n+value = 2\n*** End Patch"
+        )
+    )
+    many_error = many_ambiguous.error or ""
+    assert not many_ambiguous.success
+    assert "verified_exact_hunk_matches=12" in many_error
+    assert "exact_match_start_lines=1,2,3,4,+8 more" in many_error
+    assert len(many_error.encode("utf-8")) < 800
+    assert many_repeated.read_bytes() == many_repeated_before
+
+
+@pytest.mark.asyncio
+async def test_coding_loop_repairs_stale_model_patch_from_bounded_feedback(
+    tmp_path: Path,
+) -> None:
+    import hashlib
+    import io
+
+    from ash.core.loop import AshLoop
+    from ash.core.session import SessionStore
+    from ash.providers.base import ProviderABC, StreamChunk
+    from ash.providers.capabilities import ProviderCapabilities
+    from ash.tools.filesystem import ReadFileTool
+    from ash.ui.headless import HeadlessUI
+
+    target = tmp_path / "module.py"
+    current_source = "def render(item):\n    return item.name\n"
+    target.write_text(current_source, encoding="utf-8")
+    untouched = tmp_path / "untouched.txt"
+    untouched.write_text("sentinel\n", encoding="utf-8")
+    untouched_before = untouched.read_bytes()
+    current_digest = hashlib.sha256(target.read_bytes()).hexdigest()
+    stale_patch = (
+        "*** Begin Patch\n*** Update File: module.py\n@@\n"
+        " def render(item):\n-    return item.label\n"
+        "+    return item.name.upper()\n*** End Patch"
+    )
+    corrected_patch = (
+        "*** Begin Patch\n*** Update File: module.py\n@@\n"
+        " def render(item):\n-    return item.name\n"
+        "+    return item.name.upper()\n*** End Patch"
+    )
+
+    class RepairFromBoundedPatchFeedback(ProviderABC):
+        model_name = "bounded-patch-repair"
+        _ash_declared_capabilities = ProviderCapabilities(native_tools=True)
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def count_tokens(self, text):
+            return max(1, len(str(text)) // 4)
+
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            del temperature, tools
+            self.calls += 1
+            history = repr(messages)
+            if self.calls == 1:
+                call = {
+                    "id": "stale-patch",
+                    "name": "apply_patch",
+                    "arguments": {"patch": stale_patch},
+                }
+            elif self.calls == 2:
+                assert "current_sha256=" + current_digest in history
+                assert "Read module.py and rebuild this hunk" in history
+                assert "Do not retry the unchanged patch" in history
+                assert target.read_text(encoding="utf-8") == current_source
+                call = {
+                    "id": "refresh-module",
+                    "name": "read_file",
+                    "arguments": {"file_path": "module.py"},
+                }
+            elif self.calls == 3:
+                assert current_digest in history
+                assert "2:     return item.name" in history
+                call = {
+                    "id": "repair-module",
+                    "name": "apply_patch",
+                    "arguments": {"patch": corrected_patch},
+                }
+            else:
+                assert self.calls == 4
+                yield StreamChunk(content="Module safely repaired", is_done=True)
+                return
+            yield StreamChunk(is_done=True, native_tool_calls=[call])
+
+    async def approve(_name: str, _arguments: dict[str, object]) -> bool:
+        return True
+
+    guard = SafetyGuard(tmp_path)
+    store = SessionStore(tmp_path / "patch-repair-loop.db")
+    provider = RepairFromBoundedPatchFeedback()
+    loop = AshLoop(
+        store,
+        provider,
+        guard,
+        HeadlessUI(output_format="stream-json", stream=io.StringIO()),
+        tmp_path,
+        tools={
+            "apply_patch": ApplyPatchTool(guard),
+            "read_file": ReadFileTool(guard),
+        },
+        on_tool_approval=approve,
+    )
+    try:
+        session = await loop.start_session()
+        assert await loop.run_turn("Repair the module safely") == "Module safely repaired"
+        calls = store.load_session(session.session_id).tool_calls
+        assert [call.tool_name for call in calls] == [
+            "apply_patch",
+            "read_file",
+            "apply_patch",
+        ]
+        assert calls[0].success is False
+        assert "Do not retry the unchanged patch" in (calls[0].error or "")
+        assert "unrelated diagnostic marker" not in (calls[0].error or "")
+        assert calls[1].success is True
+        assert calls[2].success is True
+        assert provider.calls == 4
+        assert target.read_text(encoding="utf-8") == (
+            "def render(item):\n    return item.name.upper()\n"
+        )
+        assert untouched.read_bytes() == untouched_before
+        assert store.verify_audit_log(session.session_id) == []
+    finally:
+        await loop.aclose()
+
+
+
+
+@pytest.mark.asyncio
+async def test_model_patch_feedback_uses_original_header_for_long_path(
+    tmp_path: Path,
+) -> None:
+    from ash.tools.patch import ApplyPatchTool
+
+    guard = SafetyGuard(tmp_path)
+    path_parts = ("directory_" + "x" * 90,) * 3
+    relative_path = Path(*path_parts) / "target.py"
+    target = tmp_path / relative_path
+    target.parent.mkdir(parents=True)
+    original = b"def render():\n    return 1\n"
+    target.write_bytes(original)
+    result = await ApplyPatchTool(guard).run(
+        patch=(
+            "*** Begin Patch\n"
+            f"*** Update File: {relative_path.as_posix()}\n@@\n"
+            " def render():\n-    return 2\n+    return 3\n"
+            "*** End Patch"
+        )
+    )
+
+    error = result.error or ""
+    assert not result.success
+    assert "path display truncated" in error
+    assert "Read the exact path from the failed Update File header" in error
+    assert f"Read {error.split(': hunk 1:', 1)[0]}" not in error
+    assert len(error.encode("utf-8")) < 800
+    assert target.read_bytes() == original

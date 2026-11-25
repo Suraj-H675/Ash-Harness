@@ -3552,6 +3552,45 @@ async def test_run_command_workspace_path_requires_explicit_opt_in(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("pty", [False, True])
+async def test_command_timeout_retains_bounded_redacted_partial_output(
+    project_root: Path, guard: SafetyGuard, pty: bool
+) -> None:
+    canary = "SYNTHETIC_TASK21_CANARY"
+    script = (
+        "import sys,time;"
+        "sys.stdout.write('early-before-timeout\\n'+'noise\\n'*5000+"
+        "'src/timeout_case.py:42:1: error: late diagnostic\\n');"
+        "sys.stdout.flush();"
+        f"sys.stderr.write('token={canary}\\n');sys.stderr.flush();"
+        "time.sleep(30)"
+    )
+    command = f"{shlex.quote(sys.executable)} -c {shlex.quote(script)}"
+    result = await RunCommandTool(guard, project_root=project_root).run(
+        command_line=command,
+        timeout_seconds=1,
+        pty=pty,
+    )
+
+    assert not result.success
+    assert result.error == "Error: Command timed out after 1 seconds."
+    assert result.outcome is ToolExecutionOutcome.UNKNOWN
+    assert result.exit_code is None
+    assert "Partial output before timeout" in result.output
+    assert "early-before-timeout" not in result.output
+    assert "late diagnostic" in result.output
+    assert "Earlier output omitted" in result.output
+    assert "[REDACTED]" in result.output
+    assert any(
+        item["path"] == "src/timeout_case.py" and item["line"] == 42
+        for item in result.diagnostics
+    )
+    assert result.truncated
+    assert canary not in result.model_dump_json()
+    assert len(result.output) + len(result.error or "") < 25_000
+
+
+@pytest.mark.asyncio
 async def test_run_command_timeout_after_effect_is_unknown(
     guard: SafetyGuard,
     project_root: Path,

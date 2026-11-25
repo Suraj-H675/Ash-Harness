@@ -157,7 +157,12 @@ class SearchToolsTool(BaseTool):
             omitted = max(0, len(matches) - 1)
             matches = matches[:1]
         for name, tool, _ in matches:
-            metadata = _search_result_tool(name, tool, include_schema=not omit_schema)
+            metadata = _search_result_tool(
+                name,
+                tool,
+                include_schema=not omit_schema,
+                include_description=not compact_result,
+            )
             candidate_order = deque(item for item in order if item != name)
             candidate_order.append(name)
             preview = (
@@ -396,12 +401,18 @@ def _bounded_schema_search_text(schema: Any) -> str:
 
 
 def _search_result_tool(
-    name: str, tool: BaseTool, *, include_schema: bool = True
+    name: str,
+    tool: BaseTool,
+    *,
+    include_schema: bool = True,
+    include_description: bool = True,
 ) -> dict[str, Any]:
-    description = str(getattr(tool, "description", ""))[
-        :MAX_TOOL_SEARCH_DESCRIPTION_CHARS
-    ]
-    result: dict[str, Any] = {"name": name, "description": description}
+    result: dict[str, Any] = {"name": name}
+    if include_description:
+        description = str(getattr(tool, "description", ""))[
+            :MAX_TOOL_SEARCH_DESCRIPTION_CHARS
+        ]
+        result["description"] = description
     if not include_schema:
         return result
     schema = tool.search_schema()

@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+from collections import Counter
 from contextlib import aclosing
 from dataclasses import replace
 from pathlib import Path
@@ -645,6 +646,21 @@ def apply_sprint_markdown_edit(execution: SprintExecution, markdown: str) -> Non
 
     if execution.state != SprintState.PLANNING:
         raise PlannerError("only planning sprints can be edited")
+    edit_bytes = 0
+    for character in markdown:
+        codepoint = ord(character)
+        if 0xD800 <= codepoint <= 0xDFFF:
+            raise PlannerError("edited plan must be valid UTF-8")
+        if codepoint <= 0x7F:
+            edit_bytes += 1
+        elif codepoint <= 0x7FF:
+            edit_bytes += 2
+        elif codepoint <= 0xFFFF:
+            edit_bytes += 3
+        else:
+            edit_bytes += 4
+        if edit_bytes > MAX_PLANNER_RESPONSE_BYTES:
+            raise PlannerError("edited plan exceeds 256 KiB")
     if "## Goal" not in markdown or "## Checklist" not in markdown:
         raise PlannerError("edited plan must include Goal and Checklist sections")
     edited = parse_sprint_response(markdown, fallback_goal=execution.contract.goal)
@@ -665,7 +681,23 @@ def apply_sprint_markdown_edit(execution: SprintExecution, markdown: str) -> Non
         contract_id=execution.contract.contract_id,
         max_cost_inr=execution.contract.max_cost_inr,
     )
-    execution.set_items(edited.items)
+    previous_counts = Counter(
+        (item.section, item.description) for item in execution.items
+    )
+    edited_counts = Counter((item.section, item.description) for item in edited.items)
+    previous_by_identity = {
+        (item.section, item.description): item
+        for item in execution.items
+        if previous_counts[(item.section, item.description)] == 1
+    }
+    updated_items: list[ChecklistItem] = []
+    for item in edited.items:
+        identity = (item.section, item.description)
+        previous = previous_by_identity.get(identity)
+        if previous is not None and edited_counts[identity] == 1:
+            item = replace(item, status=previous.status, notes=previous.notes)
+        updated_items.append(item)
+    execution.set_items(updated_items)
 
 
 def _validate_plan_paths(paths: tuple[Path, ...], section: str) -> None:

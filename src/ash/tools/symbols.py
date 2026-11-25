@@ -37,7 +37,10 @@ class FindSymbolTool(BaseTool):
     execution_contract = ToolExecutionContract(parallel_safe=True)
     description = (
         "Find exact class, type, function, and method definitions using the "
-        "workspace Tree-sitter index."
+        "workspace Tree-sitter index. It covers supported parser languages only; "
+        "a clean miss does not cover unsupported extensions. Multiple matches "
+        "are ambiguous candidates; check all returned locations before assuming "
+        "a unique definition."
     )
     args_schema = SymbolQueryArgs
 
@@ -91,7 +94,9 @@ class FindReferencesTool(BaseTool):
     execution_contract = ToolExecutionContract(parallel_safe=True)
     description = (
         "Find structural identifier uses while excluding declarations, comments, "
-        "and string literals."
+        "and string literals. Matches are same-name candidates and are not "
+        "resolved to a specific declaration. It covers supported parser "
+        "languages only; a clean miss does not cover unsupported extensions."
     )
     args_schema = SymbolQueryArgs
 

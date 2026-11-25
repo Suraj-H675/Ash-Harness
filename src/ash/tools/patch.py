@@ -159,12 +159,22 @@ class ApplyPatchTool(BaseTool):
                 success=False,
                 output="",
                 error=f"Patch path changed after validation: {exc}",
+                outcome=(
+                    ToolExecutionOutcome.UNKNOWN
+                    if mutation_attempted
+                    else ToolExecutionOutcome.COMPLETED
+                ),
             )
         except ScopedIOError as exc:
             return ToolResult(
                 success=False,
                 output="",
                 error=f"Patch workspace mutation was refused: {exc}",
+                outcome=(
+                    ToolExecutionOutcome.UNKNOWN
+                    if mutation_attempted
+                    else ToolExecutionOutcome.COMPLETED
+                ),
             )
         if applied[0] == PATCH_OUTPUT_LIMIT_EXIT:
             detail = applied[2].strip()

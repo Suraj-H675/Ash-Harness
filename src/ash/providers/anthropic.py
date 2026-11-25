@@ -15,7 +15,11 @@ from typing import Any, AsyncGenerator
 from ash.context.tokens import AnthropicTokenCounter
 from ash.providers.base import ProviderABC, StreamChunk, TokenCounterLike
 from ash.providers.capabilities import ProviderCapabilities, infer_capabilities
-from ash.providers.messages import CanonicalToolCall, MessageInput, normalize_messages
+from ash.providers.messages import (
+    CanonicalToolCall,
+    MessageInput,
+    normalize_provider_history,
+)
 from ash.providers.readiness import (
     ProviderConfigurationError,
     normalize_provider_base_url,
@@ -35,7 +39,7 @@ def prepare_anthropic_messages(
 
     system_blocks: list[str] = []
     conversation: list[dict[str, Any]] = []
-    for message in normalize_messages(messages):
+    for message in normalize_provider_history(messages):
         role = message.get("role")
         content = message.get("content", "")
         if role == "system":

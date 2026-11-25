@@ -53,6 +53,7 @@ def _directory_identity(path: Path) -> tuple[int, int] | None:
 
 
 MAX_BACKGROUND_OUTPUT_CHARS = 100_000
+MAX_BACKGROUND_OUTPUT_TAIL_CHARS = MAX_BACKGROUND_OUTPUT_CHARS // 2
 MAX_BACKGROUND_JOBS = 32
 MAX_BACKGROUND_HISTORY_JOBS = 32
 MAX_BACKGROUND_COMMAND_CHARS = 100_000
@@ -64,8 +65,14 @@ MAX_BACKGROUND_JOB_ID_CHARS = 128
 MAX_BACKGROUND_CWD_CHARS = 4_096
 BACKGROUND_CLOSE_REAP_GRACE_SECONDS = 0.5
 BACKGROUND_OUTPUT_TRUNCATION_MARKER = (
-    "\n[background process output truncated after "
-    f"{MAX_BACKGROUND_OUTPUT_CHARS} characters]\n"
+    "\n[background process output exceeded "
+    f"{MAX_BACKGROUND_OUTPUT_CHARS} characters; middle omitted; "
+    "recent tail follows after output drains]\n"
+)
+MAX_BACKGROUND_OUTPUT_HEAD_CHARS = (
+    MAX_BACKGROUND_OUTPUT_CHARS
+    - MAX_BACKGROUND_OUTPUT_TAIL_CHARS
+    - len(BACKGROUND_OUTPUT_TRUNCATION_MARKER)
 )
 
 
@@ -136,9 +143,14 @@ class Job:
     process: asyncio.subprocess.Process
     process_tree_plan: ProcessTreePlan
     output: list[str] = field(default_factory=list)
+    # Monotonic character offset in the tool-visible preview stream.
     cursor: int = 0
+    output_base_offset: int = 0
     output_size: int = 0
     output_truncated: bool = False
+    output_tail: str = ""
+    output_tail_active: bool = False
+    output_tail_published: bool = False
     readers: list[asyncio.Task[None]] = field(default_factory=list)
     sandbox_backend: str = "scoped"
     stdout_redactor: StreamingRedactor = field(default_factory=StreamingRedactor)
@@ -219,7 +231,8 @@ class BackgroundProcessTool(BaseTool):
             timed_out = False
             if (
                 args.action == "wait"
-                and job.cursor >= len(job.output)
+                and job.cursor
+                >= job.output_base_offset + job.output_size
                 and self._has_active_readers_or_root(job)
             ):
                 # No await occurs between inspecting the unread cursor and
@@ -269,8 +282,12 @@ class BackgroundProcessTool(BaseTool):
                         if not task.done():
                             task.cancel()
                     await asyncio.gather(output_wait, exit_wait, return_exceptions=True)
-            output = "".join(job.output[job.cursor :])
-            job.cursor = len(job.output)
+            if job.output_tail_active and all(reader.done() for reader in job.readers):
+                self._publish_output_tail(job)
+            retained_output = "".join(job.output)
+            first_unread = max(0, job.cursor - job.output_base_offset)
+            output = retained_output[first_unread:]
+            job.cursor = job.output_base_offset + len(retained_output)
             status = self._status(job)
             if (
                 args.action == "wait"
@@ -606,7 +623,14 @@ class BackgroundProcessTool(BaseTool):
     def _append_output(job: Job, text: str) -> None:
         """Retain a bounded preview while continuing to drain the child pipe."""
 
-        if not text or job.output_truncated:
+        if not text:
+            return
+        if job.output_tail_active:
+            combined_tail = job.output_tail + text
+            job.output_tail = combined_tail[-MAX_BACKGROUND_OUTPUT_TAIL_CHARS:]
+            job.output_changed.set()
+            return
+        if job.output_truncated:
             return
         remaining = MAX_BACKGROUND_OUTPUT_CHARS - job.output_size
         if len(text) <= remaining:
@@ -614,11 +638,32 @@ class BackgroundProcessTool(BaseTool):
             job.output_size += len(text)
             job.output_changed.set()
             return
-        if remaining:
-            job.output.append(text[:remaining])
-            job.output_size += remaining
-        job.output.append(BACKGROUND_OUTPUT_TRUNCATION_MARKER)
+
+        previous_output = "".join(job.output)
+        combined = previous_output + text
+        head = combined[:MAX_BACKGROUND_OUTPUT_HEAD_CHARS]
+        consumed = max(0, job.cursor - job.output_base_offset)
+        # A poll before truncation may have consumed part of the future tail.
+        # Keep only unread text in both the head and the bounded recent tail.
+        omitted = combined[max(len(head), consumed):]
+        already_returned = min(consumed, len(head))
+        job.output_base_offset = job.cursor
+        job.output = [head[already_returned:], BACKGROUND_OUTPUT_TRUNCATION_MARKER]
+        job.output_size = len(job.output[0]) + len(BACKGROUND_OUTPUT_TRUNCATION_MARKER)
         job.output_truncated = True
+        job.output_tail_active = True
+        job.output_tail = omitted[-MAX_BACKGROUND_OUTPUT_TAIL_CHARS:]
+        job.output_changed.set()
+
+    @staticmethod
+    def _publish_output_tail(job: Job) -> None:
+        if job.output_tail_published:
+            return
+        job.output_tail_published = True
+        if not job.output_tail_active or not job.output_tail:
+            return
+        job.output.append(job.output_tail)
+        job.output_size += len(job.output_tail)
         job.output_changed.set()
 
     @staticmethod

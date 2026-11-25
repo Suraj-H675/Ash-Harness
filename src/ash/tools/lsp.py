@@ -80,7 +80,8 @@ class LSPTool(BaseTool):
         "Query installed language servers for diagnostics, hover, definitions, "
         "references, implementations, symbols, advisory rename/code actions, "
         "formatting, and call hierarchy. LSP edits and commands are never "
-        "executed directly. "
+        "executed directly. Navigation rejects a changed request source; "
+        "server-wide semantic index freshness is unverified. "
         "Coordinates are 1-based as shown in editors."
     )
     args_schema = LSPQueryArgs
