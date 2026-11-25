@@ -2029,3 +2029,33 @@ async def test_patch_checkpoint_distinguishes_dry_run_from_real_edit(tmp_path, d
         assert restored == []
         assert not store.file_checkpoints_for_call(session.session_id, "turn", "call")
         assert path.read_text(encoding="utf-8") == "after\n"
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(os.name != "posix", reason="requires a POSIX temporary directory alias")
+async def test_patch_checkpoint_finalizes_under_symlinked_temp_directory(tmp_path, monkeypatch) -> None:
+    import tempfile
+
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    alias = tmp_path / "scratch-alias"
+    alias.symlink_to(scratch, target_is_directory=True)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    path = workspace / "source.txt"
+    path.write_text("before\n", encoding="utf-8")
+    guard = SafetyGuard(workspace)
+    store = SessionStore(tmp_path / "sessions.db")
+    session = store.create_session(str(workspace))
+    tool = ApplyPatchTool(guard)
+    middleware = FileCheckpointMiddleware(store, guard, lambda: (session.session_id, "turn", "call"))
+    arguments = {"patch": "--- a/source.txt\n+++ b/source.txt\n@@ -1 +1 @@\n-before\n+after\n"}
+    await middleware.before_tool("apply_patch", arguments, tool)
+    result = await tool.run(**arguments)
+    assert result.success, result.error
+    with monkeypatch.context() as patch:
+        patch.setattr(tempfile, "tempdir", str(alias))
+        await middleware.after_tool("apply_patch", arguments, result)
+    assert undo_latest_checkpoint(store, guard, session.session_id) == [path]
+    assert path.read_text(encoding="utf-8") == "before\n"
+    assert list(scratch.iterdir()) == []

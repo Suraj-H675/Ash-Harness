@@ -818,8 +818,12 @@ async def test_grouped_provider_fallback_does_not_claim_absent_context_was_dropp
 
 
 @pytest.mark.asyncio
-async def test_grouped_hit_collection_counts_path_storage_once_per_file(tmp_path) -> None:
-    directory_names = ["d" * 140 for _ in range(20)]
+async def test_grouped_hit_collection_counts_path_storage_once_per_file(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Exercise the same collection budget with a path valid on macOS too.
+    monkeypatch.setattr(search_module, "MAX_SEARCH_CAPTURE_BYTES", 100_000)
+    directory_names = ["d" * 100 for _ in range(4)]
     relative = "/".join([*directory_names, "cache.py"])
     source = tmp_path / relative
     source.parent.mkdir(parents=True)

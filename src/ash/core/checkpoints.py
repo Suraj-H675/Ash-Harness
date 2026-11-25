@@ -281,7 +281,9 @@ async def _expected_patch_states(
     """Apply a patch to saved preimages in a private workspace for attribution."""
 
     with tempfile.TemporaryDirectory(prefix="ash-checkpoint-patch-") as directory:
-        root = Path(directory)
+        # The OS temporary directory can be reached through a symlink (for
+        # example, /var on macOS). Use the same canonical root as the guard.
+        root = Path(directory).resolve(strict=True)
         scratch_guard = SafetyGuard(root)
         relative_paths: dict[str, Path] = {}
         for row in rows:

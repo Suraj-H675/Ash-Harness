@@ -261,6 +261,8 @@ def test_search_discovery_requires_successfully_offered_exact_schema(
     assert schema["properties"]["context_lines"]["maximum"] == 10
     assert schema["properties"]["files_only"]["type"] == "boolean"
     assert "default" not in schema["properties"]["files_only"]
+    assert schema["properties"]["grouped_context"]["type"] == "boolean"
+    assert "default" not in schema["properties"]["grouped_context"]
     request = {
         "tools": [
             {
@@ -307,7 +309,8 @@ def test_search_discovery_requires_successfully_offered_exact_schema(
     for tamper in (
         "widen", "drop", "widen_context", "bad_files_only_type",
         "enabled_files_only_default", "files_only_without_bounded_fields",
-        "extra_field",
+        "extra_field", "bad_grouped_type", "enabled_grouped_default",
+        "grouped_without_files_only",
     ):
         forged = json.loads(json.dumps(schema))
         if tamper == "widen":
@@ -321,6 +324,12 @@ def test_search_discovery_requires_successfully_offered_exact_schema(
         elif tamper == "files_only_without_bounded_fields":
             del forged["properties"]["context_lines"]
             del forged["properties"]["max_output_bytes"]
+        elif tamper == "bad_grouped_type":
+            forged["properties"]["grouped_context"]["type"] = "string"
+        elif tamper == "enabled_grouped_default":
+            forged["properties"]["grouped_context"]["default"] = True
+        elif tamper == "grouped_without_files_only":
+            del forged["properties"]["files_only"]
         elif tamper == "extra_field":
             forged["properties"]["unreviewed_tool_option"] = {"type": "boolean"}
         else:
