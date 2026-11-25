@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import io
 import shlex
 import sqlite3
@@ -9,14 +11,19 @@ import sys
 from pathlib import Path
 
 import pytest
+from pydantic import BaseModel
 
 from ash.context.history import ContextBudgetExceededError
-from ash.core.context_continuation import run_with_context_continuation
+from ash.core.context_continuation import (
+    restart_context_with_handoff,
+    run_with_context_continuation,
+)
 from ash.core.loop import AshLoop
-from ash.core.session import SessionStore
+from ash.core.session import SessionForkConflictError, SessionStore
 from ash.providers.base import ProviderABC, StreamChunk
 from ash.providers.capabilities import ProviderCapabilities
 from ash.safety.guard import SafetyGuard
+from ash.tools.base import BaseTool, ToolResult
 from ash.tools.command import RunCommandTool
 from ash.tools.filesystem import ReadFileTool, ReplaceFileContentTool
 from ash.ui.headless import HeadlessUI
@@ -255,6 +262,218 @@ async def test_partial_edits_survive_context_restart_and_full_repair_is_verified
         assert store.verify_audit_log(child.session_id) == []
         assert approvals.count("run_command") == 1
     finally:
+        await loop.aclose()
+
+
+@pytest.mark.asyncio
+async def test_partial_edits_survive_interrupted_synthetic_remote_effect(
+    tmp_path: Path,
+) -> None:
+    """Keep completed file work and block a fresh window on unknown remote work."""
+    project = tmp_path / "project"
+    project.mkdir()
+    pricing = project / "pricing.py"
+    taxes = project / "taxes.py"
+    pricing.write_text("def subtotal(price):\n    return price - 5\n", encoding="utf-8")
+    taxes.write_text("def total(price):\n    return price + 11\n", encoding="utf-8")
+
+    class PublishArgs(BaseModel):
+        destination: str
+
+    class SyntheticPublishTool(BaseTool):
+        name = "mcp__synthetic__publish"
+        description = "Publish to a disposable synthetic service."
+        args_schema = PublishArgs
+
+        def __init__(self, safety_guard: SafetyGuard, effect_log: Path) -> None:
+            super().__init__(safety_guard)
+            self.effect_log = effect_log
+            self.started = asyncio.Event()
+            self.effect_count = 0
+
+        async def run(self, *, destination: str) -> ToolResult:
+            assert destination == "invoice-123"
+            self.effect_count += 1
+            with self.effect_log.open("ab") as stream:
+                stream.write(b"accepted\n")
+            self.started.set()
+            await asyncio.Event().wait()
+            return ToolResult(success=True, output="unreachable")
+
+    class Provider(ProviderABC):
+        model_name = "scripted-interrupted-effect"
+        _ash_declared_capabilities = ProviderCapabilities(native_tools=True)
+
+        def __init__(self) -> None:
+            self.requests = 0
+            self.offered_tools: set[str] = set()
+
+        def count_tokens(self, text: str) -> int:
+            return max(1, len(str(text)) // 4)
+
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            self.requests += 1
+            if self.requests == 1:
+                self.offered_tools = {
+                    entry["function"]["name"] for entry in (tools or [])
+                }
+                publish_schema = next(
+                    entry["function"]["parameters"]
+                    for entry in (tools or [])
+                    if entry["function"]["name"] == "mcp__synthetic__publish"
+                )
+                assert "destination" in publish_schema["properties"]
+                calls = [
+                    {
+                        "id": "edit-pricing-once",
+                        "name": "replace_file_content",
+                        "arguments": {
+                            "file_path": "pricing.py",
+                            "target_content": "    return price - 5",
+                            "replacement_content": "    return price - 10",
+                        },
+                    },
+                    {
+                        "id": "edit-taxes-once",
+                        "name": "replace_file_content",
+                        "arguments": {
+                            "file_path": "taxes.py",
+                            "target_content": "    return price + 11",
+                            "replacement_content": "    return price + 9",
+                        },
+                    },
+                ]
+            elif self.requests == 2:
+                assert pricing.read_text(encoding="utf-8").endswith(
+                    "    return price - 10\n"
+                )
+                assert taxes.read_text(encoding="utf-8").endswith(
+                    "    return price + 9\n"
+                )
+                calls = [
+                    {
+                        "id": "publish-once",
+                        "name": "mcp__synthetic__publish",
+                        "arguments": {"destination": "invoice-123"},
+                    }
+                ]
+            else:
+                pytest.fail("runtime requested another provider response before recovery")
+            yield StreamChunk(is_done=True, native_tool_calls=calls)
+
+    project_effect_log = tmp_path / "synthetic-service" / "effects.log"
+    project_effect_log.parent.mkdir()
+    guard = SafetyGuard(project)
+    store = SessionStore(tmp_path / "interrupted-effect.db")
+    provider = Provider()
+    publish_tool = SyntheticPublishTool(guard, project_effect_log)
+    approvals: list[str] = []
+
+    async def approve(tool_name: str, _arguments: dict[str, object]) -> bool:
+        approvals.append(tool_name)
+        return tool_name in {"replace_file_content", "mcp__synthetic__publish"}
+
+    loop = AshLoop(
+        store,
+        provider,
+        guard,
+        HeadlessUI(output_format="stream-json", stream=io.StringIO()),
+        project,
+        tools={
+            "replace_file_content": ReplaceFileContentTool(guard),
+            "mcp__synthetic__publish": publish_tool,
+        },
+        on_tool_approval=approve,
+    )
+
+    def checkpoint_context():
+        if loop.current_session is None or loop.turn_context is None:
+            return None
+        return (
+            loop.current_session.session_id,
+            loop.turn_context.turn_id,
+            str(loop.turn_context.get("tool_call_id", "")),
+        )
+
+    from ash.core.checkpoints import FileCheckpointMiddleware
+
+    loop.tool_middlewares.append(
+        FileCheckpointMiddleware(store, guard, checkpoint_context)
+    )
+    loop._safe_edit_preflight = True
+    task_text = "Repair pricing and taxes, then publish the verified result."
+    task: asyncio.Task[str] | None = None
+    try:
+        session = await loop.start_session()
+        task = asyncio.create_task(loop.run_turn(task_text))
+        await asyncio.wait_for(publish_tool.started.wait(), timeout=5)
+        assert project_effect_log.read_bytes() == b"accepted\n"
+
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert pricing.read_bytes() == b"def subtotal(price):\n    return price - 10\n"
+        assert taxes.read_bytes() == b"def total(price):\n    return price + 9\n"
+        assert publish_tool.effect_count == 1
+        assert provider.requests == 2
+        assert provider.offered_tools == {
+            "replace_file_content",
+            "mcp__synthetic__publish",
+        }
+        assert approvals == [
+            "replace_file_content",
+            "replace_file_content",
+            "mcp__synthetic__publish",
+        ]
+
+        call_rows = store.load_session(session.session_id).tool_calls
+        assert [call.call_id for call in call_rows] == [
+            "edit-pricing-once",
+            "edit-taxes-once",
+            "publish-once",
+        ]
+        assert all(call.approved and call.success is True for call in call_rows[:2])
+        uncertain = call_rows[2]
+        assert uncertain.approved and uncertain.dispatched and uncertain.executed
+        assert uncertain.success is None
+        assert "outcome is unknown" in (uncertain.error or "")
+        assert "remote MCP tool" in (uncertain.error or "")
+        assert loop.recovery_summary is not None
+        assert loop.recovery_summary.unknown_calls == (
+            "mcp__synthetic__publish (publish-once)",
+        )
+
+        with sqlite3.connect(store.db_path) as connection:
+            checkpoints = connection.execute(
+                "SELECT call_id, path, after_sha256, restored FROM file_checkpoints "
+                "WHERE session_id = ? ORDER BY checkpoint_id",
+                (session.session_id,),
+            ).fetchall()
+        assert [(row[0], row[1], row[3]) for row in checkpoints] == [
+            ("edit-pricing-once", str(pricing), 0),
+            ("edit-taxes-once", str(taxes), 0),
+        ]
+        assert [row[2] for row in checkpoints] == [
+            hashlib.sha256(pricing.read_bytes()).hexdigest(),
+            hashlib.sha256(taxes.read_bytes()).hexdigest(),
+        ]
+        assert store.verify_audit_log(session.session_id) == []
+
+        with pytest.raises(SessionForkConflictError):
+            restart_context_with_handoff(
+                store,
+                guard,
+                session.session_id,
+                "Inspect the synthetic publish outcome before deciding what to do.",
+            )
+        assert len(store.session_tree(session.session_id)) == 1
+        assert project_effect_log.read_bytes() == b"accepted\n"
+    finally:
+        if task is not None and not task.done():
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
         await loop.aclose()
 
 
