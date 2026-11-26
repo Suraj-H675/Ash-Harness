@@ -1,6 +1,7 @@
 import asyncio
 import codecs
 import hashlib
+import json
 import os
 import re
 import shlex
@@ -21,11 +22,12 @@ from ash.tools.command import (
     extract_diagnostics,
     extract_diagnostic_summary,
 )
-from ash.tools.base import BaseTool, ToolExecutionOutcome, ToolResult
+from ash.tools.base import BaseTool, ToolExecutionOutcome, ToolOutputBudget, ToolResult
 from ash.tools.filesystem import (
     BINARY_FILE_ERROR,
     DEFAULT_MAX_READ_CHARS,
     EXISTS_ERROR,
+    MAX_BATCH_READ_RENDER_CHARS,
     MAX_PYTHON_SYNTAX_CHECK_BYTES,
     ReadFileTool,
     ReadFilesTool,
@@ -257,6 +259,288 @@ async def test_batch_read_keeps_normal_per_file_limits_and_truncation(
 
 
 @pytest.mark.asyncio
+async def test_budgeted_batch_read_preserves_ordered_ranges_and_full_fit(
+    guard: SafetyGuard,
+    project_root: Path,
+) -> None:
+    (project_root / "implementation.py").write_text(
+        "".join(f"implementation_value_{line:03} = {line}\n" for line in range(1, 251)),
+        encoding="utf-8",
+    )
+    (project_root / "caller.py").write_text(
+        "from implementation import implementation_value_001\n"
+        "print(implementation_value_001)\n",
+        encoding="utf-8",
+    )
+    (project_root / "test_case.py").write_text(
+        "def test_implementation():\n    assert True\n",
+        encoding="utf-8",
+    )
+    tool = ReadFilesTool(guard)
+
+    def result_bytes(result: ToolResult) -> int:
+        return len(
+            json.dumps(
+                result.model_dump(mode="python"),
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            ).encode("utf-8")
+        )
+
+    def section(output: str, index: int, path: str) -> str:
+        label = f"[{index}/3] {path}\n"
+        start = output.index(label) + len(label)
+        next_label = output.find("\n\n[", start)
+        return output[start:] if next_label < 0 else output[start:next_label]
+
+    requests = [
+        {"file_path": "implementation.py", "max_chars": 4_096},
+        {"file_path": "caller.py", "max_chars": 512},
+        {"file_path": "test_case.py", "max_chars": 512},
+    ]
+    full = await tool.run(files=requests)
+    floor = await tool.run(files=[{**request, "max_chars": 1} for request in requests])
+    budget_cap = (result_bytes(full) + result_bytes(floor)) // 2
+    budget = ToolOutputBudget(
+        accepts=lambda result: result_bytes(result) <= budget_cap,
+        can_dispatch=True,
+    )
+    with tool.output_budget_context(budget):
+        bounded = await tool.run(files=requests)
+
+    assert budget.accepts(bounded), result_bytes(bounded)
+    assert bounded.success
+    assert bounded.truncated
+    assert result_bytes(bounded) <= budget_cap
+    assert (
+        bounded.output.index("[1/3] implementation.py")
+        < bounded.output.index("[2/3] caller.py")
+        < bounded.output.index("[3/3] test_case.py")
+    )
+    assert (
+        len(re.findall(r"(?m)^\d+: ", section(bounded.output, 1, "implementation.py")))
+        >= 10
+    )
+    assert "next_start_line=" in section(bounded.output, 1, "implementation.py")
+    assert "1: from implementation import implementation_value_001" in section(
+        bounded.output, 2, "caller.py"
+    )
+    assert "2: print(implementation_value_001)" in section(
+        bounded.output, 2, "caller.py"
+    )
+    assert "1: def test_implementation():" in section(bounded.output, 3, "test_case.py")
+    assert "2:     assert True" in section(bounded.output, 3, "test_case.py")
+    assert "omitted" not in bounded.output.lower()
+    assert bounded.output.count("sha256=") == 3
+
+    full_budget = ToolOutputBudget(
+        accepts=lambda result: result_bytes(result) <= result_bytes(full),
+        can_dispatch=True,
+    )
+    with tool.output_budget_context(full_budget):
+        full_fit = await tool.run(files=requests)
+    assert full_fit.model_dump() == full.model_dump()
+
+    reordered = [requests[1], requests[0], requests[2]]
+    reordered_full = await tool.run(files=reordered)
+    reordered_floor = await tool.run(
+        files=[{**request, "max_chars": 1} for request in reordered]
+    )
+    reordered_cap = (result_bytes(reordered_full) + result_bytes(reordered_floor)) // 2
+    reordered_budget = ToolOutputBudget(
+        accepts=lambda result: result_bytes(result) <= reordered_cap,
+        can_dispatch=True,
+    )
+    with tool.output_budget_context(reordered_budget):
+        reordered_result = await tool.run(files=reordered)
+    assert reordered_budget.accepts(reordered_result), result_bytes(reordered_result)
+    assert reordered_result.success
+    assert (
+        reordered_result.output.index("[1/3] caller.py")
+        < reordered_result.output.index("[2/3] implementation.py")
+        < reordered_result.output.index("[3/3] test_case.py")
+    )
+    assert "next_start_line=" in section(
+        reordered_result.output, 2, "implementation.py"
+    )
+    assert "1: from implementation import implementation_value_001" in section(
+        reordered_result.output, 1, "caller.py"
+    )
+    assert "1: implementation_value_001 = 1" in section(
+        reordered_result.output, 2, "implementation.py"
+    )
+    assert "1: def test_implementation():" in section(
+        reordered_result.output, 3, "test_case.py"
+    )
+
+
+@pytest.mark.asyncio
+async def test_budgeted_batch_read_preserves_partial_unicode_continuation(
+    guard: SafetyGuard,
+    project_root: Path,
+) -> None:
+    long_line = 'value = "' + "漢😀" * 4_000 + '"'
+    (project_root / "unicode.py").write_text(
+        "preamble = 0\n" + long_line + "\nignored = True\n",
+        encoding="utf-8",
+    )
+    (project_root / "caller.py").write_text("first\ncaller_tail\n", encoding="utf-8")
+    (project_root / "test_case.py").write_text("first\nassert True\n", encoding="utf-8")
+    tool = ReadFilesTool(guard)
+    requests = [
+        {
+            "file_path": "unicode.py",
+            "start_line": 2,
+            "end_line": 2,
+            "start_column": 9,
+            "max_chars": 4_096,
+        },
+        {
+            "file_path": "caller.py",
+            "start_line": 2,
+            "end_line": 2,
+            "max_chars": 512,
+        },
+        {
+            "file_path": "test_case.py",
+            "start_line": 2,
+            "end_line": 2,
+            "max_chars": 512,
+        },
+    ]
+
+    def result_bytes(result: ToolResult) -> int:
+        return len(result.model_dump_json().encode("utf-8"))
+
+    full = await tool.run(files=requests)
+    floor = await tool.run(files=[{**request, "max_chars": 1} for request in requests])
+    budget_cap = (result_bytes(full) + result_bytes(floor)) // 2
+    budget = ToolOutputBudget(
+        accepts=lambda result: result_bytes(result) <= budget_cap,
+        can_dispatch=True,
+    )
+    with tool.output_budget_context(budget):
+        result = await tool.run(files=requests)
+
+    assert budget.accepts(result), result_bytes(result)
+    assert result.success
+    assert "2 [column 9]: " in result.output
+    continuation = re.search(
+        r"next_start_line=(\d+); next_start_column=(\d+)", result.output
+    )
+    assert continuation is not None
+    assert continuation.group(1) == "2"
+    assert int(continuation.group(2)) < 9 + 4_096
+    excerpt = re.search(r"2 \[column 9\]: (.*)", result.output)
+    assert excerpt is not None
+    assert int(continuation.group(2)) == 9 + len(excerpt.group(1))
+    assert "2: caller_tail" in result.output
+    assert "2: assert True" in result.output
+
+
+@pytest.mark.asyncio
+async def test_budgeted_batch_read_reports_when_ranges_cannot_fit(
+    guard: SafetyGuard,
+    project_root: Path,
+) -> None:
+    for name in ("first.py", "second.py", "third.py"):
+        (project_root / name).write_text(
+            "".join(f"value_{line:03} = {line}\n" for line in range(120)),
+            encoding="utf-8",
+        )
+    tool = ReadFilesTool(guard)
+    requests = [
+        {"file_path": f"{name}.py", "max_chars": 512}
+        for name in ("first", "second", "third")
+    ]
+
+    def result_bytes(result: ToolResult) -> int:
+        return len(
+            json.dumps(
+                result.model_dump(mode="python"),
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            ).encode("utf-8")
+        )
+
+    full = await tool.run(files=requests)
+    floor = await tool.run(files=[{**request, "max_chars": 1} for request in requests])
+    budget_cap = min(result_bytes(full), result_bytes(floor)) // 2
+    budget = ToolOutputBudget(
+        accepts=lambda result: result_bytes(result) <= budget_cap,
+        can_dispatch=True,
+    )
+    with tool.output_budget_context(budget):
+        bounded = await tool.run(files=requests)
+
+    assert budget.accepts(bounded)
+    assert not bounded.success
+    assert bounded.truncated
+    assert "context budget" in (bounded.output + " " + (bounded.error or "")).lower()
+    assert "omitted" in bounded.output.lower()
+    assert not all(
+        f"[{index}/3] {name}.py" in bounded.output
+        for index, name in enumerate(("first", "second", "third"), 1)
+    )
+
+
+@pytest.mark.asyncio
+async def test_budgeted_batch_read_keeps_useful_prefix_when_all_cannot_fit(
+    guard: SafetyGuard, project_root: Path,
+) -> None:
+    names = ("definition", "consumer", "verification", "config")
+    for name in names:
+        (project_root / f"{name}.py").write_text(
+            "FIRST_SENTINEL = 123\n" + "data = 42\n" * 500
+            if name == "definition" else f"{name.upper()}_SENTINEL = 7\n",
+            encoding="utf-8",
+        )
+    tool = ReadFilesTool(guard)
+    files = [
+        {"file_path": f"{name}.py", "max_chars": 4096 if name == "definition" else 512}
+        for name in names
+    ]
+    budget = ToolOutputBudget(
+        accepts=lambda result: len(result.model_dump_json().encode("utf-8")) <= 1100,
+        can_dispatch=True,
+    )
+    with tool.output_budget_context(budget):
+        result = await tool.run(files=files)
+    assert budget.accepts(result)
+    assert not result.success and result.truncated
+    assert "FIRST_SENTINEL" in result.output
+    assert "omitted" in result.output and "sha256=" in result.output
+
+
+@pytest.mark.asyncio
+async def test_budgeted_batch_read_preserves_ranges_under_render_cap(
+    guard: SafetyGuard, project_root: Path,
+) -> None:
+    for index in range(4):
+        (project_root / f"module_{index}.py").write_text(
+            f"MARKER_{index} = 1\n" + "0123456789\n" * 800, encoding="utf-8"
+        )
+    tool = ReadFilesTool(guard)
+    files = [{"file_path": f"module_{i}.py", "max_chars": 4096} for i in range(4)]
+    full = await tool.run(files=files)
+    assert not full.success and "render limit" in (full.error or "")
+    budget = ToolOutputBudget(
+        accepts=lambda result: len(result.model_dump_json().encode("utf-8")) <= 60_000,
+        can_dispatch=True,
+    )
+    with tool.output_budget_context(budget):
+        result = await tool.run(files=files)
+    assert result.success and result.truncated
+    assert len(result.output) <= MAX_BATCH_READ_RENDER_CHARS
+    assert all(f"MARKER_{i} = 1" in result.output for i in range(4))
+    assert budget.accepts(result)
+
+
+@pytest.mark.asyncio
 async def test_batch_read_isolated_failure_never_leaks_out_of_workspace(
     guard: SafetyGuard, project_root: Path,
 ) -> None:
@@ -296,14 +580,18 @@ async def test_batch_read_rejects_stale_hash_without_suppressing_other_reads(
 async def test_batch_read_rejects_overlarge_sum_without_reading_files(
     guard: SafetyGuard, project_root: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    import ash.tools.filesystem as filesystem_module
+
     tool = ReadFilesTool(guard)
 
-    async def unexpected_read(**_kwargs: object) -> ToolResult:
+    def unexpected_read(*_args: object, **_kwargs: object) -> tuple[Path, bytes]:
         raise AssertionError("over-budget batches must not read any files")
 
-    monkeypatch.setattr(tool._reader, "run", unexpected_read)
+    for index in range(3):
+        (project_root / f"existing-{index}.py").write_text("value = 1\n", encoding="utf-8")
+    monkeypatch.setattr(filesystem_module, "read_scoped_bytes", unexpected_read)
     result = await tool.run(files=[
-        {"file_path": f"missing-{index}.py", "max_chars": 8_192}
+        {"file_path": f"existing-{index}.py", "max_chars": 8_192}
         for index in range(3)
     ])
     assert not result.success
@@ -327,18 +615,21 @@ async def test_batch_read_count_and_per_entry_limits_are_schema_enforced(
 
 @pytest.mark.asyncio
 async def test_batch_read_output_overrun_fails_closed(
-    guard: SafetyGuard, monkeypatch: pytest.MonkeyPatch,
+    guard: SafetyGuard, project_root: Path,
 ) -> None:
+    for index in range(4):
+        (project_root / f"large_{index}.py").write_text(
+            ("0123456789\n" * 800),
+            encoding="utf-8",
+        )
     tool = ReadFilesTool(guard)
-
-    async def unexpectedly_large_read(**_kwargs: object) -> ToolResult:
-        return ToolResult(success=True, output="x" * 30_000)
-
-    monkeypatch.setattr(tool._reader, "run", unexpectedly_large_read)
-    result = await tool.run(files=[{"file_path": "foo.py"}])
+    result = await tool.run(files=[
+        {"file_path": f"large_{index}.py", "max_chars": 4_096}
+        for index in range(4)
+    ])
     assert not result.success
     assert result.truncated
-    assert len(result.output) < 1_000
+    assert len(result.output) <= MAX_BATCH_READ_RENDER_CHARS + 100
     assert "omitted" in result.output
     assert "render limit" in result.error
 

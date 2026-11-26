@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import json
+import re
 import shlex
 import sys
 from pathlib import Path
@@ -312,6 +313,195 @@ async def test_opaque_history_bounds_repeated_reads_and_keeps_edit_test_progress
         )
         assert approvals.count("replace_file_content") == 1
         assert approvals.count("run_command") == 1
+    finally:
+        await loop.aclose()
+
+
+@pytest.mark.asyncio
+async def test_opaque_history_batch_read_keeps_implementation_caller_and_test(
+    tmp_path: Path,
+) -> None:
+    implementation = tmp_path / "implementation.py"
+    implementation.write_text(
+        "def answer():\n    return 1\n"
+        + "".join(
+            f"# implementation line {line:03} with supporting source detail\n"
+            for line in range(1, 251)
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "caller.py").write_text(
+        "from implementation import answer\nvalue = answer()\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "test_case.py").write_text(
+        "from implementation import answer; assert answer() == 2\nprint('TEST_OK')\n",
+        encoding="utf-8",
+    )
+    command = shlex.quote(sys.executable) + " -c " + shlex.quote("import test_case")
+
+    class Provider(ProviderABC):
+        model_name = "scripted-batch-budget-coding"
+        _ash_declared_capabilities = ProviderCapabilities(native_tools=True)
+
+        def __init__(self) -> None:
+            self.requests: list[list[dict[str, Any]]] = []
+            self.states: list[list[dict[str, Any]]] = []
+            self.model_tool_requests: list[str] = []
+
+        def count_tokens(self, text: str) -> int:
+            return max(1, (len(text) + 3) // 4)
+
+        def replay_credential_identity(self) -> ProviderReplayCredentialIdentity:
+            return ProviderReplayCredentialIdentity.from_secret(
+                "fixture-only-replay-key",
+                scope=("batch-navigation-budget-test",),
+            )
+
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            self.requests.append(messages)
+            prior_states = [
+                item["provider_state"]
+                for item in messages
+                if item.get("role") == "assistant" and item.get("provider_state")
+            ]
+            assert prior_states == self.states
+            message_text = json.dumps(messages)
+            request_number = len(self.requests)
+
+            if request_number == 1:
+                name, arguments = (
+                    "read_files",
+                    {
+                        "files": [
+                            {"file_path": "implementation.py", "max_chars": 4_096},
+                            {"file_path": "caller.py", "max_chars": 512},
+                            {"file_path": "test_case.py", "max_chars": 512},
+                        ]
+                    },
+                )
+            elif (
+                "from implementation import answer" not in message_text
+                or "assert answer() == 2" not in message_text
+            ):
+                name, arguments = (
+                    "read_files",
+                    {
+                        "files": [
+                            {"file_path": "implementation.py", "max_chars": 256},
+                            {"file_path": "caller.py", "max_chars": 512},
+                            {"file_path": "test_case.py", "max_chars": 512},
+                        ]
+                    },
+                )
+            elif not any(
+                item == "replace_file_content" for item in self.model_tool_requests
+            ):
+                name, arguments = (
+                    "replace_file_content",
+                    {
+                        "file_path": "implementation.py",
+                        "target_content": "    return 1",
+                        "replacement_content": "    return 2",
+                    },
+                )
+            elif not any(item == "run_command" for item in self.model_tool_requests):
+                name, arguments = "run_command", {"command_line": command}
+            else:
+                assert "TEST_OK" in message_text
+                yield StreamChunk(content="Updated and verified.", is_done=True)
+                return
+
+            self.model_tool_requests.append(name)
+            state = [
+                {
+                    "type": "reasoning",
+                    "id": f"opaque-{request_number}",
+                    "summary": [],
+                    "status": "completed",
+                    "encrypted_content": "fixture-state",
+                }
+            ]
+            self.states.append(state)
+            yield StreamChunk(
+                native_tool_calls=[
+                    {
+                        "id": f"call-{request_number}",
+                        "name": name,
+                        "arguments": arguments,
+                    }
+                ],
+                provider_state=state,
+                is_done=True,
+            )
+
+    approvals: list[str] = []
+
+    async def approve(name: str, _: dict[str, object]) -> bool:
+        approvals.append(name)
+        return True
+
+    guard = SafetyGuard(tmp_path)
+    store = SessionStore(tmp_path / "batch-budget.db")
+    provider = Provider()
+    loop = AshLoop(
+        store,
+        provider,
+        guard,
+        HeadlessUI(output_format="text", stream=io.StringIO()),
+        tmp_path,
+        tools={
+            "read_files": ReadFilesTool(guard),
+            "replace_file_content": ReplaceFileContentTool(guard),
+            "run_command": RunCommandTool(guard, project_root=tmp_path),
+        },
+        config=AshConfig(
+            model="custom/scripted-batch-budget-coding",
+            workspace_root=tmp_path,
+            db_directory=tmp_path / "db",
+            memory_backend="off",
+            max_context_tokens=10_000,
+            max_completion_tokens=1_500,
+        ),
+        on_tool_approval=approve,
+    )
+    try:
+        session = await loop.start_session()
+        response = await loop.run_turn(
+            "Inspect implementation, caller, and test. Fix answer and run the test. "
+            + ("prior context " * 1_280)
+        )
+
+        assert response == "Updated and verified."
+        assert implementation.read_text(encoding="utf-8").startswith(
+            "def answer():\n    return 2\n"
+        )
+        assert provider.model_tool_requests == [
+            "read_files",
+            "replace_file_content",
+            "run_command",
+        ]
+        assert len(provider.requests) == 4
+        saved = store.load_session(session.session_id)
+        read_calls = [
+            call for call in saved.tool_calls if call.tool_name == "read_files"
+        ]
+        assert len(read_calls) == 1
+        assert read_calls[0].success
+        assert "[1/3] implementation.py" in read_calls[0].result
+        assert "[2/3] caller.py" in read_calls[0].result
+        assert "[3/3] test_case.py" in read_calls[0].result
+        assert "implementation line 001" in read_calls[0].result
+        assert "from implementation import answer" in read_calls[0].result
+        assert "assert answer() == 2" in read_calls[0].result
+        assert "omitted" not in read_calls[0].result.lower()
+        clipped = re.search(r"source_chars_limit=(\d+)", read_calls[0].result)
+        assert clipped is not None
+        assert int(clipped.group(1)) < 4_096
+        assert "context budget;" in read_calls[0].result
+        assert approvals.count("replace_file_content") == 1
+        assert approvals.count("run_command") == 1
+        assert not store.verify_audit_log(session.session_id)
     finally:
         await loop.aclose()
 

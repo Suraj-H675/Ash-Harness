@@ -27,7 +27,6 @@ from ash.tools.base import (
     BaseTool,
     ToolExecutionContract,
     ToolExecutionOutcome,
-    ToolOutputBudget,
     ToolResult,
     count_output_tokens,
     scoped_path_refusal,
@@ -236,6 +235,18 @@ class ReadFilesArgs(BaseModel):
     )
 
 
+@dataclass(frozen=True)
+class _ReadFileSnapshot:
+    args: ReadFileArgs
+    metadata: str
+    line_prefixes: tuple[str, ...]
+    line_lengths: tuple[int, ...]
+    visible_line_count: int
+    selected_count: int
+    total_lines: int
+    end_index: int
+
+
 class WriteFileArgs(BaseModel):
     file_path: str = Field(..., description="Target path for writing content.")
     content: str = Field(
@@ -375,8 +386,9 @@ class ReadFileTool(BaseTool):
                 prop.pop("default", None)
         return schema
 
-    async def run(self, **kwargs: Any) -> ToolResult:
-        args = ReadFileArgs(**kwargs)
+    async def _read_snapshot(
+        self, args: ReadFileArgs
+    ) -> _ReadFileSnapshot | ToolResult:
         try:
             resolved_path = self.safety_guard.validate_mutation_path(args.file_path)
         except SafetyViolation as exc:
@@ -440,6 +452,7 @@ class ReadFileTool(BaseTool):
         end_index = args.end_line if args.end_line is not None else len(lines)
         selected = lines[start_index:end_index]
         selected_count = len(selected)
+        visible = selected[:DEFAULT_MAX_READ_LINES]
         metadata = _format_read_metadata(
             resolved_path,
             lines,
@@ -447,74 +460,128 @@ class ReadFileTool(BaseTool):
             encoding,
         )
 
-        def build_result(source_char_limit: int) -> ToolResult:
-            visible = selected[:DEFAULT_MAX_READ_LINES]
-            remaining = source_char_limit
-            numbered_lines: list[str] = []
-            continuation: tuple[int, int] | None = None
-            for index, line in enumerate(visible):
-                line_number = args.start_line + index
-                column = args.start_column if index == 0 else 1
-                if column > len(line) + 1:
-                    return ToolResult(
-                        success=False,
-                        output="",
-                        error=(
-                            f"Error: start_column {column} exceeds line {line_number} "
-                            f"length ({len(line)} characters)."
-                        ),
-                    )
-                offset = column - 1
-                shown = line[offset : offset + remaining]
-                prefix = (
-                    f"{line_number}: "
-                    if column == 1
-                    else f"{line_number} [column {column}]: "
+        remaining = args.max_chars
+        line_prefixes: list[str] = []
+        line_lengths: list[int] = []
+        for index, line in enumerate(visible):
+            line_number = args.start_line + index
+            column = args.start_column if index == 0 else 1
+            if column > len(line) + 1:
+                return ToolResult(
+                    success=False,
+                    output="",
+                    error=(
+                        f"Error: start_column {column} exceeds line {line_number} "
+                        f"length ({len(line)} characters)."
+                    ),
                 )
-                numbered_lines.append(prefix + shown)
-                remaining -= len(shown)
-                if offset + len(shown) < len(line):
-                    continuation = (line_number, column + len(shown))
-                    break
-                if remaining == 0 and index + 1 < len(visible):
-                    continuation = (line_number + 1, 1)
-                    break
+            offset = column - 1
+            preview = line[offset : offset + remaining]
+            line_prefixes.append(preview)
+            line_lengths.append(len(line))
+            remaining -= len(preview)
+            if remaining == 0:
+                break
 
-            if continuation is None and remaining == 0 and len(visible) < selected_count:
-                continuation = (args.start_line + len(visible), 1)
-            context_limited = (
-                source_char_limit < args.max_chars and continuation is not None
-            )
-            truncated = (
-                continuation is not None
-                or selected_count > DEFAULT_MAX_READ_LINES
-                or context_limited
-            )
+        return _ReadFileSnapshot(
+            args=args,
+            metadata=metadata,
+            line_prefixes=tuple(line_prefixes),
+            line_lengths=tuple(line_lengths),
+            visible_line_count=len(visible),
+            selected_count=selected_count,
+            total_lines=len(lines),
+            end_index=end_index,
+        )
 
-            rendered_lines = "\n".join(numbered_lines)
-            output = metadata if not rendered_lines else f"{metadata}\n{rendered_lines}"
-            if continuation is not None:
-                next_line, next_column = continuation
-                context_note = "context budget; " if context_limited else ""
+    @staticmethod
+    def _render_snapshot(
+        snapshot: _ReadFileSnapshot,
+        source_char_limit: int,
+    ) -> ToolResult:
+        args = snapshot.args
+        remaining = source_char_limit
+        numbered_lines: list[str] = []
+        continuation: tuple[int, int] | None = None
+        for index, (line_prefix, line_length) in enumerate(
+            zip(snapshot.line_prefixes, snapshot.line_lengths, strict=True)
+        ):
+            line_number = args.start_line + index
+            column = args.start_column if index == 0 else 1
+            offset = column - 1
+            shown = line_prefix[:remaining]
+            prefix = (
+                f"{line_number}: "
+                if column == 1
+                else f"{line_number} [column {column}]: "
+            )
+            numbered_lines.append(prefix + shown)
+            remaining -= len(shown)
+            if offset + len(shown) < line_length:
+                continuation = (line_number, column + len(shown))
+                break
+            if remaining == 0 and index + 1 < snapshot.visible_line_count:
+                continuation = (line_number + 1, 1)
+                break
+
+        if (
+            continuation is None
+            and remaining == 0
+            and snapshot.visible_line_count < snapshot.selected_count
+        ):
+            continuation = (
+                args.start_line + snapshot.visible_line_count,
+                1,
+            )
+        context_limited = (
+            source_char_limit < args.max_chars and continuation is not None
+        )
+        truncated = (
+            continuation is not None
+            or snapshot.selected_count > DEFAULT_MAX_READ_LINES
+            or context_limited
+        )
+
+        rendered_lines = "\n".join(numbered_lines)
+        output = (
+            snapshot.metadata
+            if not rendered_lines
+            else f"{snapshot.metadata}\n{rendered_lines}"
+        )
+        if continuation is not None:
+            next_line, next_column = continuation
+            context_note = "context budget; " if context_limited else ""
+            output += (
+                "\n[read_file truncated: "
+                f"{context_note}source_chars_limit={source_char_limit}; "
+                f"next_start_line={next_line}; next_start_column={next_column}]"
+            )
+        elif truncated:
+            output = (
+                f"{output}\n"
+                f"{_format_read_truncation_metadata(args.start_line, snapshot.end_index, snapshot.total_lines, snapshot.selected_count)}"
+            )
+            if context_limited:
                 output += (
-                    "\n[read_file truncated: "
-                    f"{context_note}source_chars_limit={source_char_limit}; "
-                    f"next_start_line={next_line}; next_start_column={next_column}]"
+                    "\n[context budget truncated this read; "
+                    "continue from the reported line.]"
                 )
-            elif truncated:
-                output = (
-                    f"{output}\n"
-                    f"{_format_read_truncation_metadata(args.start_line, end_index, len(lines), selected_count)}"
-                )
-                if context_limited:
-                    output += "\n[context budget truncated this read; continue from the reported line.]"
 
-            return ToolResult(
-                success=True,
-                output=output,
-                token_count=count_output_tokens(output),
-                truncated=truncated,
-            )
+        return ToolResult(
+            success=True,
+            output=output,
+            token_count=count_output_tokens(output),
+            truncated=truncated,
+        )
+
+    async def run(self, **kwargs: Any) -> ToolResult:
+        args = ReadFileArgs(**kwargs)
+        snapshot = await self._read_snapshot(args)
+        if isinstance(snapshot, ToolResult):
+            return snapshot
+
+        def build_result(source_char_limit: int) -> ToolResult:
+            return self._render_snapshot(snapshot, source_char_limit)
 
         result = build_result(args.max_chars)
         budget = self.output_budget
@@ -592,105 +659,150 @@ class ReadFilesTool(BaseTool):
                     "request shorter ranges or split the batch."
                 ),
             )
-        outputs: list[str] = []
-        failures = 0
-        truncated = False
-        output_chars = 0
-        omitted = False
-        for index, item in enumerate(args.files, 1):
-            label = f"[{index}/{len(args.files)}] {item.file_path}"
 
-            async def read_with_budget() -> ToolResult:
-                return await self._reader.run(**item.model_dump())
+        snapshots: list[_ReadFileSnapshot | ToolResult] = []
+        for item in args.files:
+            snapshots.append(
+                await self._reader._read_snapshot(ReadFileArgs(**item.model_dump()))
+            )
 
-            budget = self.output_budget
-            if budget is not None:
-                def accepts_read(
-                    candidate: ToolResult,
-                    *,
-                    active_budget: ToolOutputBudget = budget,
-                ) -> bool:
-                    content = (
-                        candidate.output
-                        if candidate.success
-                        else (candidate.error or "Read failed")
-                    )
-                    projected = outputs + [f"{label}\n{content}"]
-                    has_more = index < len(args.files)
-                    if has_more:
-                        projected.append(
-                            "[context budget: remaining requested ranges may be "
-                            "omitted; request smaller focused ranges.]"
-                        )
-                    candidate_output = "\n\n".join(projected)
-                    candidate_failures = failures + int(not candidate.success)
-                    candidate_error = (
-                        f"{candidate_failures} of {len(args.files)} reads failed."
-                        if candidate_failures
-                        else None
-                    )
-                    candidate_result = ToolResult(
-                        success=candidate_failures == 0,
-                        output=candidate_output,
-                        error=candidate_error,
-                        truncated=(truncated or candidate.truncated or has_more),
-                        token_count=count_output_tokens(candidate_output),
-                    )
-                    return active_budget.accepts(candidate_result)
-
-                nested_budget = ToolOutputBudget(
-                    accepts=accepts_read,
-                    can_dispatch=budget.can_dispatch,
+        def rendered_results(source_char_limit: int) -> list[ToolResult]:
+            return [
+                snapshot
+                if isinstance(snapshot, ToolResult)
+                else self._reader._render_snapshot(
+                    snapshot,
+                    min(snapshot.args.max_chars, source_char_limit),
                 )
-                with self._reader.output_budget_context(nested_budget):
-                    result = await read_with_budget()
-            else:
-                result = await read_with_budget()
+                for snapshot in snapshots
+            ]
 
-            content = result.output if result.success else (result.error or "Read failed")
-            rendered = f"{label}\n{content}"
-            if output_chars + len(rendered) + 2 > MAX_BATCH_READ_RENDER_CHARS:
+        def build_candidate(
+            results: list[ToolResult],
+            *,
+            prefix_count: int | None = None,
+        ) -> tuple[int, ToolResult]:
+            outputs: list[str] = []
+            failures = 0
+            truncated = False
+            omitted = False
+            output_chars = 0
+            for index, (item, result) in enumerate(
+                zip(args.files, results, strict=True), 1
+            ):
+                if prefix_count is not None and index > prefix_count:
+                    break
+                content = (
+                    result.output if result.success else (result.error or "Read failed")
+                )
+                rendered = f"[{index}/{len(args.files)}] {item.file_path}\n{content}"
+                if output_chars + len(rendered) + 2 > MAX_BATCH_READ_RENDER_CHARS:
+                    omitted = True
+                    break
+                outputs.append(rendered)
+                output_chars += len(rendered) + 2
+                truncated = truncated or result.truncated
+                failures += not result.success
+
+            retained = len(outputs)
+            error: str | None = None
+            if prefix_count is not None and retained < len(args.files):
+                note = (
+                    f"[context budget: omitted {len(args.files) - retained} requested "
+                    "read outcomes; retry with fewer, focused paths.]"
+                )
+                # Leave space for the omission marker within the render cap.
+                if output_chars + len(note) > MAX_BATCH_READ_RENDER_CHARS:
+                    return -1, ToolResult(success=False, output="")
+                outputs.append(note)
+                error = "Batch read results incomplete due to context budget."
+            elif omitted:
                 outputs.append(
-                    f"[{index}/{len(args.files)}] Remaining batch output omitted; "
+                    f"[{retained + 1}/{len(args.files)}] Remaining batch output omitted; "
                     "request smaller ranges."
                 )
-                omitted = True
-                break
-            outputs.append(rendered)
-            output_chars += len(rendered) + 2
-            truncated = truncated or result.truncated
-            failures += not result.success
-        def build_result(selected: list[str], context_limited: bool) -> ToolResult:
-            output = "\n\n".join(selected)
-            if context_limited:
-                omitted_count = len(args.files) - len(selected)
-                note = (
-                    f"[context budget: omitted {omitted_count} requested read "
-                    "outcomes; retry with fewer, focused paths.]"
-                )
-                output += ("\n\n" if output else "") + note
-                error = "Batch read results incomplete due to context budget."
+                error = "Batch render limit reached; request smaller ranges."
             elif failures:
                 error = f"{failures} of {len(args.files)} reads failed."
-            elif omitted:
-                error = "Batch render limit reached; request smaller ranges."
-            else:
-                error = None
-            return ToolResult(
-                success=failures == 0 and not omitted and not context_limited,
+
+            output = "\n\n".join(outputs)
+            return retained, ToolResult(
+                success=failures == 0 and retained == len(args.files),
                 output=output,
                 error=error,
-                truncated=truncated or omitted or context_limited,
+                truncated=truncated or retained < len(args.files),
                 token_count=count_output_tokens(output),
             )
 
+        requested_limits = tuple(item.max_chars for item in args.files)
+        maximum_limit = max(requested_limits)
+        full_results = rendered_results(maximum_limit)
+        retained, complete = build_candidate(full_results)
         budget = self.output_budget
-        if budget is not None:
-            # Check the final aggregate, including file labels and errors.
-            # The nested read budget cannot intercept an early read_file error
-            # (missing path, stale SHA, bad encoding, etc.).
-            return budget.fit_lines(outputs, build_result)
-        return build_result(outputs, False)
+        if budget is None:
+            return complete
+        if retained == len(args.files) and budget.accepts(complete):
+            return complete
+
+        candidate_limits: set[int] = {1, *requested_limits}
+        limit = 1
+        while limit < maximum_limit:
+            candidate_limits.add(limit)
+            limit *= 2
+
+        # Test actual whole-result admission. Source characters are only a
+        # deterministic rendering knob, not an additive token estimate.
+        # Prefer more requested outcomes, then deeper source previews.
+        best: ToolResult | None = None
+        best_count = -1
+        best_limit = 0
+        nearest_rejected_limit = maximum_limit
+        seen_limits: set[tuple[int, ...]] = set()
+
+        def consider(source_limit: int) -> bool:
+            nonlocal best, best_count, best_limit
+            limits = tuple(min(n, source_limit) for n in requested_limits)
+            if limits in seen_limits:
+                return False
+            seen_limits.add(limits)
+            results = (
+                full_results
+                if source_limit == maximum_limit
+                else rendered_results(source_limit)
+            )
+            count, candidate = build_candidate(results)
+            if count == len(args.files) and budget.accepts(candidate):
+                best, best_count, best_limit = candidate, count, source_limit
+                return True
+            # All outcomes did not fit. Keep the deepest useful ordered
+            # prefix seen so far, not just a prefix of the largest render.
+            for prefix in range(min(count, len(args.files) - 1), best_count, -1):
+                kept, partial = build_candidate(results, prefix_count=prefix)
+                if kept >= 0 and budget.accepts(partial):
+                    best, best_count, best_limit = partial, kept, source_limit
+                    break
+            return False
+
+        for candidate_limit in sorted(candidate_limits, reverse=True):
+            if consider(candidate_limit):
+                break
+            nearest_rejected_limit = candidate_limit
+        if best_count == len(args.files):
+            gap = nearest_rejected_limit - best_limit
+            for divisor in (2, 4, 8):
+                candidate_limit = best_limit + gap // divisor
+                if best_limit < candidate_limit < nearest_rejected_limit:
+                    consider(candidate_limit)
+        if best is not None:
+            return best
+        return ToolResult(
+            success=False,
+            output="",
+            error=(
+                "Context budget left no room for this navigation result; use existing "
+                "evidence, edit/test, or explicitly enabled safe continuation."
+            ),
+        )
 
 
 class WriteFileTool(BaseTool):
