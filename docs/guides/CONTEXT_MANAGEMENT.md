@@ -190,6 +190,26 @@ The additional margin is bounded and may shorten or refuse navigation sooner;
 it cannot guarantee room for arbitrary future completions or tool output.
 Ash does not discard or rewrite opaque replay state. Unknown middleware or
 registered hooks retain the conservative non-projected behavior.
+For a single built-in `run_command` result in an opaque-replay turn, Ash also
+uses the normal context assembler, the active route's `count_tokens` function,
+and native schema accounting to measure the whole projected request. That
+counter may be an estimate; normal next-request admission remains authoritative.
+The default built-in SQLite lexical memory path stays eligible when project
+memory uses SQLite without an embedding adapter: when a preview is needed, Ash
+reserves the existing memory section budget, then the real next request performs
+a fresh retrieval. Transient tool-result images use the existing history
+representation and token-estimation path. When the full redacted result would
+exceed the current projection, Ash stores a bounded provider-history preview
+with explicit excerpt boundaries and omission counts, the execution outcome,
+any available exit code, and available failure evidence. The separately
+recorded command result and terminal event retain the full permitted redacted
+evidence. When the full result fits the current projection, it stays unchanged.
+Mixed tool batches, registered hooks, unknown middleware, embedding-backed
+memory, non-default periodic memory or skill nudges, and failover routes keep
+the full provider result. Instructions and other live context are refreshed at
+the normal next-request boundary after the command result is durably finalized;
+if that fresh request no longer fits, Ash fails closed without repeating the
+command. A preview that cannot fit still receives the normal context rejection.
 `search_text` also supports optional `context_lines=1..5` for nearby source
 lines around each match without a separate read request. Adjacent windows are
 merged, and the match count still controls `max_results`. Matching lines keep
