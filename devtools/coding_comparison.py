@@ -15,7 +15,9 @@ from typing import Any
 from codex_repository_benchmark import (
     HOST_APP_FEATURES, HOST_CONNECTOR_CHECK_METHOD, summarize_codex_events,
 )
-from evaluation_files import VERIFICATION_ORDER_VERSION, verification_freshness
+from evaluation_files import (
+    VERIFICATION_ORDER_VERSION, verification_freshness, read_edit_evidence,
+)
 from repository_benchmark import (
     TASKS,
     ash_completion_verified,
@@ -59,6 +61,72 @@ def _valid_sha256(value: object) -> bool:
         and len(value) == 64
         and all(character in "0123456789abcdef" for character in value)
     )
+
+
+def _final_evidence(
+    directory: Path, receipt: dict[str, Any], oracle: dict[str, Any],
+    editable: frozenset[str] | None,
+) -> dict[str, Any] | None:
+    """Check additive final-source evidence without changing legacy scores."""
+    grade = receipt.get("independent_grade_evidence")
+    edits = receipt.get("edit_evidence")
+    if grade is None and edits is None:
+        artifact = directory / "editable-changes.json"
+        if artifact.exists() or artifact.is_symlink():
+            raise ValueError("final-source receipt missing for retained artifact")
+        return None
+    if not isinstance(grade, dict) or not isinstance(edits, dict):
+        raise ValueError("incomplete final-source evidence")
+    submitted = grade.get("submitted_sha256")
+    if (
+        grade.get("version") != 1 or grade.get("scope") != "independent-oracles"
+        or not _valid_sha256(submitted) or edits.get("version") != 1
+    ):
+        raise ValueError("invalid final-source evidence")
+    status = grade.get("status")
+    if status == "stable_snapshots":
+        if grade.get("before_sha256") != submitted or grade.get("after_sha256") != submitted:
+            raise ValueError("independent grading snapshot mismatch")
+    elif status in ("unsafe_submission", "changed_before_grading", "changed_during_grading"):
+        if oracle.get("correct") is not False or receipt.get("passed") is True:
+            raise ValueError("unstable source cannot pass independent grading")
+        if status == "changed_before_grading" and (
+            not _valid_sha256(grade.get("before_sha256"))
+            or grade.get("before_sha256") == submitted
+        ):
+            raise ValueError("invalid pre-grading source drift")
+        if status == "unsafe_submission" and grade.get("before_sha256") != submitted:
+            raise ValueError("invalid unsafe submission snapshot")
+        if status == "changed_during_grading" and (
+            grade.get("before_sha256") != submitted
+            or not _valid_sha256(grade.get("after_sha256"))
+            or grade.get("after_sha256") == submitted
+        ):
+            raise ValueError("invalid changed grading snapshot")
+    else:
+        raise ValueError("invalid independent grading status")
+    complete = None
+    if edits.get("status") == "retained":
+        if edits.get("submitted_sha256") != submitted or not _valid_sha256(edits.get("original_sha256")):
+            raise ValueError("editable artifact source identity mismatch")
+        checked = read_edit_evidence(directory, edits)
+        changed = receipt.get("changed_paths")
+        if not isinstance(changed, list) or any(not isinstance(p, str) for p in changed):
+            raise ValueError("invalid changed path receipt")
+        if editable is not None and checked["paths"] != sorted(set(changed) & editable):
+            raise ValueError("editable artifact paths mismatch")
+        complete = checked["complete"]
+    elif edits.get("status") != "private_directory_required":
+        raise ValueError("invalid editable artifact status")
+    elif (directory / "editable-changes.json").exists() or (
+        directory / "editable-changes.json"
+    ).is_symlink():
+        raise ValueError("unexpected editable artifact")
+    return {
+        "independent_grade_status": status,
+        "editable_artifact_complete": complete,
+        "editable_artifact_status": edits.get("status"),
+    }
 
 
 def compare(ash_dir: Path, codex_dir: Path) -> dict[str, Any]:
@@ -366,6 +434,18 @@ def compare(ash_dir: Path, codex_dir: Path) -> dict[str, Any]:
         and codex.get("protected_files_unchanged") is True
         and codex.get("required_source_changed") is True
     )
+    editable = registered_task.editable if registered_task is not None else None
+    ash_final_evidence = _final_evidence(ash_dir, ash, ash_oracle, editable)
+    codex_final_evidence = _final_evidence(codex_dir, codex, codex_oracle, editable)
+    if (ash_final_evidence is None) != (codex_final_evidence is None):
+        raise ValueError("final-source evidence versions differ between engines")
+    grading_source_stable = not any(
+        item is not None and item["independent_grade_status"] in (
+            "changed_before_grading", "changed_during_grading",
+        ) for item in (ash_final_evidence, codex_final_evidence)
+    )
+    if not grading_source_stable:
+        comparison_caveats.append("Source drift around independent grading excludes the pair.")
     # The Ash receipt's elapsed_seconds includes preflight and grading,
     # whereas the Codex receipt's elapsed_seconds is only the CLI. Use the
     # instrumented child-process intervals for any speed comparison.
@@ -568,7 +648,8 @@ def compare(ash_dir: Path, codex_dir: Path) -> dict[str, Any]:
     if codex_score_eligible is True and (not auth_cleanup_verified or not score_claims_consistent):
         codex_score_eligible = False
     comparison_verified = bool(
-        same_upstream_revision_pins
+        grading_source_stable
+        and same_upstream_revision_pins
         and objective_verified
         and same_user_prompt
         and oracle_source_identical
@@ -613,6 +694,7 @@ def compare(ash_dir: Path, codex_dir: Path) -> dict[str, Any]:
         "requested_effort": ash_effort if requested_model_effort_match else None,
         "ash": {
             "correct_source": ash_source_correct,
+            "final_source_evidence": ash_final_evidence,
             "visible_test_command_executed": _recorded_bool(
                 ash, "visible_test_command_executed"
             ),
@@ -633,6 +715,7 @@ def compare(ash_dir: Path, codex_dir: Path) -> dict[str, Any]:
         },
         "codex": {
             "correct_source": codex_source_correct,
+            "final_source_evidence": codex_final_evidence,
             "visible_test_command_executed": (
                 event_trace.get("visible_test_command_executed")
                 if event_trace_valid and event_trace is not None

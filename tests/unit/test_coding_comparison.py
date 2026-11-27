@@ -152,6 +152,71 @@ def test_comparison_separates_correct_code_from_terminal_completion(
     assert report["codex"]["elapsed_scope"] == "cli_only"
 
 
+@pytest.mark.parametrize("fault", [
+    None, "artifact", "receipt", "snapshot", "missing", "both-missing",
+    "claimed-stable", "mismatched-paths",
+])
+def test_final_source_evidence_is_verified_without_echoing_text(tmp_path, fault):
+    from evaluation_files import (
+        capture_editable_text, retain_edit_evidence,
+        snapshot_digest, snapshot_workspace_files,
+    )
+
+    ash, codex = _evidence(tmp_path)
+    for directory, receipt_name in ((ash, "result.json"), (codex, "grade.json")):
+        directory.chmod(0o700)
+        workspace = tmp_path / (directory.name + "-source")
+        workspace.mkdir()
+        source = workspace / "code.py"
+        source.write_text("BASE CONTENT")
+        editable = frozenset({"code.py"})
+        original = snapshot_workspace_files(workspace)
+        before = capture_editable_text(workspace, original, editable)
+        source.write_text("FINAL PRIVATE SOURCE CONTENT")
+        submitted = snapshot_workspace_files(workspace)
+        after = capture_editable_text(workspace, submitted, editable)
+        edits = retain_edit_evidence(directory, before, after, original, submitted)
+        digest = snapshot_digest(submitted)
+        receipt_path = directory / receipt_name
+        receipt = json.loads(receipt_path.read_text())
+        receipt["changed_paths"] = ["code.py"]
+        receipt["edit_evidence"] = edits
+        receipt["independent_grade_evidence"] = {
+            "version": 1, "scope": "independent-oracles", "status": "stable_snapshots",
+            "submitted_sha256": digest, "before_sha256": digest, "after_sha256": digest,
+        }
+        if fault == "both-missing" or (fault == "missing" and directory == ash):
+            receipt.pop("edit_evidence")
+            receipt.pop("independent_grade_evidence")
+        elif directory == ash:
+            if fault == "artifact":
+                (directory / "editable-changes.json").write_text("{}")
+            elif fault == "receipt":
+                edits["submitted_sha256"] = "0" * 64
+            elif fault == "snapshot":
+                receipt["independent_grade_evidence"]["after_sha256"] = "0" * 64
+            elif fault == "claimed-stable":
+                receipt["independent_grade_evidence"]["status"] = "changed_during_grading"
+        receipt_path.write_text(json.dumps(receipt))
+    if fault == "mismatched-paths":
+        receipt = json.loads((ash / "result.json").read_text())
+        with pytest.raises(ValueError, match="paths mismatch"):
+            comparison._final_evidence(ash, receipt, receipt["oracle"], frozenset({"other.py"}))
+    elif fault:
+        with pytest.raises(ValueError):
+            comparison.compare(ash, codex)
+    else:
+        report = comparison.compare(ash, codex)
+        for engine in ("ash", "codex"):
+            assert report[engine]["final_source_evidence"] == {
+                "independent_grade_status": "stable_snapshots",
+                "editable_artifact_complete": True,
+                "editable_artifact_status": "retained",
+            }
+            assert report[engine]["verification_freshness"] == "unknown"
+        assert "FINAL PRIVATE SOURCE CONTENT" not in repr(report)
+
+
 def test_legacy_receipts_keep_host_isolation_unknown_and_are_not_pair_eligible(
     tmp_path: Path,
 ) -> None:

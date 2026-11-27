@@ -281,6 +281,29 @@ symmetric observed-order requirement, not proof of final-source verification.
 The comparator recomputes order evidence and rejects mixed or inconsistent
 rubrics; historical receipts retain their original grades.
 
+Both repository runners now retain `editable-changes.json` in private
+evidence directories outside Git. It contains exact before/after UTF-8
+text and mode/content fingerprints for changed allowlisted paths only,
+including additions and deletions. Text that exceeds the bounded retention
+limits, is not supported text, cannot be read safely, or matches the existing
+secret-redaction policy is omitted and the artifact explicitly marked
+incomplete. Secret detection is not exhaustive; keep all evidence private.
+The file is created without overwriting an existing artifact, mode 0600,
+and its digest is bound to the submitted source snapshot in the grade.
+The comparator verifies the artifact's digest, retained text fingerprints
+and scope, and never includes source text in its report.
+
+Separately, `independent_grade_evidence` records source snapshot digests
+immediately before and after the sealed oracle runs. An unsafe snapshot or
+detected source change prevents an independent correctness pass. Detected
+drift before or during grading excludes the comparison, rather than
+assuming the agent caused that drift. This is
+an observed snapshot check over the normal scored source files (excluding
+Git metadata and directories), not proof against an unrelated host process
+changing and restoring bytes during grading. It is **not** a hash attestation
+of the agent's own earlier visible test. The existing verification-freshness
+rubric and legacy scores remain unchanged.
+
 The flag authorizes **every Ash and Codex model run in the selected batch**
 (up to six pairs), not merely one child. Never reuse it without a fresh
 correspondingly scoped owner approval. Missing authorization fails without

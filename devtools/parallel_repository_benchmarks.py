@@ -276,6 +276,10 @@ def run_pair(
                 }
                 for engine in ("ash", "codex")
             },
+            final_source_evidence={
+                engine: comparison[engine]["final_source_evidence"]
+                for engine in ("ash", "codex")
+            },
             ash_cli_seconds=comparison["ash"]["cli_seconds"],
             codex_cli_seconds=comparison["codex"]["cli_seconds"],
             timing_available=evaluation["matching_cli_timing_available"],

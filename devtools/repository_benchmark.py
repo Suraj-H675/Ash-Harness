@@ -46,6 +46,9 @@ from evaluation_files import (
     UNSAFE_ENTRIES,
     VERIFICATION_ORDER_VERSION,
     content_identity,
+    capture_editable_text,
+    independent_grade_evidence,
+    retain_edit_evidence,
     snapshot_workspace_files as snapshot_files,
     verification_freshness,
 )
@@ -4822,6 +4825,7 @@ def run_task(
             verify_task_runtime(workspace, task.runtime, runtime_receipt)
         original = snapshot_files(workspace)
         validate_editable_paths(original, task.editable, preflight_receipt)
+        original_edits = capture_editable_text(workspace, original, task.editable)
         _stage_chatgpt_access_only(home, account, timeout=timeout)
         (home / ".ash" / "ash.toml").write_text('sandbox_backend = "native"\n')
         db = scratch / "db"
@@ -4928,7 +4932,13 @@ def run_task(
             task.editable,
             require_all_editable_changed=task.require_all_editable_changed,
         )
-        oracle = check_oracles(workspace, task)
+        final_edits = capture_editable_text(workspace, updated, task.editable)
+        oracle, independent_grade = independent_grade_evidence(
+            workspace, updated, lambda: check_oracles(workspace, task),
+        )
+        edit_evidence = retain_edit_evidence(
+            evidence, original_edits, final_edits, original, updated,
+        )
         store = SessionStore(db / "sessions.db")
         aggregated = collect_coding_session_receipts(store, workspace)
         calls = aggregated["calls"]
@@ -5010,6 +5020,8 @@ def run_task(
             "timed_out": timed_out,
             "terminal_error_category": headless_error_category(evidence / "ash.stdout"),
             "oracle": oracle,
+            "independent_grade_evidence": independent_grade,
+            "edit_evidence": edit_evidence,
             "protected_files_unchanged": protected,
             "required_sources_changed": changed,
             "required_tools_succeeded": required,

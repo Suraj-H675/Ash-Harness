@@ -1650,7 +1650,7 @@ def test_r17_ash_fake_grade_accepts_one_semantic_source_repair(
         monkeypatch.setattr(bench, "preflight", unexpected_fetch)
 
     evidence = tmp_path / "ash-evidence"
-    evidence.mkdir()
+    evidence.mkdir(mode=0o700)
     result = bench.run_task(
         task_name,
         model="gpt-6-luna",
@@ -1672,6 +1672,17 @@ def test_r17_ash_fake_grade_accepts_one_semantic_source_repair(
     assert result["visible_test_command_passed"] is True
     assert result["oracle"]["correct"] is True
     assert result["scratch_removed"] is True
+    assert result["independent_grade_evidence"]["status"] == "stable_snapshots"
+    assert result["edit_evidence"]["complete"] is True
+    artifact = json.loads((evidence / "editable-changes.json").read_text())
+    assert len(artifact["entries"]) == 1
+    entry = artifact["entries"][0]
+    assert entry["path"] == "src/_pytest/fixtures.py"
+    assert entry["before"]["text"] == "baseline"
+    assert entry["after"]["text"] == ("repaired again" if late_edit else "repaired")
+    assert result["edit_evidence"]["submitted_sha256"] == (
+        result["independent_grade_evidence"]["submitted_sha256"]
+    )
     assert any(task.command_grant in " ".join(argv) for argv in setup_commands)
     if prepared:
         assert result["preflight"]["paired_preparation_sha256"] == digest

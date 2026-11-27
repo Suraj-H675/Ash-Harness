@@ -513,6 +513,59 @@ def test_pair_alternates_order_and_validates_external_receipts(
     assert (tmp_path / f"h11-chunk-footer-r{rep:02d}/summary.json").is_file()
 
 
+def test_detected_grading_source_drift_excludes_pair_without_reclassifying_legacy(
+    tmp_path: Path,
+) -> None:
+    from evaluation_files import (
+        capture_editable_text, independent_grade_evidence,
+        retain_edit_evidence, snapshot_workspace_files,
+    )
+
+    task_name = "h11-chunk-footer"
+    task = TASKS[task_name]
+    def fake_invoke(argv, evidence):
+        _emit_receipt(task_name, evidence)
+        workspace = tmp_path / (evidence.name + "-source")
+        workspace.mkdir()
+        path = sorted(task.editable)[0]
+        source = workspace / path
+        source.parent.mkdir(parents=True, exist_ok=True)
+        source.write_text("before")
+        original = snapshot_workspace_files(workspace)
+        before = capture_editable_text(workspace, original, task.editable)
+        source.write_text("after")
+        submitted = snapshot_workspace_files(workspace)
+        after = capture_editable_text(workspace, submitted, task.editable)
+        def grade():
+            if evidence.name == "ash":
+                source.write_text("host drift")
+            return {"correct": True, "visible_oracle_exit": 0, "hidden_oracle_exit": 0}
+        oracle, proof = independent_grade_evidence(workspace, submitted, grade)
+        edits = retain_edit_evidence(evidence, before, after, original, submitted)
+        receipt_path = evidence / ("result.json" if evidence.name == "ash" else "grade.json")
+        receipt = json.loads(receipt_path.read_text())
+        receipt["changed_paths"] = [path]
+        receipt["edit_evidence"] = edits
+        receipt["independent_grade_evidence"] = proof
+        receipt["oracle" if evidence.name == "ash" else "oracles"] = oracle
+        receipt["passed"] = oracle["correct"]
+        receipt["exit_code"] = 0 if oracle["correct"] else 1
+        receipt_path.write_text(json.dumps(receipt))
+        return receipt["exit_code"]
+
+    result = run_pair(task_name, 1, tmp_path, 170, 32768,
+                      invoke=fake_invoke, authorize_model_trial=True)
+    assert result["comparison_verified"] is False
+    assert result["score_eligible"] is False
+    assert result["final_source_evidence"]["ash"]["independent_grade_status"] == (
+        "changed_during_grading"
+    )
+    assert result["final_source_evidence"]["codex"]["independent_grade_status"] == (
+        "stable_snapshots"
+    )
+    assert any("Source drift" in caveat for caveat in result["comparison_caveats"])
+
+
 def test_pair_preserves_correct_code_and_test_but_failed_completion(
     tmp_path: Path,
 ) -> None:

@@ -42,7 +42,10 @@ from repository_benchmark import (
     verify_task_runtime,
 )
 from coding_benchmark import _chatgpt_tmpfs_root
-from evaluation_files import VERIFICATION_ORDER_VERSION, verification_freshness
+from evaluation_files import (
+    VERIFICATION_ORDER_VERSION, verification_freshness,
+    capture_editable_text, independent_grade_evidence, retain_edit_evidence,
+)
 
 
 MAX_EVENT_BYTES = 32 * 1024 * 1024
@@ -858,6 +861,7 @@ def run_task(
             verify_task_runtime(workspace, task.runtime, runtime_receipt)
         initial = snapshot_files(workspace)
         validate_editable_paths(initial, task.editable, preflight_receipt)
+        original_edits = capture_editable_text(workspace, initial, task.editable)
 
         prompt = shared_user_prompt(task)
         (evidence / "prompt.txt").write_text(prompt, encoding="utf-8")
@@ -909,7 +913,13 @@ def run_task(
             task.editable,
             require_all_editable_changed=task.require_all_editable_changed,
         )
-        oracles = check_oracles(workspace, task)
+        final_edits = capture_editable_text(workspace, updated, task.editable)
+        oracles, independent_grade = independent_grade_evidence(
+            workspace, updated, lambda: check_oracles(workspace, task),
+        )
+        edit_evidence = retain_edit_evidence(
+            evidence, original_edits, final_edits, initial, updated,
+        )
         try:
             events = summarize_codex_events(
                 evidence / "codex.jsonl", task.command_grant
@@ -998,6 +1008,8 @@ def run_task(
             "verification_freshness": freshness,
             "protected_files_unchanged": protected,
             "required_source_changed": changed,
+            "independent_grade_evidence": independent_grade,
+            "edit_evidence": edit_evidence,
             "oracles": {
                 key: value
                 for key, value in oracles.items()

@@ -828,7 +828,7 @@ def test_scoring_rejects_modified_oracle_and_cleans_scratch(
         },
     )
     evidence = tmp_path / "evidence"
-    evidence.mkdir()
+    evidence.mkdir(mode=0o700)
     result = run_task(
         "fixture",
         evidence=evidence,
@@ -842,6 +842,13 @@ def test_scoring_rejects_modified_oracle_and_cleans_scratch(
     assert result["visible_test_command_executed"] is True
     assert result["visible_test_command_passed"] is (test_exit_code == 0)
     assert result["scratch_removed"] is True
+    assert result["independent_grade_evidence"]["status"] == "stable_snapshots"
+    assert result["edit_evidence"]["complete"] is True
+    artifact = json.loads((evidence / "editable-changes.json").read_text())
+    assert len(artifact["entries"]) == 1
+    assert artifact["entries"][0]["path"] == "source.py"
+    assert artifact["entries"][0]["before"]["text"] == "BROKEN"
+    assert artifact["entries"][0]["after"]["text"] == "FIXED"
     assert result["context_tokens_requested"] == 32768
     assert not scratch_roots[0].exists()
     assert (evidence / "grade.json").is_file()
