@@ -4996,18 +4996,31 @@ def main() -> int:
     if not PYTHON.is_file() or not shutil.which("bwrap") or not shutil.which("git"):
         parser.error("repository benchmark requires Ash venv, Git, and Bubblewrap")
     try:
-        _chatgpt_tmpfs_root()
-        account = ChatGPTCredentialStore().active()
-        if account is None or not account.access_usable(
-            now=time.time() + args.timeout + 30
-        ):
-            raise ValueError("active ChatGPT access must cover the trial")
+        try:
+            _chatgpt_tmpfs_root()
+        except ValueError as exc:
+            parser.error(str(exc))
+        store = ChatGPTCredentialStore()
+        selected = store.active()
+        if selected is None or not selected.signed_in or not selected.plan_enabled:
+            parser.error("active ChatGPT access must cover the trial")
+        # Model discovery uses the supported refresh flow for the existing
+        # registration. Check the resulting credential, not the expired
+        # snapshot taken before discovery, and do not silently switch accounts.
         catalog = {slug for slug, _ in asyncio.run(list_chatgpt_models())}
+        account = store.active()
+        if account is None or (
+            account.client_id, account.issuer, account.subject, account.ext_agent_host_id
+        ) != (
+            selected.client_id, selected.issuer, selected.subject, selected.ext_agent_host_id
+        ):
+            parser.error("active ChatGPT registration changed during preflight")
+        if not account.access_usable(now=time.time() + args.timeout + 30):
+            parser.error("active ChatGPT access must cover the trial")
         if args.chatgpt_model not in catalog:
-            raise ValueError("selected model not available in active ChatGPT plan")
-    except ValueError as exc:
-        parser.error(str(exc))
+            parser.error("selected model not available in active ChatGPT plan")
     except Exception as exc:
+        # Provider/credential errors may contain private response details.
         parser.error("ChatGPT authorization preflight failed: " + type(exc).__name__)
     if args.evidence_dir.exists():
         parser.error("evidence directory already exists; never overwrite a trial")

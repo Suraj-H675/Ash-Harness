@@ -31,6 +31,116 @@ sys.modules[_spec.name] = bench
 _spec.loader.exec_module(bench)
 
 
+@pytest.mark.parametrize(
+    ("scenario", "error"),
+    [
+        ("refresh", None),
+        ("insufficient-lifetime", "active ChatGPT access must cover the trial"),
+        ("exact-boundary", "active ChatGPT access must cover the trial"),
+        ("switched-account", "active ChatGPT registration changed during preflight"),
+        ("missing-model", "selected model not available in active ChatGPT plan"),
+        ("catalog-error", "ChatGPT authorization preflight failed: RuntimeError"),
+        ("catalog-value-error", "ChatGPT authorization preflight failed: ValueError"),
+    ],
+)
+def test_repository_cli_reloads_authorized_account_after_catalog_refresh(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    scenario: str,
+    error: str | None,
+) -> None:
+    from ash.providers.openai_chatgpt_auth import (
+        CHATGPT_ISSUER,
+        CHATGPT_REQUIRED_PLAN_SCOPE,
+    )
+
+    before = bench.ChatGPTAccount(
+        client_id="oaiapp_fixture",
+        subject="fixture-subject",
+        email="fixture@example.invalid",
+        issuer=CHATGPT_ISSUER,
+        ext_agent_host_id="urn:uuid:00000000-0000-4000-8000-000000000001",
+        id_token="FAKE-ID-ONLY",
+        access_token="FAKE-EXPIRED-ONLY",
+        refresh_token="FAKE-REFRESH-ONLY",
+        token_type="Bearer",
+        scopes=(CHATGPT_REQUIRED_PLAN_SCOPE,),
+        expires_at=999,
+        earliest_refresh_at=0,
+        saved_at=900,
+    )
+    after = replace(before, access_token="FAKE-RENEWED-ONLY", expires_at=4600)
+    if scenario == "insufficient-lifetime":
+        after = replace(after, expires_at=1449)
+    elif scenario == "exact-boundary":
+        after = replace(after, expires_at=1450)
+    elif scenario == "switched-account":
+        after = replace(after, client_id="oaiapp_other", subject="other-subject")
+
+    current = before
+    catalog_calls = 0
+    trial_calls = 0
+    evidence = tmp_path / "evidence"
+
+    class Store:
+        def active(self):
+            return current
+
+    async def catalog():
+        nonlocal current, catalog_calls
+        catalog_calls += 1
+        if scenario == "catalog-error":
+            raise RuntimeError("FAKE-PRIVATE-PAYLOAD")
+        if scenario == "catalog-value-error":
+            raise ValueError("FAKE-PRIVATE-PAYLOAD")
+        current = after
+        if scenario == "missing-model":
+            return (("other-model", "Other"),)
+        return (("gpt-6-luna", "Luna"),)
+
+    def run_task(*args: object, **kwargs: object) -> dict[str, object]:
+        nonlocal trial_calls
+        trial_calls += 1
+        assert kwargs["account"] is after
+        assert kwargs["timeout"] == 300
+        assert kwargs["model"] == "gpt-6-luna"
+        assert kwargs["reasoning_effort"] == "xhigh"
+        return {
+            "task": "toolz-partition-invalid-length",
+            "passed": True,
+            "oracle": {},
+            "elapsed_seconds": 0.0,
+        }
+
+    monkeypatch.setattr(bench, "ChatGPTCredentialStore", Store)
+    monkeypatch.setattr(bench, "list_chatgpt_models", catalog)
+    monkeypatch.setattr(bench, "_chatgpt_tmpfs_root", lambda: tmp_path)
+    monkeypatch.setattr(bench.time, "time", lambda: 1000)
+    monkeypatch.setattr(bench.shutil, "which", lambda _: "/usr/bin/bwrap")
+    monkeypatch.setattr(bench, "run_task", run_task)
+    monkeypatch.setattr(sys, "argv", [
+        "repository_benchmark.py", "--task", "toolz-partition-invalid-length",
+        "--chatgpt-model", "gpt-6-luna", "--reasoning-effort", "xhigh",
+        "--timeout", "300", "--evidence-dir", str(evidence),
+    ])
+
+    if error is None:
+        assert bench.main() == 0
+        assert trial_calls == 1
+    else:
+        with pytest.raises(SystemExit) as exc:
+            bench.main()
+        assert exc.value.code == 2
+        assert trial_calls == 0
+        assert not evidence.exists()
+    assert catalog_calls == 1
+    output = capsys.readouterr()
+    if error is not None:
+        assert error in output.err
+    assert "FAKE-" not in output.out + output.err
+
+
 def test_interrupted_repository_trial_reaps_isolated_child_group(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
