@@ -27,7 +27,7 @@ from ash.providers.capabilities import ProviderCapabilities
 from ash.safety.guard import SafetyGuard
 from ash.tools.command import RunCommandTool
 from ash.tools.base import ToolMiddleware, ToolResult
-from ash.tools.filesystem import WriteFileTool
+from ash.tools.filesystem import ReadFileTool, WriteFileTool
 from ash.ui.terminal import TerminalUI
 
 
@@ -61,6 +61,8 @@ class _OpaqueCommandProvider(ProviderABC):
         byte_sensitive_counting: bool = False,
         timeout_after_output: bool = False,
         mixed_batch: bool = False,
+        mixed_batch_order: str = "command_then_write",
+        mixed_navigation: bool = False,
     ) -> None:
         self.repair_after_failure = repair_after_failure
         self.verbose = verbose
@@ -68,6 +70,8 @@ class _OpaqueCommandProvider(ProviderABC):
         self.byte_sensitive_counting = byte_sensitive_counting
         self.timeout_after_output = timeout_after_output
         self.mixed_batch = mixed_batch
+        self.mixed_batch_order = mixed_batch_order
+        self.mixed_navigation = mixed_navigation
         self.calls = 0
         self.requests: list[list[dict[str, object]]] = []
         self.schemas: list[list[dict[str, object]] | None] = []
@@ -121,24 +125,35 @@ class _OpaqueCommandProvider(ProviderABC):
             command_arguments: dict[str, object] = {"command_line": command}
             if self.timeout_after_output:
                 command_arguments["timeout_seconds"] = 1
-            native_tool_calls = [
+            native_tool_calls: list[dict[str, object]] = []
+            mixed_write_call = {
+                "id": "r52-mixed-write",
+                "name": "write_file",
+                "arguments": {
+                    "file_path": "mixed-batch-side-effect.txt",
+                    "content": "write occurred once\n",
+                },
+            }
+            if self.mixed_batch and self.mixed_batch_order == "write_then_command":
+                native_tool_calls.append(mixed_write_call)
+            if self.mixed_navigation:
+                native_tool_calls.append(
+                    {
+                        "id": "r52-read-before-command",
+                        "name": "read_file",
+                        "arguments": {"file_path": "target.py"},
+                    }
+                )
+            native_tool_calls.append(
                 {
                     "id": "r52-command-initial",
                     "name": "run_command",
                     "arguments": command_arguments,
                 }
-            ]
+            )
             if self.mixed_batch:
-                native_tool_calls.append(
-                    {
-                        "id": "r52-mixed-write",
-                        "name": "write_file",
-                        "arguments": {
-                            "file_path": "mixed-batch-side-effect.txt",
-                            "content": "write occurred once\n",
-                        },
-                    }
-                )
+                if self.mixed_batch_order != "write_then_command":
+                    native_tool_calls.append(mixed_write_call)
             yield StreamChunk(
                 is_done=True,
                 native_tool_calls=native_tool_calls,
@@ -311,6 +326,9 @@ def _make_loop(
     byte_sensitive_counting: bool = False,
     timeout_after_output: bool = False,
     mixed_batch: bool = False,
+    mixed_batch_order: str = "command_then_write",
+    mixed_navigation: bool = False,
+    include_read_file: bool = False,
 ) -> tuple[AshLoop, SessionStore, _EventUI, _OpaqueCommandProvider]:
     guard = SafetyGuard(project_root=tmp_path)
     store = SessionStore(tmp_path / "sessions.db")
@@ -322,17 +340,22 @@ def _make_loop(
         byte_sensitive_counting=byte_sensitive_counting,
         timeout_after_output=timeout_after_output,
         mixed_batch=mixed_batch,
+        mixed_batch_order=mixed_batch_order,
+        mixed_navigation=mixed_navigation,
     )
+    tools = {
+        "write_file": WriteFileTool(guard),
+        "run_command": RunCommandTool(guard, project_root=tmp_path),
+    }
+    if include_read_file:
+        tools["read_file"] = ReadFileTool(guard)
     loop = AshLoop(
         store,
         provider,
         guard,
         ui,
         tmp_path,
-        tools={
-            "write_file": WriteFileTool(guard),
-            "run_command": RunCommandTool(guard, project_root=tmp_path),
-        },
+        tools=tools,
         tool_middlewares=[SecretRedactionMiddleware()],
         safety_tier="auto_approve",
         system_prompt="Synthetic command context test.",
@@ -1220,6 +1243,72 @@ async def test_mixed_command_and_write_calls_keep_full_results_and_dispatch(
         assert "provider-history preview" not in command_message.content
         command_payload = json.loads(ET.fromstring(command_message.content).text or "")
         assert command_payload["output"] == _VERBOSE_OUTPUT + "VERIFICATION_OK\n"
+        assert store.verify_audit_log(session.session_id) == []
+    finally:
+        await loop.aclose()
+
+
+@pytest.mark.asyncio
+async def test_mixed_navigation_before_command_admits_bounded_results(
+    tmp_path: Path,
+) -> None:
+    _write_verifier(tmp_path)
+    loop, store, _, provider = _make_loop(
+        tmp_path,
+        repair_after_failure=False,
+        verbose=True,
+        mixed_navigation=True,
+        include_read_file=True,
+    )
+    try:
+        session = await loop.start_session()
+        assert await loop.run_turn("Inspect, edit, and verify the workspace") == (
+            "Repair and verification evidence complete"
+        )
+
+        assert provider.calls == 3
+        assert (tmp_path / "target.py").read_bytes() == b"value = 42\n"
+        assert (tmp_path / "check-count.txt").read_text(encoding="utf-8") == "1"
+        saved = store.load_session(session.session_id)
+        read_call = next(
+            record for record in saved.tool_calls if record.call_id == "r52-read-before-command"
+        )
+        command = next(
+            record for record in saved.tool_calls if record.call_id == "r52-command-initial"
+        )
+        assert read_call.approved and read_call.dispatched and read_call.executed
+        assert read_call.success is True
+        assert "value = 42" in read_call.result
+        assert command.approved and command.dispatched and command.executed
+        assert command.success is True and command.exit_code == 0
+        assert command.result == _VERBOSE_OUTPUT + "VERIFICATION_OK\n"
+        tool_ids = [
+            message.metadata.get("call_id")
+            for message in saved.messages
+            if message.role == "tool"
+            and message.metadata.get("call_id")
+            in {"r52-read-before-command", "r52-command-initial"}
+        ]
+        assert tool_ids == ["r52-read-before-command", "r52-command-initial"]
+        request_ids = [
+            message.get("tool_call_id")
+            for message in provider.requests[2]
+            if message.get("role") == "tool"
+            and message.get("tool_call_id")
+            in {"r52-read-before-command", "r52-command-initial"}
+        ]
+        assert request_ids == tool_ids
+        command_message = next(
+            message
+            for message in saved.messages
+            if message.role == "tool"
+            and message.metadata.get("call_id") == "r52-command-initial"
+        )
+        payload = json.loads(ET.fromstring(command_message.content).text or "")
+        assert payload["provider_preview_truncated"] is True
+        assert payload["success"] is True and payload["exit_code"] == 0
+        assert "VERIFICATION_OK" in payload["output"]
+        assert payload["provider_preview_omitted"]["output_utf8_bytes"] > 0
         assert store.verify_audit_log(session.session_id) == []
     finally:
         await loop.aclose()

@@ -190,7 +190,7 @@ The additional margin is bounded and may shorten or refuse navigation sooner;
 it cannot guarantee room for arbitrary future completions or tool output.
 Ash does not discard or rewrite opaque replay state. Unknown middleware or
 registered hooks retain the conservative non-projected behavior.
-For a single built-in `run_command` result in an opaque-replay turn, Ash also
+For an eligible built-in `run_command` result in an opaque-replay turn, Ash also
 uses the normal context assembler, the active route's `count_tokens` function,
 and native schema accounting to measure the whole projected request. That
 counter may be an estimate; normal next-request admission remains authoritative.
@@ -204,10 +204,15 @@ with explicit excerpt boundaries and omission counts, the execution outcome,
 any available exit code, and available failure evidence. The separately
 recorded command result and terminal event retain the full permitted redacted
 evidence. When the full result fits the current projection, it stays unchanged.
-Mixed tool batches, registered hooks, unknown middleware, embedding-backed
-memory, non-default periodic memory or skill nudges, and failover routes keep
-the full provider result. Instructions and other live context are refreshed at
-the normal next-request boundary after the command result is durably finalized;
+A batch with one final built-in command is also eligible if its preceding
+calls are built-in writes or budgeted navigation calls and their results have
+already been durably recorded in order. A dirty repository map still prevents
+projection; a write with the map enabled can therefore make this batch
+ineligible. Batches with later siblings or multiple commands, registered hooks,
+unknown middleware, embedding-backed memory, non-default periodic memory or
+skill nudges, and failover routes keep the full provider result. Instructions
+and other live context are refreshed at the normal next-request boundary after
+the command result is durably finalized;
 if that fresh request no longer fits, Ash fails closed without repeating the
 command. A preview that cannot fit still receives the normal context rejection.
 `search_text` also supports optional `context_lines=1..5` for nearby source

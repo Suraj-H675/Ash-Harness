@@ -85,7 +85,11 @@ class _DefaultMemoryCommandProvider(ProviderABC):
                         "arguments": {
                             "file_path": "target.py",
                             "content": "value = "
-                            + ("41\n" if self.scenario == "repair" else "42\n"),
+                            + (
+                                "41\n"
+                                if self.scenario in {"repair", "mixed-repair", "navigation-repair"}
+                                else "42\n"
+                            ),
                         },
                     }
                 ],
@@ -98,15 +102,34 @@ class _DefaultMemoryCommandProvider(ProviderABC):
             command += " --verbose"
 
         if call_number == 2:
+            native_tool_calls = []
+            if self.scenario.startswith("mixed-"):
+                native_tool_calls.append(
+                    {
+                        "id": "default-memory-mixed-write",
+                        "name": "write_file",
+                        "arguments": {
+                            "file_path": "batch-side-effect.txt",
+                            "content": "written once before verification\n",
+                        },
+                    }
+                )
+            if self.scenario == "navigation-repair":
+                native_tool_calls.append({
+                    "id": "default-memory-read",
+                    "name": "read_file",
+                    "arguments": {"file_path": "target.py"},
+                })
+            native_tool_calls.append(
+                {
+                    "id": "default-memory-command",
+                    "name": "run_command",
+                    "arguments": {"command_line": command},
+                }
+            )
             yield StreamChunk(
                 is_done=True,
-                native_tool_calls=[
-                    {
-                        "id": "default-memory-command",
-                        "name": "run_command",
-                        "arguments": {"command_line": command},
-                    }
-                ],
+                native_tool_calls=native_tool_calls,
                 provider_state=[
                     {
                         "type": "reasoning",
@@ -124,7 +147,7 @@ class _DefaultMemoryCommandProvider(ProviderABC):
             command_payload.get("exit_code") == 1
             and _FAILURE_DIAGNOSTIC in str(command_payload.get("error", ""))
         )
-        if self.scenario == "repair" and call_number == 3:
+        if self.scenario in {"repair", "mixed-repair", "navigation-repair"} and call_number == 3:
             assert self.failure_evidence_seen
             yield StreamChunk(
                 is_done=True,
@@ -141,7 +164,7 @@ class _DefaultMemoryCommandProvider(ProviderABC):
                 ],
             )
             return
-        if self.scenario == "repair" and call_number == 4:
+        if self.scenario in {"repair", "mixed-repair", "navigation-repair"} and call_number == 4:
             yield StreamChunk(
                 is_done=True,
                 native_tool_calls=[
@@ -153,7 +176,7 @@ class _DefaultMemoryCommandProvider(ProviderABC):
                 ],
             )
             return
-        expected_calls = 5 if self.scenario == "repair" else 3
+        expected_calls = 5 if self.scenario in {"repair", "mixed-repair", "navigation-repair"} else 3
         assert call_number == expected_calls
         yield StreamChunk(content="Verified and repaired locally.", is_done=True)
 
@@ -211,6 +234,9 @@ def _write_verifier(workspace: Path, *, wait_for_memory_update: bool = False) ->
         ("success", False, [0], 0, 9_000, False),
         ("success", True, [0], 0, 9_000, False),
         ("repair", True, [1, 0], 0, 9_000, False),
+        ("mixed-success", False, [0], 0, 9_000, False),
+        ("mixed-repair", True, [1, 0], 0, 9_000, False),
+        ("navigation-repair", True, [1, 0], 0, 9_000, False),
         ("success", True, [0], 160, 9_000, False),
         ("success", True, [0], 0, 14_000, True),
     ],
@@ -218,6 +244,9 @@ def _write_verifier(workspace: Path, *, wait_for_memory_update: bool = False) ->
         "quiet-success",
         "verbose-success",
         "verbose-repair-retest",
+        "mixed-quiet-success",
+        "mixed-verbose-repair-retest",
+        "navigation-map-memory-repair-retest",
         "large-memory-stress",
         "minimum-fit-rejects-honestly",
     ),
@@ -245,7 +274,7 @@ async def test_default_runtime_sqlite_memory_command_repair(
         model="custom/r52-default-memory-command",
         workspace_root=tmp_path,
         db_directory=tmp_path / "state",
-        repo_map_enabled=False,
+        repo_map_enabled=scenario == "navigation-repair",
         automation_enabled=False,
         lsp_enabled=False,
         safety_tier="interactive",
@@ -254,7 +283,7 @@ async def test_default_runtime_sqlite_memory_command_repair(
 
     async def approve(tool_name: str, _arguments: dict[str, Any]) -> bool:
         approvals.append(tool_name)
-        return tool_name in {"write_file", "run_command"}
+        return tool_name in {"read_file", "write_file", "run_command"}
 
     runtime = build_runtime(
         config,
@@ -285,6 +314,10 @@ async def test_default_runtime_sqlite_memory_command_repair(
     assert len(runtime.loop._memory_pipeline.document_paths()) == extra_memory_docs + 1
 
     try:
+        if scenario == "navigation-repair":
+            repo_map = runtime.loop.repo_map
+            assert repo_map is not None
+            await asyncio.to_thread(lambda: repo_map.files)
         session = await runtime.loop.start_session()
         if expect_budget_rejection:
             with pytest.raises(ContextBudgetExceededError):
@@ -322,6 +355,56 @@ async def test_default_runtime_sqlite_memory_command_repair(
             in {record.call_id for record in command_records}
         }
         assert len(tool_payloads) == len(command_records)
+        if scenario == "navigation-repair":
+            assert runtime.loop.repo_map is not None and runtime.loop.repo_map.ready
+            read = next(
+                record for record in saved.tool_calls
+                if record.call_id == "default-memory-read"
+            )
+            assert read.executed and read.success is True
+            assert "value = 41" in (read.result or "")
+            assert "## Repository Map" in json.dumps(provider.requests[2])
+            batch_ids = [
+                message.get("tool_call_id")
+                for message in provider.requests[2]
+                if message.get("role") == "tool"
+                and message.get("tool_call_id")
+                in {"default-memory-read", "default-memory-command"}
+            ]
+            assert batch_ids == ["default-memory-read", "default-memory-command"]
+        if scenario.startswith("mixed-"):
+            mixed_write = next(
+                record
+                for record in saved.tool_calls
+                if record.call_id == "default-memory-mixed-write"
+            )
+            assert mixed_write.approved and mixed_write.dispatched and mixed_write.executed
+            assert mixed_write.success is True
+            assert (tmp_path / "batch-side-effect.txt").read_text(encoding="utf-8") == (
+                "written once before verification\n"
+            )
+            batch_call_ids = [
+                call.get("call_id")
+                for message in saved.messages
+                if message.role == "assistant"
+                and message.metadata.get("tool_calls")
+                for call in message.metadata["tool_calls"]
+                if isinstance(call, dict)
+                and call.get("call_id")
+                in {"default-memory-mixed-write", "default-memory-command"}
+            ]
+            assert batch_call_ids == [
+                "default-memory-mixed-write",
+                "default-memory-command",
+            ]
+            request_call_ids = [
+                message.get("tool_call_id")
+                for message in provider.requests[2]
+                if message.get("role") == "tool"
+                and message.get("tool_call_id")
+                in {"default-memory-mixed-write", "default-memory-command"}
+            ]
+            assert request_call_ids == batch_call_ids
         assert len(runtime.loop.session_store.provider_replay_state_bindings(
             session.session_id
         )) == 1
@@ -355,7 +438,9 @@ async def test_default_runtime_sqlite_memory_command_repair(
             assert command_records[0].success is True
             assert (tmp_path / "check-count.txt").read_text(encoding="utf-8") == "1"
         else:
-            assert len(provider.requests) == (5 if scenario == "repair" else 3)
+            assert len(provider.requests) == (
+                5 if scenario in {"repair", "mixed-repair", "navigation-repair"} else 3
+            )
         assert all(
             command_stdout(record.result) == (_VERBOSE_OUTPUT + "CHECK_OK\n")
             for record in command_records
@@ -366,7 +451,7 @@ async def test_default_runtime_sqlite_memory_command_repair(
             for record in command_records
             if record.exit_code == 0 and not verbose
         )
-        if scenario == "repair":
+        if scenario in {"repair", "mixed-repair", "navigation-repair"}:
             assert provider.failure_evidence_seen
             assert "CHECK_OK" in tool_payloads[command_records[-1].call_id]["output"]
             assert _FAILURE_DIAGNOSTIC in (command_records[0].error or "")

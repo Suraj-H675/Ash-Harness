@@ -241,6 +241,7 @@ class _CommandResultPreviewContext:
     session: Session
     call_id: str
     tool_name: str
+    prior_call_ids: tuple[str, ...]
     tool_schema: list[dict[str, Any]]
     tools_snapshot: dict[str, BaseTool]
     request_budget: RequestTokenBudget
@@ -4992,6 +4993,7 @@ class AshLoop:
                 tool_schema=iteration_tool_schema,
                 request_budget=request_budget,
                 tools_snapshot=iteration_tools,
+                navigation_output_budgets=navigation_output_budgets,
             )
             try:
                 results = await self._execute_tool_calls(
@@ -6090,26 +6092,51 @@ class AshLoop:
         tool_schema: list[dict[str, Any]],
         request_budget: RequestTokenBudget | None,
         tools_snapshot: dict[str, BaseTool],
+        navigation_output_budgets: dict[str, ToolOutputBudget] | None = None,
     ) -> _CommandResultPreviewContext | None:
-        """Snapshot one safe command-result projection for the current request."""
-
         if (
             request_budget is None
-            or len(tool_calls) != 1
+            or not tool_calls
             or self.memory_nudge_interval > 0
             or self.skill_nudge_interval > 0
         ):
             return None
-        call = tool_calls[0]
+        command_calls = [
+            (index, call)
+            for index, call in enumerate(tool_calls)
+            if call.get("name") == "run_command"
+        ]
+        # Only the last result can be measured with every sibling already
+        # committed, without guessing future output or rewriting history.
+        if len(command_calls) != 1 or command_calls[0][0] != len(tool_calls) - 1:
+            return None
+        command_index, call = command_calls[0]
         call_id = call.get("call_id")
         tool_name = call.get("name")
         if not isinstance(call_id, str) or tool_name != "run_command":
             return None
 
         from ash.tools.command import RunCommandTool
+        from ash.tools.filesystem import WriteFileTool
 
         if type(tools_snapshot.get(tool_name)) is not RunCommandTool:
             return None
+
+        prior_call_ids: list[str] = []
+        for prior_call in tool_calls[:command_index]:
+            prior_call_id = prior_call.get("call_id")
+            prior_tool_name = prior_call.get("name")
+            if not isinstance(prior_call_id, str) or not isinstance(prior_tool_name, str):
+                return None
+            if type(tools_snapshot.get(prior_tool_name)) is not WriteFileTool and not (
+                navigation_output_budgets is not None
+                and prior_call_id in navigation_output_budgets
+            ):
+                return None
+            prior_call_ids.append(prior_call_id)
+        if len(set(prior_call_ids)) != len(prior_call_ids):
+            return None
+
         if isinstance(self.provider, FailoverProvider):
             # A composite route does not identify which counter will govern
             # the next request.
@@ -6167,6 +6194,7 @@ class AshLoop:
             session=session,
             call_id=call_id,
             tool_name=tool_name,
+            prior_call_ids=tuple(prior_call_ids),
             tool_schema=deepcopy(tool_schema),
             tools_snapshot=dict(tools_snapshot),
             request_budget=request_budget,
@@ -6193,6 +6221,17 @@ class AshLoop:
             or self._pending_plan_context != context.pending_plan_context
         ):
             return None
+        if context.prior_call_ids:
+            prior_call_ids = set(context.prior_call_ids)
+            persisted_prior_call_ids = tuple(
+                message.metadata["call_id"]
+                for message in context.session.messages
+                if message.role == "tool"
+                and isinstance(message.metadata.get("call_id"), str)
+                and message.metadata["call_id"] in prior_call_ids
+            )
+            if persisted_prior_call_ids != context.prior_call_ids:
+                return None
 
         original: dict[str, Any] = {
             "success": result.success,
