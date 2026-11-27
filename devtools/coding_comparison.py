@@ -96,6 +96,42 @@ def compare(ash_dir: Path, codex_dir: Path) -> dict[str, Any]:
     ):
         raise ValueError("comparator revisions do not match the registered task")
     same_upstream_revision_pins = True
+    ash_preparation = ash.get("preflight")
+    codex_preparation = manifest.get("preflight")
+    ash_prepared_sha = (
+        ash_preparation.get("paired_preparation_sha256")
+        if isinstance(ash_preparation, dict) else None
+    )
+    codex_prepared_sha = (
+        codex_preparation.get("paired_preparation_sha256")
+        if isinstance(codex_preparation, dict) else None
+    )
+    retained = ash_dir.parent / "prepared-source.json"
+    shared_preparation = (
+        ash_prepared_sha is not None or codex_prepared_sha is not None
+        or retained.exists() or retained.is_symlink()
+    )
+    if shared_preparation:
+        if (
+            not _valid_sha256(ash_prepared_sha)
+            or ash_prepared_sha != codex_prepared_sha
+            or ash_preparation != codex_preparation
+            or ash_dir.parent.resolve() != codex_dir.parent.resolve()
+        ):
+            raise ValueError("comparator shared preparation receipts do not match")
+        if retained.is_symlink() or not retained.is_file():
+            raise ValueError("comparator retained preparation manifest is missing or unsafe")
+        data = retained.read_bytes()
+        if hashlib.sha256(data).hexdigest() != ash_prepared_sha:
+            raise ValueError("comparator retained preparation manifest does not match")
+        proof = json.loads(data)
+        if (
+            not isinstance(proof, dict)
+            or not isinstance(proof.get("preflight"), dict)
+            or {**proof["preflight"], "paired_preparation_sha256": ash_prepared_sha}
+            != ash_preparation
+        ):
+            raise ValueError("comparator preparation proof differs from arm receipts")
     ash_task_hash = ash.get("task_prompt_sha256")
     codex_task_hash = manifest.get("task_prompt_sha256")
     registered_task_hash = (
@@ -568,6 +604,7 @@ def compare(ash_dir: Path, codex_dir: Path) -> dict[str, Any]:
         "diagnostic_retake_of": diagnostic_retake_of,
         "evidence_classification": evidence_classification,
         "preflight_verified": preflight_verified,
+        "shared_preparation_verified": True if shared_preparation else None,
         "comparison_caveats": comparison_caveats,
         "comparison_verified": comparison_verified,
         "score_eligible": comparison_verified,

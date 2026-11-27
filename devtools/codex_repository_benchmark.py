@@ -30,6 +30,7 @@ from repository_benchmark import (
     TASKS,
     check_edits,
     check_oracles,
+    copy_prepared_pair_source,
     preflight,
     remove_reference_checkout,
     shared_user_prompt,
@@ -827,6 +828,7 @@ def run_task(
     preflight_only: bool = False,
     context_tokens: int = 32768,
     authorize_model_trial: bool = False,
+    prepared_source: tuple[Path, str] | None = None,
 ) -> dict[str, Any]:
     """Isolate source, run Codex once at most, and score outside the checkout."""
     if not preflight_only:
@@ -840,10 +842,15 @@ def run_task(
     with tempfile.TemporaryDirectory(prefix="ash-codex-repo-") as temp:
         scratch = Path(temp)
         (scratch / "tmp").mkdir()
-        baseline, preflight_receipt = preflight(task, scratch)
-        remove_reference_checkout(scratch)
         workspace = scratch / "workspace"
-        shutil.copytree(baseline, workspace, symlinks=True)
+        if prepared_source is None:
+            baseline, preflight_receipt = preflight(task, scratch)
+            remove_reference_checkout(scratch)
+            shutil.copytree(baseline, workspace, symlinks=True)
+        else:
+            preflight_receipt = copy_prepared_pair_source(
+                task, *prepared_source, workspace,
+            )
         if task.runtime is not None:
             runtime_receipt = preflight_receipt.get("runtime_overlay")
             if not isinstance(runtime_receipt, dict):
@@ -1034,6 +1041,8 @@ def main() -> int:
         action="store_true",
         help="Explicitly opt into one model-using comparison after owner approval",
     )
+    parser.add_argument("--prepared-source", nargs=2, metavar=("ROOT", "SHA256"),
+                        help=argparse.SUPPRESS)
     args = parser.parse_args()
     if not re.fullmatch(r"[a-z0-9][a-z0-9._-]*", args.model):
         parser.error("model must be an explicit simple model ID")
@@ -1073,6 +1082,8 @@ def main() -> int:
             preflight_only=args.preflight_only,
             context_tokens=args.context_tokens,
             authorize_model_trial=args.authorize_model_trial,
+            prepared_source=(Path(args.prepared_source[0]), args.prepared_source[1])
+            if args.prepared_source else None,
         )
     finally:
         os.umask(previous_umask)

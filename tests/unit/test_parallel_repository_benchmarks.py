@@ -293,6 +293,84 @@ def test_approved_pair_refuses_unsealed_comparator_before_first_engine(
     assert not attempted
 
 
+def test_shared_source_failure_prevents_both_model_dispatches(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from repository_benchmark import PinnedSourceError
+
+    def fail_prepare(*args):
+        raise PinnedSourceError("fetch", 128)
+
+    def unexpected_invoke(*args):
+        pytest.fail("source preparation failure must prevent dispatch")
+
+    monkeypatch.setattr(batch_runner, "preflight_plain_codex_readiness", lambda: None)
+    monkeypatch.setattr(batch_runner, "prepare_pair_source", fail_prepare)
+    monkeypatch.setattr(batch_runner, "invoke_runner", unexpected_invoke)
+    report = run_pair("h11-chunk-footer", 1, tmp_path, 170, 32768,
+                      invoke=unexpected_invoke, authorize_model_trial=True)
+    assert report["reason"] == "shared_source_preparation_failed"
+    assert report["source_stage"] == "fetch"
+    assert report["runner_exit_codes"] == {}
+    assert report["score_eligible"] is False
+    assert report["comparison_verified"] is False
+
+
+@pytest.mark.parametrize("fault", [None, "mismatch", "missing", "both-missing", "retained"])
+def test_real_pair_path_binds_shared_preparation_to_both_arms(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fault: str | None,
+) -> None:
+    prepared_paths = []
+    seen = []
+    def prepare(task, root):
+        prepared_paths.append(root)
+        proof = {
+            "preflight": {
+                "base_visible_exit": 1, "base_hidden_exit": 1,
+                "reference_visible_exit": 0, "reference_hidden_exit": 0,
+                "reference_added_paths": [], "reference_removed_paths": [],
+                "reference_modified_paths": [],
+                "editable_ablation_results": [
+                    {"path": path, "visible_oracle_exit": 1, "hidden_oracle_exit": 1}
+                    for path in sorted(task.editable)
+                ],
+            }
+        }
+        data = json.dumps(proof).encode()
+        (root / "manifest.json").write_bytes(data)
+        return hashlib.sha256(data).hexdigest()
+
+    def fake_invoke(argv, evidence):
+        seen.append(evidence.name)
+        i = argv.index("--prepared-source")
+        assert Path(argv[i+1]) == prepared_paths[0]
+        digest = argv[i+2]
+        assert hashlib.sha256((prepared_paths[0] / "manifest.json").read_bytes()).hexdigest() == digest
+        _emit_receipt("h11-chunk-footer", evidence)
+        p = evidence / ("result.json" if evidence.name == "ash" else "manifest.json")
+        row = json.loads(p.read_text())
+        if evidence.name == "codex" and fault == "mismatch":
+            digest = "0" * 64
+        if fault != "both-missing" and not (
+            evidence.name == "codex" and fault == "missing"
+        ):
+            row["preflight"]["paired_preparation_sha256"] = digest
+        p.write_text(json.dumps(row))
+        if evidence.name == "codex" and fault == "retained":
+            (evidence.parent / "prepared-source.json").write_text("{}")
+        return 0
+
+    monkeypatch.setattr(batch_runner, "preflight_plain_codex_readiness", lambda: None)
+    monkeypatch.setattr(batch_runner, "prepare_pair_source", prepare)
+    monkeypatch.setattr(batch_runner, "invoke_runner", fake_invoke)
+    result = run_pair("h11-chunk-footer", 1, tmp_path, 170, 32768,
+                      invoke=fake_invoke, authorize_model_trial=True)
+    assert seen == ["ash", "codex"]
+    assert len(prepared_paths) == 1 and not prepared_paths[0].exists()
+    assert result["score_eligible"] is (fault is None)
+    assert result["comparison_verified"] is (fault is None)
+
+
 def test_approved_cli_rejects_unsealed_native_before_accessing_credentials(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

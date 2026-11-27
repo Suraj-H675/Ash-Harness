@@ -28,7 +28,9 @@ def content_identity(fingerprint: str | None) -> str | None:
     return fingerprint
 
 
-def snapshot_workspace_files(root: Path) -> dict[str, str]:
+def snapshot_workspace_files(
+    root: Path, *, include_git: bool = False, include_directories: bool = False,
+) -> dict[str, str]:
     """Capture regular-file content and mode, plus every non-directory hazard.
 
     File descriptors are opened without following links and checked again
@@ -39,12 +41,14 @@ def snapshot_workspace_files(root: Path) -> dict[str, str]:
     entries: dict[str, str] = {}
     for path in root.rglob("*"):
         relative = path.relative_to(root)
-        if relative.parts[0] == ".git":
+        if not include_git and relative.parts[0] == ".git":
             continue
         name = relative.as_posix()
         try:
             mode = path.lstat().st_mode
             if stat.S_ISDIR(mode):
+                if include_directories:
+                    entries[name] = f"DIR:{stat.S_IMODE(mode):04o}"
                 continue
             if stat.S_ISLNK(mode):
                 entries[name] = "SYMLINK"

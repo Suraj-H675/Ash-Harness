@@ -230,6 +230,23 @@ PYTHONPATH=src .venv/bin/python devtools/parallel_repository_benchmarks.py \
   --evidence-root /var/tmp/ash-approved-paired-new-evidence
 ~~~
 
+Before either model is dispatched, the paired coordinator acquires both exact
+upstream pins and runs the existing red/green preflight once. It removes
+the reference checkout, then fingerprints the pristine baseline (including
+Git metadata and directory modes) in a fresh owner-private preparation.
+Each engine independently copies and validates that baseline before running.
+The preparation manifest remains outside the model workspace; its digest
+binds both receipts, and a mismatched or missing shared proof is unscored.
+The temporary preparation is removed after the pair. Standalone runners
+still perform their own preflight. A failed acquisition stops that pair
+before either model call and records an unscored source-preparation failure.
+
+This is a trusted-host coordinator handoff, not a reusable cache or a
+signature authenticating arbitrary user-supplied source bundles. It prevents
+a second upstream fetch from failing after the first model has already run;
+it cannot guarantee all later local setup, credential, or provider operations
+will succeed. The shared preflight is not two independently executed preflights.
+
 Each pair's `summary.json` (also included as a result in `batch.json`)
 preserves existing
 `ash_pass` and `codex_pass` as **full-task** grades. The additive

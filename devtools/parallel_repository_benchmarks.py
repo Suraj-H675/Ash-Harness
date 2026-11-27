@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import os
@@ -30,7 +31,9 @@ from coding_benchmark import _chatgpt_tmpfs_root
 from ash.providers.openai_chatgpt_auth import ChatGPTAuthSession, ChatGPTCredentialStore
 from repository_benchmark import (
     TASKS,
+    PinnedSourceError,
     hidden_oracle_classification,
+    prepare_pair_source,
     task_evidence_classification,
 )
 
@@ -131,19 +134,48 @@ def run_pair(
         else ("codex", "ash")
     )
     exit_codes: dict[str, int] = {}
-    for engine in order:
-        evidence = directory / engine
-        try:
-            exit_codes[engine] = invoke(
-                commands(
-                    task, engine, evidence, timeout, context,
-                    authorize_model_trial=authorize_model_trial,
-                ), evidence
+    # One fresh, private preparation per pair. Never retain a reference tree
+    # or let either arm fetch separately after the first inference begins.
+    with tempfile.TemporaryDirectory(prefix="ash-pair-source-") as raw_prepared:
+        prepared = Path(raw_prepared)
+        digest = None
+        if invoke is invoke_runner:
+            try:
+                digest = prepare_pair_source(TASKS[task], prepared)
+            except (OSError, RuntimeError, subprocess.SubprocessError, ValueError) as exc:
+                # No model has run. Do not classify this as a coding failure.
+                failed = {
+                    "task": task, "repetition": repetition,
+                    "reason": "shared_source_preparation_failed",
+                    "failure_type": type(exc).__name__,
+                    "runner_exit_codes": {},
+                    "comparison_verified": False, "score_eligible": False,
+                    "fully_controlled": False,
+                }
+                if isinstance(exc, PinnedSourceError):
+                    failed["source_stage"] = exc.stage
+                    failed["source_exit_code"] = exc.exit_code
+                    failed["source_revision_role"] = exc.revision_role
+                (directory / "summary.json").write_text(
+                    json.dumps(failed, indent=2) + "\n"
+                )
+                return failed
+            (directory / "prepared-source.json").write_bytes(
+                (prepared / "manifest.json").read_bytes()
             )
-        except (OSError, subprocess.SubprocessError):
-            # Never put paths, provider payloads, or credential errors in
-            # the aggregate report. The private stderr file is diagnostic.
-            exit_codes[engine] = -1
+        for engine in order:
+            evidence = directory / engine
+            argv = commands(
+                task, engine, evidence, timeout, context,
+                authorize_model_trial=authorize_model_trial,
+            )
+            if digest is not None:
+                argv += ["--prepared-source", str(prepared), digest]
+            try:
+                exit_codes[engine] = invoke(argv, evidence)
+            except (OSError, subprocess.SubprocessError):
+                # Private supervisor output is diagnostic, not scoring evidence.
+                exit_codes[engine] = -1
 
     comparison_caveats = [
         "system prompts and built-in tool descriptions differ between Ash and native Codex",
@@ -187,13 +219,27 @@ def run_pair(
             exit_codes.get(engine) == (0 if comparison[engine]["scored_pass"] else 1)
             for engine in ("ash", "codex")
         )
-        matched = comparison["comparison_verified"] is True and exit_codes_consistent
+        preparation_matches = True
+        if digest is not None:
+            preparation_matches = (
+                comparison["shared_preparation_verified"] is True
+                and hashlib.sha256(
+                    (directory / "prepared-source.json").read_bytes()
+                ).hexdigest() == digest
+            )
+        matched = (
+            comparison["comparison_verified"] is True
+            and exit_codes_consistent and preparation_matches
+        )
         result.update(
             comparison_verified=bool(matched),
             reason="verified" if matched else "provider_outage_or_parity_unverified",
             fully_controlled=False,
             score_eligible=matched and comparison["score_eligible"] is True,
             runner_exit_codes_consistent=exit_codes_consistent,
+            shared_preparation_verified=(
+                preparation_matches if digest is not None else None
+            ),
             preflight_verified=comparison["preflight_verified"],
             comparison_scope="operational_qualified",
             diagnostic_retake_of=comparison["diagnostic_retake_of"],

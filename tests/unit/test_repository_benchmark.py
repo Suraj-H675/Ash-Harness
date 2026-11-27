@@ -1513,17 +1513,19 @@ def test_r17_preflight_records_exact_reference_paths_and_provenance(
         bench.preflight(task, tmp_path / "partial-red")
 
 
-@pytest.mark.parametrize("terminals,stop_reason,expected", [
-    (["turn.completed"], "completed", True),
-    ([], None, False),
-    (["turn.error"], None, False),
-    (["turn.completed"], "iteration_limit", False),
-    (["turn.completed", "turn.completed"], "completed", False),
+@pytest.mark.parametrize("terminals,stop_reason,expected,prepared", [
+    (["turn.completed"], "completed", True, False),
+    (["turn.completed"], "completed", True, True),
+    ([], None, False, False),
+    (["turn.error"], None, False, False),
+    (["turn.completed"], "iteration_limit", False, False),
+    (["turn.completed", "turn.completed"], "completed", False, False),
 ])
 @pytest.mark.parametrize("late_edit", [False, True])
 def test_r17_ash_fake_grade_accepts_one_semantic_source_repair(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     terminals: list[str], stop_reason: str | None, expected: bool, late_edit: bool,
+    prepared: bool,
 ) -> None:
     task_name = "pytest-mixed-indirect-fixture-precedence"
     task = bench.TASKS[task_name]
@@ -1637,6 +1639,16 @@ def test_r17_ash_fake_grade_accepts_one_semantic_source_repair(
         },
     )
 
+    handoff = None
+    if prepared:
+        source = tmp_path / "prepared"
+        source.mkdir(mode=0o700)
+        digest = bench.prepare_pair_source(task, source)
+        handoff = (source, digest)
+        def unexpected_fetch(*args):
+            pytest.fail("prepared arm must not fetch again")
+        monkeypatch.setattr(bench, "preflight", unexpected_fetch)
+
     evidence = tmp_path / "ash-evidence"
     evidence.mkdir()
     result = bench.run_task(
@@ -1647,6 +1659,7 @@ def test_r17_ash_fake_grade_accepts_one_semantic_source_repair(
         timeout=30,
         context_tokens=32768,
         turn_token_budget=0,
+        prepared_source=handoff,
     )
     assert result["passed"] is (expected and not late_edit), result
     assert result["observed_edit_after_passing_test"] is late_edit
@@ -1660,7 +1673,12 @@ def test_r17_ash_fake_grade_accepts_one_semantic_source_repair(
     assert result["oracle"]["correct"] is True
     assert result["scratch_removed"] is True
     assert any(task.command_grant in " ".join(argv) for argv in setup_commands)
-    assert not scratch_roots[0].exists()
+    if prepared:
+        assert result["preflight"]["paired_preparation_sha256"] == digest
+        assert (source / "baseline/src/_pytest/fixtures.py").read_text() == "baseline"
+        assert not (source / "reference").exists()
+    else:
+        assert not scratch_roots[0].exists()
 
 
 def test_fetch_pinned_checks_out_only_exact_commit(
@@ -1709,6 +1727,108 @@ def test_fetch_pinned_checks_out_only_exact_commit(
         ],
         ["git", "rev-parse", "HEAD"],
     ]
+
+
+@pytest.mark.parametrize("stage", ["fetch", "checkout"])
+def test_pinned_fetch_failure_names_stage_without_remote_stderr(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stage: str,
+) -> None:
+    def fake_command(argv, **kwargs):
+        return subprocess.CompletedProcess(
+            argv, 128 if stage in argv else 0, stdout="",
+            stderr="PRIVATE_UPSTREAM_DETAIL",
+        )
+
+    monkeypatch.setattr(bench, "command", fake_command)
+    task = bench.TASKS["h11-chunk-footer"]
+    with pytest.raises(bench.PinnedSourceError) as error:
+        bench.fetch_pinned(tmp_path / "source", task, task.base_sha)
+    assert error.value.stage == stage
+    assert error.value.exit_code == 128
+    assert stage in str(error.value)
+    assert "PRIVATE_UPSTREAM_DETAIL" not in str(error.value)
+
+
+def test_prepared_pair_copies_are_independent_and_reference_is_absent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task = bench.TASKS["h11-chunk-footer"]
+    root = tmp_path / "prepared"
+    root.mkdir(mode=0o700)
+    fetched = []
+
+    def fake_fetch(destination, selected, sha):
+        fetched.append(sha)
+        destination.mkdir()
+        (destination / "h11").mkdir()
+        (destination / "h11/_readers.py").write_text(sha)
+        (destination / ".git").mkdir()
+        (destination / ".git/HEAD").write_text(sha)
+        (destination / "empty").mkdir()
+
+    def fake_grade(workspace, selected):
+        correct = workspace.name == "reference"
+        return {"correct": correct, "visible_oracle_exit": int(not correct),
+                "hidden_oracle_exit": int(not correct)}
+
+    monkeypatch.setattr(bench, "fetch_pinned", fake_fetch)
+    monkeypatch.setattr(bench, "check_oracles", fake_grade)
+    digest = bench.prepare_pair_source(task, root)
+    assert fetched == [task.base_sha, task.reference_fix_sha]
+    assert not (root / "reference").exists()
+    assert {p.name for p in root.iterdir()} == {"baseline", "manifest.json"}
+    first, second = tmp_path / "first", tmp_path / "second"
+    receipt = bench.copy_prepared_pair_source(task, root, digest, first)
+    (first / "h11/_readers.py").write_text("candidate edit")
+    (first / ".git/HEAD").write_text("candidate git edit")
+    assert bench.copy_prepared_pair_source(task, root, digest, second) == receipt
+    assert receipt["paired_preparation_sha256"] == digest
+    assert (second / "h11/_readers.py").read_text() == task.base_sha
+    assert (second / ".git/HEAD").read_text() == task.base_sha
+    assert fetched == [task.base_sha, task.reference_fix_sha]
+
+
+@pytest.mark.parametrize("fault", ["source", "git", "mode", "link", "manifest",
+                                    "reference", "wrong-task", "directory"])
+def test_prepared_pair_rejects_changed_input_before_copy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fault: str,
+) -> None:
+    task = bench.TASKS["h11-chunk-footer"]
+    root = tmp_path / "prepared"
+    root.mkdir(mode=0o700)
+
+    def fake_preflight(selected, destination):
+        baseline = destination / "baseline"
+        baseline.mkdir()
+        (baseline / "code.py").write_text("original")
+        (baseline / ".git").mkdir()
+        (baseline / ".git/HEAD").write_text(selected.base_sha)
+        (baseline / "empty").mkdir()
+        (destination / "reference").mkdir()
+        return baseline, {"base_visible_exit": 1}
+
+    monkeypatch.setattr(bench, "preflight", fake_preflight)
+    digest = bench.prepare_pair_source(task, root)
+    baseline = root / "baseline"
+    if fault == "source":
+        (baseline / "code.py").write_text("changed")
+    elif fault == "git":
+        (baseline / ".git/HEAD").write_text("changed")
+    elif fault == "mode":
+        (baseline / "code.py").chmod(0o777)
+    elif fault == "link":
+        (baseline / "link").symlink_to(tmp_path)
+    elif fault == "manifest":
+        (root / "manifest.json").write_text("{}")
+    elif fault == "reference":
+        (root / "reference").mkdir()
+    elif fault == "wrong-task":
+        task = replace(task, base_sha="0" * 40)
+    elif fault == "directory":
+        (baseline / "empty").rmdir()
+    with pytest.raises(RuntimeError, match="prepared"):
+        bench.copy_prepared_pair_source(task, root, digest, tmp_path / "copy")
+    assert not (tmp_path / "copy").exists()
 
 
 def test_preflight_requires_red_base_and_green_upstream_fix(

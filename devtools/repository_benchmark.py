@@ -3587,6 +3587,17 @@ def shared_user_prompt(task: RepositoryTask) -> str:
     )
 
 
+class PinnedSourceError(RuntimeError):
+    """Safe, bounded acquisition failure; never retain remote output."""
+
+    def __init__(self, stage: str, exit_code: int | None = None):
+        self.stage = stage
+        self.exit_code = exit_code
+        self.revision_role: str | None = None
+        detail = "timed out" if exit_code is None else f"failed (exit {exit_code})"
+        super().__init__(f"pinned upstream {stage} {detail}")
+
+
 def fetch_pinned(destination: Path, task: RepositoryTask, sha: str) -> None:
     """Clone a constant, exact-commit public source; never infer HEAD from a branch."""
     destination.mkdir()
@@ -3597,19 +3608,28 @@ def fetch_pinned(destination: Path, task: RepositoryTask, sha: str) -> None:
         "GIT_CONFIG_NOSYSTEM": "1",
         "GIT_TERMINAL_PROMPT": "0",
     }
-    for args in (
-        ["git", "init", "-q"],
-        ["git", "remote", "add", "origin", task.upstream],
-        ["git", "-c", "protocol.version=2", "fetch", "--depth=1", "origin", sha],
-        ["git", "-c", "core.hooksPath=/dev/null", "checkout", "-q", "--detach", sha],
+    for stage, args in (
+        ("init", ["git", "init", "-q"]),
+        ("remote-add", ["git", "remote", "add", "origin", task.upstream]),
+        ("fetch", ["git", "-c", "protocol.version=2", "fetch", "--depth=1", "origin", sha]),
+        ("checkout", ["git", "-c", "core.hooksPath=/dev/null", "checkout", "-q", "--detach", sha]),
     ):
-        result = command(args, cwd=destination, env=environment, timeout=45)
+        try:
+            result = command(args, cwd=destination, env=environment, timeout=45)
+        except subprocess.TimeoutExpired:
+            raise PinnedSourceError(stage) from None
         if result.returncode:
-            raise RuntimeError(f"pinned upstream checkout failed: {args[1]}")
-    result = command(
-        ["git", "rev-parse", "HEAD"], cwd=destination, env=environment, timeout=5
-    )
-    if result.returncode or result.stdout.strip() != sha:
+            # Do not expose remote stderr, URLs, or environment details.
+            raise PinnedSourceError(stage, result.returncode)
+    try:
+        result = command(
+            ["git", "rev-parse", "HEAD"], cwd=destination, env=environment, timeout=5
+        )
+    except subprocess.TimeoutExpired:
+        raise PinnedSourceError("verify-head") from None
+    if result.returncode:
+        raise PinnedSourceError("verify-head", result.returncode)
+    if result.stdout.strip() != sha:
         raise RuntimeError("pinned upstream checkout does not match manifest commit")
 
 
@@ -4327,8 +4347,15 @@ def preflight(task: RepositoryTask, root: Path) -> tuple[Path, dict[str, object]
         system_python_version = _attest_r17_system_python_version()
     baseline = root / "baseline"
     reference = root / "reference"
-    fetch_pinned(baseline, task, task.base_sha)
-    fetch_pinned(reference, task, task.reference_fix_sha)
+    for role, tree, sha in (
+        ("baseline", baseline, task.base_sha),
+        ("reference", reference, task.reference_fix_sha),
+    ):
+        try:
+            fetch_pinned(tree, task, sha)
+        except PinnedSourceError as exc:
+            exc.revision_role = role
+            raise
     for tree in (baseline, reference):
         if task.runtime is not None:
             _assert_safe_source_tree(tree)
@@ -4530,6 +4557,92 @@ def remove_reference_checkout(root: Path) -> None:
         raise RuntimeError("preflight reference checkout was not removed")
 
 
+def _prepared_identity(task: RepositoryTask) -> dict[str, object]:
+    return {
+        "source": task.source,
+        "upstream": task.upstream,
+        "base_sha": task.base_sha,
+        "reference_fix_sha": task.reference_fix_sha,
+        "editable": sorted(task.editable),
+        "visible_script": task.visible_script,
+        "visible_oracle_sha256": hashlib.sha256(task.visible_source.encode()).hexdigest(),
+        "hidden_oracle_sha256": hidden_oracle_sha256(task),
+        "prompt_sha256": hashlib.sha256(shared_user_prompt(task).encode()).hexdigest(),
+        "runtime_sha256": (
+            task.runtime.trusted_overlay_sha256 if task.runtime is not None else None
+        ),
+        "evaluator_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+    }
+
+
+def _prepared_tree(root: Path) -> dict[str, str]:
+    if root.is_symlink() or not root.is_dir():
+        raise RuntimeError("prepared baseline is not a plain directory")
+    tree = snapshot_files(root, include_git=True, include_directories=True)
+    if not tree or UNSAFE_ENTRIES.intersection(tree.values()):
+        raise RuntimeError("prepared baseline contains unsafe entries")
+    return tree
+
+
+def prepare_pair_source(task: RepositoryTask, root: Path) -> str:
+    """Trusted coordinator only: acquire both pins and grade before any dispatch."""
+    if root.is_symlink() or not root.is_dir() or any(root.iterdir()):
+        raise RuntimeError("pair preparation requires an empty private directory")
+    if root.stat().st_uid != os.getuid() or stat.S_IMODE(root.stat().st_mode) & 0o077:
+        raise RuntimeError("pair preparation directory must be owner-private")
+    baseline, receipt = preflight(task, root)
+    remove_reference_checkout(root)
+    if baseline != root / "baseline":
+        raise RuntimeError("unexpected prepared baseline location")
+    manifest = {
+        "version": 1,
+        "identity": _prepared_identity(task),
+        "preflight": receipt,
+        "tree": _prepared_tree(baseline),
+    }
+    data = (json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    (root / "manifest.json").write_bytes(data)
+    return hashlib.sha256(data).hexdigest()
+
+
+def copy_prepared_pair_source(
+    task: RepositoryTask, root: Path, expected_digest: str, workspace: Path,
+) -> dict[str, object]:
+    """Consume a trusted coordinator handoff, not an untrusted source cache.
+
+    The trusted operator owns the manifest and expected digest. The digest
+    detects drift; it does not authenticate an arbitrary third-party bundle.
+    """
+    if root.is_symlink() or not root.is_dir():
+        raise RuntimeError("prepared source directory is unavailable")
+    if root.stat().st_uid != os.getuid() or stat.S_IMODE(root.stat().st_mode) & 0o077:
+        raise RuntimeError("prepared source directory must be owner-private")
+    if {p.name for p in root.iterdir()} != {"baseline", "manifest.json"}:
+        raise RuntimeError("prepared source contains unexpected entries")
+    manifest_path = root / "manifest.json"
+    if manifest_path.is_symlink() or not manifest_path.is_file():
+        raise RuntimeError("prepared source manifest is unsafe")
+    data = manifest_path.read_bytes()
+    if hashlib.sha256(data).hexdigest() != expected_digest:
+        raise RuntimeError("prepared source manifest digest mismatch")
+    manifest = json.loads(data)
+    if (
+        not isinstance(manifest, dict) or manifest.get("version") != 1
+        or manifest.get("identity") != _prepared_identity(task)
+        or not isinstance(manifest.get("preflight"), dict)
+        or not isinstance(manifest.get("tree"), dict)
+    ):
+        raise RuntimeError("prepared source identity mismatch")
+    baseline = root / "baseline"
+    if _prepared_tree(baseline) != manifest["tree"]:
+        raise RuntimeError("prepared baseline changed")
+    shutil.copytree(baseline, workspace, symlinks=True)
+    if _prepared_tree(workspace) != manifest["tree"]:
+        raise RuntimeError("prepared workspace copy changed")
+    # Both receipts bind the same acquisition; no claim of independent fetches.
+    return {**manifest["preflight"], "paired_preparation_sha256": expected_digest}
+
+
 def _stop_evaluation_child(child: subprocess.Popen[bytes]) -> int:
     """Reap the isolated Ash subprocess after timeout or interruption."""
     if child.poll() is not None:
@@ -4680,6 +4793,7 @@ def run_task(
     context_continuations: int = 0,
     turn_time_budget: int | None = None,
     report_after_visible_check: bool = False,
+    prepared_source: tuple[Path, str] | None = None,
 ) -> dict[str, object]:
     task = TASKS[task_name]
     user_prompt = shared_user_prompt(task) if fair_prompt else task.prompt
@@ -4692,12 +4806,15 @@ def run_task(
     ):
         scratch = Path(scratch_str)
         home = Path(home_str)
-        baseline, preflight_receipt = preflight(task, scratch)
-        remove_reference_checkout(scratch)
         workspace = scratch / "workspace"
-        # Preserve link types instead of following upstream links into any
-        # filesystem paths outside the pinned source checkout.
-        shutil.copytree(baseline, workspace, symlinks=True)
+        if prepared_source is None:
+            baseline, preflight_receipt = preflight(task, scratch)
+            remove_reference_checkout(scratch)
+            shutil.copytree(baseline, workspace, symlinks=True)
+        else:
+            preflight_receipt = copy_prepared_pair_source(
+                task, *prepared_source, workspace,
+            )
         if task.runtime is not None:
             runtime_receipt = preflight_receipt.get("runtime_overlay")
             if not isinstance(runtime_receipt, dict):
@@ -4980,6 +5097,8 @@ def main() -> int:
         "--report-after-visible-check", action="store_true",
         help="Explicit operator checkpoint: finish with a bounded report when the already-granted visible command succeeds after edits",
     )
+    parser.add_argument("--prepared-source", nargs=2, metavar=("ROOT", "SHA256"),
+                        help=argparse.SUPPRESS)
     args = parser.parse_args()
     if not re.fullmatch(r"[a-z0-9][a-z0-9._-]*", args.chatgpt_model):
         parser.error("invalid exact ChatGPT model ID")
@@ -5038,6 +5157,8 @@ def main() -> int:
         context_continuations=args.context_continuations,
         turn_time_budget=args.turn_time_budget,
         report_after_visible_check=args.report_after_visible_check,
+        prepared_source=(Path(args.prepared_source[0]), args.prepared_source[1])
+        if args.prepared_source else None,
     )
     print(
         json.dumps(
