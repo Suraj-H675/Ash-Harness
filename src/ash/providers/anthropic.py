@@ -12,7 +12,7 @@ import os
 from collections.abc import Sequence
 from typing import Any, AsyncGenerator
 
-from ash.context.tokens import AnthropicTokenCounter
+from ash.context.tokens import AnthropicTokenCounter, token_count_mode
 from ash.providers.base import ProviderABC, StreamChunk, TokenCounterLike
 from ash.providers.capabilities import ProviderCapabilities, infer_capabilities
 from ash.providers.messages import (
@@ -249,6 +249,12 @@ class AnthropicProvider(ProviderABC):
 
     def count_tokens(self, text: str) -> int:
         return self._token_counter.count(text)
+
+    @property
+    def context_count_mode(self) -> str:
+        if getattr(self.count_tokens, "__func__", None) is AnthropicProvider.count_tokens:
+            return token_count_mode(self._token_counter)
+        return "unknown"
 
     def _resolve_client(self) -> Any:
         if self._client is not None:

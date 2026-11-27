@@ -62,6 +62,19 @@ class OpenAITokenCounter:
         return estimate_text_tokens(text)
 
 
+def token_count_mode(counter: object) -> str:
+    """Name only built-in counter modes whose implementation is known."""
+
+    if type(counter) is AnthropicTokenCounter:
+        return "chars_per_token_4"
+    if type(counter) is OpenAITokenCounter:
+        if counter._encoder is not None:
+            return f"tiktoken_{DEFAULT_OPENAI_FALLBACK_ENCODING}"
+        if counter.using_approximation:
+            return "offline_text_heuristic"
+    return "unknown"
+
+
 def estimate_text_tokens(text: str) -> int:
     """Return a conservative offline estimate for mixed code and Unicode text.
 

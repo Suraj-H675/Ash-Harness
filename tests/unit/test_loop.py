@@ -5413,6 +5413,27 @@ async def test_opaque_context_rejection_reports_preserved_replay_state(tmp_path)
     assert rejection["protected_current_turn"] is True
     assert rejection["dispatch_status"] == "not_dispatched"
     assert not any(event["type"] == "model.request.started" for event in ui.events)
+    assert rejection["total_input_limit"] == 100
+    assert rejection["required_total_input_tokens"] == (
+        rejection["required_input_tokens"] + rejection["native_tool_schema_tokens"]
+    )
+    assert rejection["message_estimate_tokens"] == rejection["required_input_tokens"]
+    persisted = next(
+        row.event for row in store.list_runtime_events(session.session_id)
+        if row.event["type"] == "context.request.rejected"
+    )
+    assert persisted["required_input_tokens"] == rejection["required_input_tokens"]
+    assert persisted["required_total_input_tokens"] == (
+        rejection["required_total_input_tokens"]
+    )
+    assert "encrypted_content" not in persisted
+    from ash.core.activity import summarize_operational_events
+    metrics = summarize_operational_events(store.list_runtime_events(session.session_id))
+    recorded = next(
+        row for row in metrics["timeline"] if row["type"] == "context.request.rejected"
+    )
+    assert recorded["required_total_input_tokens"] == persisted["required_total_input_tokens"]
+
 
 
 @pytest.mark.asyncio
@@ -10170,6 +10191,17 @@ async def test_turn_usage_tracks_cache_and_configured_cost(tmp_path):
     assert request_started[0]["context_id"] == context_event["context_id"]
     assert request_completed[0]["context_id"] == context_event["context_id"]
     assert context_event["estimator_count_mode"] == "unknown"
+    assert context_event["input_limit"] == context_event["maximum"]
+    assert context_event["combined_limit"] > context_event["response_limit"]
+    assert context_event["current"] == (
+        context_event["message_estimate_tokens"]
+        + context_event["native_tool_schema_tokens"]
+    )
+    assert context_event["serialized_message_tokens"] + (
+        context_event["image_estimate_tokens"]
+        + context_event["opaque_transport_estimate_tokens"]
+    ) == context_event["message_estimate_tokens"]
+    assert request_started[0]["requested_completion_limit"] > 0
     assert request_started[0]["requested_route"] == "openai/cache-test"
     assert request_completed[0]["effective_route"] == "openai/cache-test"
     assert request_completed[0]["usage_source"] == "provider"
@@ -10185,6 +10217,14 @@ async def test_turn_usage_tracks_cache_and_configured_cost(tmp_path):
     assert context_event["history_message_count"] >= 1
     assert context_event["tool_message_count"] >= 0
     assert context_event["tool_message_chars"] >= 0
+    from ash.core.loop import _observer_event_projection
+
+    observer_event = _observer_event_projection(context_event)
+    assert observer_event["message_estimate_tokens"] == context_event[
+        "message_estimate_tokens"
+    ]
+    assert "tool_message_chars" in observer_event
+    assert "prompt" not in observer_event
     usage = store.get_session_usage(session.session_id)
     assert usage.prompt_tokens == 100
     assert usage.cache_read_tokens == 60

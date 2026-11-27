@@ -775,6 +775,29 @@ _NON_SECRET_USAGE_FIELDS = frozenset(
         "memory_tokens",
     }
 )
+_NUMERIC_ONLY_CONTEXT_FIELDS = frozenset(
+    {
+        "combined_limit",
+        "response_limit",
+        "input_limit",
+        "message_estimate_tokens",
+        "serialized_message_tokens",
+        "native_tool_schema_tokens",
+        "assistant_text_chars",
+        "assistant_tool_call_argument_chars",
+        "serialized_tool_result_chars",
+        "unattributed_tool_call_arguments",
+        "non_string_tool_result_messages",
+        "image_count",
+        "image_estimate_tokens",
+        "opaque_transport_estimate_tokens",
+        "required_input_tokens",
+        "required_total_input_tokens",
+        "total_input_limit",
+        "requested_completion_limit",
+    }
+)
+_BOOLEAN_ONLY_CONTEXT_FIELDS = frozenset({"opaque_transport_estimate_enabled"})
 _USAGE_TOKEN_FIELD = re.compile(
     r"^(?:(?:prompt|completion|input|output|total|estimated|cached|cache|"
     r"context|max|agent|reasoning|turn|attachment|tool|used|added|before|after|"
@@ -801,6 +824,10 @@ def _normalize_field_name(key: object) -> str:
 
 def _is_secret_field(key: object, value: Any) -> bool:
     normalized = _normalize_field_name(key)
+    if normalized in _NUMERIC_ONLY_CONTEXT_FIELDS:
+        return value is not None and type(value) is not int
+    if normalized in _BOOLEAN_ONLY_CONTEXT_FIELDS:
+        return value is not None and type(value) is not bool
     is_numeric_usage = (
         isinstance(value, (int, float))
         and not isinstance(value, bool)

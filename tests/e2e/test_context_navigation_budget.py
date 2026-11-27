@@ -28,6 +28,44 @@ from ash.tools.search import SearchTextTool
 from ash.ui.headless import HeadlessUI
 
 
+def _assert_context_usage_accounting(
+    store: SessionStore,
+    session_id: str,
+    *,
+    expected_requests: int,
+) -> list[dict[str, Any]]:
+    events = [
+        item.event
+        for item in store.list_runtime_events(session_id)
+        if item.event.get("type") == "context.usage"
+        and item.event.get("assembly_purpose") == "request"
+    ]
+    assert len(events) == expected_requests
+    for event in events:
+        assert event["current"] == (
+            event["message_estimate_tokens"]
+            + event["native_tool_schema_tokens"]
+        )
+        assert event["message_estimate_tokens"] == (
+            event["serialized_message_tokens"]
+            + event["image_estimate_tokens"]
+            + event["opaque_transport_estimate_tokens"]
+        )
+        assert type(event["opaque_transport_estimate_enabled"]) is bool
+        assert all(
+            type(event[field]) is int
+            for field in (
+                "combined_limit",
+                "response_limit",
+                "input_limit",
+                "assistant_text_chars",
+                "assistant_tool_call_argument_chars",
+                "serialized_tool_result_chars",
+            )
+        )
+    return events
+
+
 @pytest.mark.asyncio
 async def test_opaque_history_bounds_repeated_reads_and_keeps_edit_test_progress(
     tmp_path: Path,
@@ -258,6 +296,16 @@ async def test_opaque_history_bounds_repeated_reads_and_keeps_edit_test_progress
         assert response == "Edited and tested."
         assert len(provider.requests) >= 5
         assert max(provider.request_input_tokens) <= request_budget.input_limit
+        usage_events = _assert_context_usage_accounting(
+            store, session.session_id, expected_requests=len(provider.requests)
+        )
+        assert [event["current"] for event in usage_events] == (
+            provider.request_input_tokens
+        )
+        assert all(
+            event["estimator_count_mode"] == "unknown"
+            for event in usage_events
+        )
         assert target.read_text(encoding="utf-8") == "VALUE = 2\n"
         persisted = store.load_session(session.session_id)
         read_results = [
@@ -1412,6 +1460,13 @@ async def test_growing_opaque_state_leaves_room_for_patch_repair_and_test(
             "Inspect the source, coordinate the two edits and verify them with the permitted test."
         )
         assert result == "Repaired and verified." and provider.phase == 4
+        usage_events = _assert_context_usage_accounting(
+            store, session.session_id, expected_requests=len(provider.requests)
+        )
+        assert [
+            event["current"] - event["native_tool_schema_tokens"]
+            for event in usage_events
+        ] == provider.requests
         calls = store.load_session(session.session_id).tool_calls
         assert sum(c.tool_name == "apply_patch" and c.success == 1 for c in calls) == 1
         assert sum(c.tool_name == "apply_patch" and c.success == 0 for c in calls) == 1
@@ -1524,6 +1579,21 @@ async def test_chatgpt_replay_accounting_preserves_final_edit_and_retest(
         session = await loop.start_session()
         result = await loop.run_turn("Edit value.py, verify it, refine it and verify the latest edit.")
         assert result == "Latest edit verified." and provider.requests == 9
+        usage_events = _assert_context_usage_accounting(
+            store, session.session_id, expected_requests=provider.requests
+        )
+        assert all(
+            event["opaque_transport_estimate_enabled"] is True
+            for event in usage_events
+        )
+        assert any(
+            event["opaque_transport_estimate_tokens"] > 0
+            for event in usage_events
+        )
+        assert all(
+            event["estimator_count_mode"] == "offline_text_heuristic"
+            for event in usage_events
+        )
         assert target.read_text() == "VALUE = 3\n"
         saved = store.load_session(session.session_id)
         assert [c.tool_name for c in saved.tool_calls if c.success and c.tool_name != "read_file"] == [

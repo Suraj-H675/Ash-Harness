@@ -2934,6 +2934,86 @@ async def test_replace_file_content_rejects_stale_expected_sha256(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("edit_tool", ["replace", "batch", "whole"])
+@pytest.mark.parametrize("malformed", ["a" * 63, "g" * 64, "a" * 62 + "\ufb00"])
+async def test_edit_tools_reject_malformed_expected_sha256_without_echo(
+    project_root: Path,
+    guard: SafetyGuard,
+    edit_tool: str,
+    malformed: str,
+) -> None:
+    target = project_root / "doc.txt"
+    original = "one\ntwo\nthree\n"
+    target.write_text(original, encoding="utf-8")
+
+    if edit_tool == "replace":
+        result = await ReplaceFileContentTool(guard).run(
+            file_path="doc.txt",
+            start_line=2,
+            end_line=2,
+            target_content="two",
+            replacement_content="TWO",
+            expected_sha256=malformed,
+        )
+    elif edit_tool == "batch":
+        result = await ReplaceFileEditsTool(guard).run(
+            file_path="doc.txt",
+            edits=[
+                {
+                    "start_line": 2,
+                    "end_line": 2,
+                    "target_content": "two",
+                    "replacement_content": "TWO",
+                }
+            ],
+            expected_sha256=malformed,
+        )
+    else:
+        result = await WholeEditTool(guard).run(
+            file_path="doc.txt",
+            content=original.replace("two", "TWO"),
+            expected_sha256=malformed,
+        )
+
+    assert result.success is False
+    assert "64-character hexadecimal digest" in (result.error or "")
+    assert malformed not in (result.error or "")
+    assert "File changed since it was read" not in (result.error or "")
+    assert target.read_text(encoding="utf-8") == original
+
+
+@pytest.mark.asyncio
+async def test_whole_edit_honors_caller_digest_and_refuses_missing_target(
+    project_root: Path, guard: SafetyGuard,
+) -> None:
+    target = project_root / "doc.txt"
+    original = b"original\n"
+    digest = hashlib.sha256(original).hexdigest()
+    target.write_bytes(b"concurrent edit\n")
+    tool = WholeEditTool(guard)
+
+    stale = await tool.run(
+        file_path="doc.txt", content="replacement\n", expected_sha256=digest,
+    )
+    assert not stale.success
+    assert "File changed since it was read" in (stale.error or "")
+    assert target.read_bytes() == b"concurrent edit\n"
+
+    missing = await tool.run(
+        file_path="missing.txt", content="replacement\n", expected_sha256=digest,
+    )
+    assert not missing.success
+    assert not (project_root / "missing.txt").exists()
+
+    target.write_bytes(original)
+    matched = await tool.run(
+        file_path="doc.txt", content="replacement\n", expected_sha256=digest.upper(),
+    )
+    assert matched.success
+    assert target.read_bytes() == b"replacement\n"
+
+
+@pytest.mark.asyncio
 async def test_replace_file_edits_applies_multiple_ranges_atomically(
     project_root: Path,
     guard: SafetyGuard,

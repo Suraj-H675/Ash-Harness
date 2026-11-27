@@ -467,6 +467,82 @@ def _context_diagnostics_for_session(
     return diagnostics
 
 
+def _render_context_assembly_details(assembly: dict[str, Any]) -> list[str]:
+    """Describe only numeric measurements belonging to this exact assembly."""
+    lines: list[str] = []
+    limit_values = tuple(
+        assembly.get(field)
+        for field in ("combined_limit", "response_limit", "input_limit")
+    )
+    if all(type(value) is int for value in limit_values):
+        combined_limit, response_limit, input_limit = limit_values
+        lines.append(
+            f"  configured limits: combined={combined_limit:,}; "
+            f"response={response_limit:,}; input={input_limit:,} tokens"
+        )
+    component_fields = (
+        "message_estimate_tokens",
+        "serialized_message_tokens",
+        "native_tool_schema_tokens",
+        "image_count",
+        "image_estimate_tokens",
+        "opaque_transport_estimate_tokens",
+        "assistant_text_chars",
+        "assistant_tool_call_argument_chars",
+        "serialized_tool_result_chars",
+        "unattributed_tool_call_arguments",
+        "non_string_tool_result_messages",
+    )
+    component_values = {field: assembly.get(field) for field in component_fields}
+    if all(type(value) is int for value in component_values.values()):
+        opaque_enabled = assembly.get("opaque_transport_estimate_enabled")
+        opaque_mode = (
+            "enabled" if opaque_enabled is True
+            else "disabled" if opaque_enabled is False
+            else "unknown"
+        )
+        lines.append(
+            "  local input estimate: "
+            f"message={component_values['message_estimate_tokens']:,} tokens "
+            f"(serialized={component_values['serialized_message_tokens']:,}; "
+            f"images={component_values['image_count']:,}/"
+            f"{component_values['image_estimate_tokens']:,}; "
+            f"opaque transport ({opaque_mode})="
+            f"{component_values['opaque_transport_estimate_tokens']:,}); "
+            "native tool schemas="
+            f"{component_values['native_tool_schema_tokens']:,} tokens"
+        )
+        lines.append(
+            "  included message text: assistant="
+            f"{component_values['assistant_text_chars']:,} chars; "
+            "tool-call arguments="
+            f"{component_values['assistant_tool_call_argument_chars']:,}; "
+            "serialized tool results="
+            f"{component_values['serialized_tool_result_chars']:,}"
+        )
+        lines.append(
+            "  unattributed tool arguments/non-string results: "
+            f"{component_values['unattributed_tool_call_arguments']:,}/"
+            f"{component_values['non_string_tool_result_messages']:,}"
+        )
+        lines.append(
+            "  image and opaque estimates are included in message tokens; "
+            "provider capacity remains unverified"
+        )
+        lines.append(
+            "  serialized estimate counts cleaned JSON messages, including "
+            "their envelope; image and eligible opaque payload bytes are "
+            "excluded"
+        )
+        lines.append(
+            "  formula: current = message estimate + native schemas; "
+            "section counts are attribution views, not extra input"
+        )
+    else:
+        lines.append("  local input attribution: unavailable in this stored event")
+    return lines
+
+
 def _render_context_diagnostics(diagnostics: dict[str, Any]) -> str:
     """Render bounded, session-specific request evidence for `/context`."""
 
@@ -488,6 +564,7 @@ def _render_context_diagnostics(diagnostics: dict[str, Any]) -> str:
             f"{assembly.get('estimator_count_mode') or 'unknown'}; "
             f"context_id={assembly.get('context_id') or 'unknown'}"
         )
+        lines.extend(_render_context_assembly_details(assembly))
     else:
         lines.append("Last recorded request assembly: unavailable")
 
@@ -508,6 +585,13 @@ def _render_context_diagnostics(diagnostics: dict[str, Any]) -> str:
         else:
             lines.append(
                 f"Last dispatched request attempt: {state}; usage={usage_source}"
+            )
+        requested_completion_limit = request.get("requested_completion_limit")
+        if type(requested_completion_limit) is int:
+            lines.append(
+                "  Ash requested completion limit for this call: "
+                f"{requested_completion_limit:,} tokens; enforcement depends on the "
+                "provider; not next-request input headroom"
             )
         if usage_source in {"provider", "estimated"}:
             prompt = request.get("prompt_tokens")
@@ -530,6 +614,10 @@ def _render_context_diagnostics(diagnostics: dict[str, Any]) -> str:
                 lines.append(
                     f"  matched local estimate: ~{current:,}/{maximum:,} input tokens"
                 )
+                if not isinstance(assembly, dict) or (
+                    matched_assembly.get("context_id") != assembly.get("context_id")
+                ):
+                    lines.extend(_render_context_assembly_details(matched_assembly))
             else:
                 lines.append("  matched local estimate: unavailable")
         else:
@@ -549,11 +637,19 @@ def _render_context_diagnostics(diagnostics: dict[str, Any]) -> str:
         cause = rejection.get("cause") or "unknown"
         required = rejection.get("required_input_tokens")
         limit = rejection.get("input_limit")
-        numeric = (
-            f"; required ~{required:,}, input ceiling {limit:,}"
-            if type(required) is int and type(limit) is int
-            else ""
-        )
+        total_required = rejection.get("required_total_input_tokens")
+        total_limit = rejection.get("total_input_limit")
+        native_schemas = rejection.get("native_tool_schema_tokens")
+        numeric = ""
+        if type(required) is int and type(limit) is int:
+            if all(type(x) is int for x in (total_required, total_limit, native_schemas)):
+                numeric = (
+                    f"; message-only required ~{required:,}/{limit:,}; "
+                    f"total input ~{total_required:,}/{total_limit:,} "
+                    f"(native schemas {native_schemas:,})"
+                )
+            else:
+                numeric = f"; required ~{required:,}, input ceiling {limit:,}"
         turn_used = rejection.get("turn_tokens_used")
         turn_limit = rejection.get("turn_token_limit")
         turn_budget = (
@@ -566,6 +662,24 @@ def _render_context_diagnostics(diagnostics: dict[str, Any]) -> str:
             f"dispatch={rejection.get('dispatch_status') or 'unknown'}"
             f"{numeric}{turn_budget}; earlier requests may have completed"
         )
+        if type(total_required) is int and type(total_limit) is int:
+            # Rejection fields were measured without dispatch; the raw
+            # message-only limit is not a provider capacity measurement.
+            serialized = rejection.get("serialized_message_tokens")
+            images = rejection.get("image_estimate_tokens")
+            opaque = rejection.get("opaque_transport_estimate_tokens")
+            if all(type(x) is int for x in (serialized, images, opaque)):
+                lines.append(
+                    f"  rejected message estimate: serialized={serialized:,}; "
+                    f"images={images:,}; opaque transport={opaque:,} tokens"
+                )
+            args = rejection.get("assistant_tool_call_argument_chars")
+            results = rejection.get("serialized_tool_result_chars")
+            if type(args) is int and type(results) is int:
+                lines.append(
+                    f"  rejected message tool-call arguments={args:,} chars; "
+                    f"serialized tool results={results:,} chars"
+                )
         lines.append(
             "  protected current turn="
             f"{rejection.get('protected_current_turn')}; opaque replay preserved="

@@ -66,6 +66,68 @@ class ContextAssemblyResult:
     maximum_input: int
 
 
+def _text_content_characters(content: object) -> int:
+    if isinstance(content, str):
+        return len(content)
+    if not isinstance(content, list):
+        return 0
+    return sum(
+        len(block["text"])
+        for block in content
+        if isinstance(block, dict)
+        and block.get("type") in ("text", "input_text", "output_text")
+        and isinstance(block.get("text"), str)
+    )
+
+
+def _message_attribution(messages: list[dict[str, Any]]) -> dict[str, int]:
+    assistant_text_chars = 0
+    assistant_tool_call_argument_chars = 0
+    serialized_tool_result_chars = 0
+    unattributed_tool_call_arguments = 0
+    non_string_tool_result_messages = 0
+    for message in messages:
+        role = message.get("role")
+        if role == "assistant":
+            assistant_text_chars += _text_content_characters(message.get("content"))
+            tool_calls = message.get("tool_calls")
+            if isinstance(tool_calls, list):
+                for call in tool_calls:
+                    if not isinstance(call, dict):
+                        unattributed_tool_call_arguments += 1
+                        continue
+                    # Canonical Ash history uses flat call objects. Legacy
+                    # OpenAI-shaped call records can have nested arguments.
+                    function = call.get("function")
+                    arguments = (
+                        function.get("arguments") if isinstance(function, dict)
+                        else call.get("arguments")
+                    )
+                    if isinstance(arguments, str):
+                        assistant_tool_call_argument_chars += len(arguments)
+                    elif isinstance(arguments, dict):
+                        # Measure the local JSON representation, not provider
+                        # token occupancy. No complete history reserialization.
+                        assistant_tool_call_argument_chars += len(
+                            json.dumps(arguments, ensure_ascii=False, default=str)
+                        )
+                    else:
+                        unattributed_tool_call_arguments += 1
+        elif role == "tool":
+            content = message.get("content")
+            if isinstance(content, str):
+                serialized_tool_result_chars += len(content)
+            elif "content" in message:
+                non_string_tool_result_messages += 1
+    return {
+        "assistant_text_chars": assistant_text_chars,
+        "assistant_tool_call_argument_chars": assistant_tool_call_argument_chars,
+        "serialized_tool_result_chars": serialized_tool_result_chars,
+        "unattributed_tool_call_arguments": unattributed_tool_call_arguments,
+        "non_string_tool_result_messages": non_string_tool_result_messages,
+    }
+
+
 def _allocate_section_limits(
     limit: int, demands: list[int], weights: list[float]
 ) -> list[int]:
@@ -260,15 +322,36 @@ def assemble_context(request: ContextAssemblyRequest) -> ContextAssemblyResult:
         input_token_limit=allocator.input_limit - native_schema_tokens,
         responses_reasoning_transport_estimate=request.responses_reasoning_transport_estimate,
     )
-    compaction = compactor.compact(
-        messages,
-        count_tokens=count_tokens,
-        previous_summary=request.previous_summary,
-        include_previous_summary=request.include_previous_summary,
-        force=request.force_compaction,
-        protected_from_index=request.protected_history_index,
-    )
-    tokens = compaction.estimated_tokens + native_schema_tokens
+    try:
+        compaction = compactor.compact(
+            messages,
+            count_tokens=count_tokens,
+            previous_summary=request.previous_summary,
+            include_previous_summary=request.include_previous_summary,
+            force=request.force_compaction,
+            protected_from_index=request.protected_history_index,
+        )
+    except ContextBudgetExceededError as exc:
+        # Preserve the original rejection semantics. Normalize only the
+        # accounting scope of errors from the message-only compactor.
+        exc.rejection_accounting = {
+            "native_tool_schema_tokens": native_schema_tokens,
+            "required_total_input_tokens": exc.required_tokens + native_schema_tokens,
+            "total_input_limit": exc.limit + native_schema_tokens,
+            "combined_limit": budget.combined_limit,
+            "response_limit": budget.response_limit,
+        }
+        if exc.token_estimate is not None:
+            exc.rejection_accounting.update(exc.token_estimate.metrics())
+        if exc.provider_replay_state_preserved:
+            # This is the unchanged message list the compactor counted.
+            exc.rejection_accounting.update(_message_attribution(messages))
+            exc.rejection_accounting["opaque_transport_estimate_enabled"] = (
+                request.responses_reasoning_transport_estimate
+            )
+        raise
+    message_estimate_tokens = compaction.estimated_tokens
+    tokens = message_estimate_tokens + native_schema_tokens
     maximum_input = budget.input_limit
     if tokens > maximum_input:
         raise ContextBudgetExceededError(
@@ -280,25 +363,33 @@ def assemble_context(request: ContextAssemblyRequest) -> ContextAssemblyResult:
     if usage["history"] > budget_limits["history"]:
         truncated.add("history")
 
+    estimate = compaction.token_estimate
+    assert estimate is not None  # Every internal compaction result is measured.
+    attribution = _message_attribution(compaction.messages)
     usage_event = {
         "type": "context.usage",
         "current": tokens,
         "maximum": maximum_input,
+        "combined_limit": budget.combined_limit,
+        "response_limit": budget.response_limit,
+        "input_limit": budget.input_limit,
+        **estimate.metrics(),
+        "native_tool_schema_tokens": native_schema_tokens,
         "system_tokens": usage["system"],
         "tool_schema_tokens": usage["tools"],
         "history_tokens": usage["history"],
         "repo_map_tokens": usage["repo_map"],
         "memory_tokens": usage["memory"],
+        **attribution,
         "history_message_count": max(0, len(compaction.messages) - 1),
         "tool_message_count": sum(
             1 for item in compaction.messages if item.get("role") == "tool"
         ),
-        "provider_replay_state_preserved": compaction.provider_replay_state_preserved,
-        "tool_message_chars": sum(
-            len(item["content"])
-            for item in compaction.messages
-            if item.get("role") == "tool" and isinstance(item.get("content"), str)
+        "opaque_transport_estimate_enabled": (
+            request.responses_reasoning_transport_estimate
         ),
+        "provider_replay_state_preserved": compaction.provider_replay_state_preserved,
+        "tool_message_chars": attribution["serialized_tool_result_chars"],
     }
 
     # The marker belongs to Ash's compactor, never to the provider. History

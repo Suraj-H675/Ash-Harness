@@ -304,6 +304,22 @@ Provider-reported prompt usage may omit retained opaque reasoning or count
 schemas differently; it does not prove the total occupied context. Ash does
 not calibrate its admission estimate from historical usage ratios.
 
+The latest `/context` assembly now shows the combined, response, and input
+ceilings; the message estimate split into cleaned serialized messages, image
+estimate, and eligible opaque transport estimate; native tool schema tokens;
+and content-free character counts for assistant text, tool-call arguments, and
+serialized tool results. Cleaned serialized messages include JSON message
+envelopes, but exclude image bytes and eligible encrypted reasoning bytes.
+Other provider framing and multimodal costs remain unknown. The displayed
+counter mode identifies only a known Ash-local counter implementation; it does
+not make the estimate an exact provider count. Old persisted events can lack
+these optional details. The requested completion limit is not necessarily
+enforced by the provider, and does not predict how much input a later coding
+step will need. Rejected message-compactor estimates include their native
+schema deduction and total-input equivalent when available.
+The serialized estimate already includes the message envelope; section counts
+are attribution views and should not be added to the total again.
+
 For the first-party ChatGPT plan adapter using Ash's offline ASCII token
 estimator, long URL-safe base64-shaped top-level reasoning payloads are
 estimated by their approximate decoded byte length (three bytes per token,

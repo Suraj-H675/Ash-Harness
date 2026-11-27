@@ -404,6 +404,11 @@ class ProviderABC(ABC):
 
         raise NotImplementedError
 
+    @property
+    def context_count_mode(self) -> str:
+        """Provenance of the local counter used for context estimates."""
+        return "unknown"
+
     def configure_max_tokens(self, max_tokens: int) -> None:
         """Apply a per-request completion ceiling when the adapter supports it."""
 

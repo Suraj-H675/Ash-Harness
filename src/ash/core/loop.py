@@ -450,6 +450,7 @@ class PreparedModelInput:
     messages: list[dict[str, Any]]
     context_id: str
     estimated_input_tokens: int | None = None
+    requested_completion_limit: int | None = None
 
 
 _OBSERVER_EVENT_FIELDS: dict[str, frozenset[str]] = {
@@ -460,6 +461,12 @@ _OBSERVER_EVENT_FIELDS: dict[str, frozenset[str]] = {
             "estimate_source",
             "current",
             "maximum",
+            "combined_limit",
+            "response_limit",
+            "input_limit",
+            "message_estimate_tokens",
+            "serialized_message_tokens",
+            "native_tool_schema_tokens",
             "estimator_route",
             "estimator_count_mode",
             "system_tokens",
@@ -470,6 +477,15 @@ _OBSERVER_EVENT_FIELDS: dict[str, frozenset[str]] = {
             "history_message_count",
             "tool_message_count",
             "tool_message_chars",
+            "assistant_text_chars",
+            "assistant_tool_call_argument_chars",
+            "serialized_tool_result_chars",
+            "unattributed_tool_call_arguments",
+            "non_string_tool_result_messages",
+            "image_count",
+            "image_estimate_tokens",
+            "opaque_transport_estimate_enabled",
+            "opaque_transport_estimate_tokens",
             "provider_replay_state_preserved",
         }
     ),
@@ -486,6 +502,22 @@ _OBSERVER_EVENT_FIELDS: dict[str, frozenset[str]] = {
             "required_history_summary",
             "turn_tokens_used",
             "turn_token_limit",
+            "native_tool_schema_tokens",
+            "required_total_input_tokens",
+            "total_input_limit",
+            "combined_limit",
+            "response_limit",
+            "message_estimate_tokens",
+            "serialized_message_tokens",
+            "image_count",
+            "image_estimate_tokens",
+            "opaque_transport_estimate_tokens",
+            "opaque_transport_estimate_enabled",
+            "assistant_text_chars",
+            "assistant_tool_call_argument_chars",
+            "serialized_tool_result_chars",
+            "unattributed_tool_call_arguments",
+            "non_string_tool_result_messages",
         }
     ),
     "model.request.started": frozenset(
@@ -500,6 +532,7 @@ _OBSERVER_EVENT_FIELDS: dict[str, frozenset[str]] = {
             "message_count",
             "tool_count",
             "native_tools",
+            "requested_completion_limit",
             "credential_profile",
             "credential_pool_size",
         }
@@ -2255,6 +2288,7 @@ class AshLoop:
         required_history_summary: bool,
         turn_tokens_used: int | None = None,
         turn_token_limit: int | None = None,
+        accounting: dict[str, int | bool] | None = None,
     ) -> None:
         """Record why this request attempt stopped before provider dispatch."""
 
@@ -2272,6 +2306,8 @@ class AshLoop:
             ),
             "required_history_summary": required_history_summary,
         }
+        if accounting:
+            payload.update(accounting)
         if turn_tokens_used is not None:
             payload["turn_tokens_used"] = max(0, int(turn_tokens_used))
         if turn_token_limit is not None:
@@ -2299,6 +2335,14 @@ class AshLoop:
                 if self._config is not None
                 else None
             )
+        count_mode = (
+            getattr(provider, "context_count_mode", "unknown")
+            if estimate_source == "local" else "unknown"
+        )
+        if not isinstance(count_mode, str) or count_mode not in (
+            "offline_text_heuristic", "chars_per_token_4", "tiktoken_cl100k_base"
+        ):
+            count_mode = "unknown"
         return {
             **payload,
             "type": "context.usage",
@@ -2307,7 +2351,7 @@ class AshLoop:
             "estimate_source": estimate_source,
             "estimator_route": estimator_route_override
             or _context_estimator_route(provider, configured_model),
-            "estimator_count_mode": "unknown",
+            "estimator_count_mode": count_mode,
         }
 
     def _emit_event(self, payload: dict[str, Any]) -> None:
@@ -4608,6 +4652,7 @@ class AshLoop:
                         exc.provider_replay_state_preserved
                     ),
                     required_history_summary=exc.required_history_summary,
+                    accounting=exc.rejection_accounting,
                     turn_tokens_used=(used_before_request if turn_token_budget > 0 else None),
                     turn_token_limit=(turn_token_budget if turn_token_budget > 0 else None),
                 )
@@ -4625,6 +4670,7 @@ class AshLoop:
             assembled_input_tokens = (
                 self._last_context_tokens if self._config is not None else None
             )
+            requested_completion_limit: int | None = None
             if request_budget is not None:
                 remaining_turn_tokens: int | None = None
                 estimated_prompt = 0
@@ -4661,6 +4707,7 @@ class AshLoop:
                         f"{estimated_prompt}, budget {turn_token_budget}.]"
                     ).strip()
                     break
+                requested_completion_limit = response_limit
                 self.provider.configure_max_tokens(response_limit)
             elif turn_token_budget > 0:
                 used_before_request = total_prompt_tokens + total_completion_tokens
@@ -4694,17 +4741,17 @@ class AshLoop:
                         f"{estimated_prompt}, budget {turn_token_budget}.]"
                     ).strip()
                     break
-                self.provider.configure_max_tokens(
-                    max(
-                        1,
-                        min(
-                            int(getattr(self._config, "max_completion_tokens", 1)),
-                            remaining - estimated_prompt,
-                        ),
-                    )
+                requested_completion_limit = max(
+                    1,
+                    min(
+                        int(getattr(self._config, "max_completion_tokens", 1)),
+                        remaining - estimated_prompt,
+                    ),
                 )
+                self.provider.configure_max_tokens(requested_completion_limit)
             elif self._config is not None:
-                self.provider.configure_max_tokens(self._config.max_completion_tokens)
+                requested_completion_limit = self._config.max_completion_tokens
+                self.provider.configure_max_tokens(requested_completion_limit)
             await self._fire_hook_lifecycle(
                 "pre_model",
                 {
@@ -4722,6 +4769,7 @@ class AshLoop:
                         messages,
                         context_id,
                         estimated_input_tokens=assembled_input_tokens,
+                        requested_completion_limit=requested_completion_limit,
                     ),
                     provider_tools=iteration_tools,
                     provider_tool_schema=iteration_tool_schema,
@@ -6637,6 +6685,17 @@ class AshLoop:
                             "message_count": len(canonical_messages),
                             "tool_count": len(openai_tools or ()),
                             "native_tools": native_protocol,
+                            **(
+                                {
+                                    "requested_completion_limit": (
+                                        prepared_input.requested_completion_limit
+                                    )
+                                }
+                                if prepared_input is not None
+                                and type(prepared_input.requested_completion_limit)
+                                is int
+                                else {}
+                            ),
                             **_provider_credential_event_fields(
                                 self.provider,
                                 model_id=replay_owner,

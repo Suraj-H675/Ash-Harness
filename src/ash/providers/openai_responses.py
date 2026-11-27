@@ -11,7 +11,7 @@ from typing import Any, AsyncGenerator
 
 import openai  # type: ignore[import-not-found]
 
-from ash.context.tokens import OpenAITokenCounter
+from ash.context.tokens import OpenAITokenCounter, token_count_mode
 from ash.providers.base import (
     ProviderABC,
     ProviderIncompleteStreamError,
@@ -717,6 +717,12 @@ class OpenAIResponsesProvider(ProviderABC):
 
     def count_tokens(self, text: str) -> int:
         return self._token_counter.count(text)
+
+    @property
+    def context_count_mode(self) -> str:
+        if getattr(self.count_tokens, "__func__", None) is OpenAIResponsesProvider.count_tokens:
+            return token_count_mode(self._token_counter)
+        return "unknown"
 
     def _resolve_client(self) -> Any:
         if self._client is None:

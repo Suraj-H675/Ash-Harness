@@ -365,6 +365,13 @@ class WholeEditArgs(BaseModel):
         description="Complete new file content.",
     )
     reason: str = Field("", description="Why the entire file is being replaced.")
+    expected_sha256: str | None = Field(
+        None,
+        description=(
+            "Optional exact 64-character hexadecimal SHA-256 from read_file. "
+            "Refuse if the existing file is missing or no longer matches."
+        ),
+    )
 
 
 class ReadFileTool(BaseTool):
@@ -1202,6 +1209,11 @@ class WholeEditTool(BaseTool):
                 self.safety_guard,
                 preserve_existing=True,
             )
+            stale_error = _validate_expected_sha256(
+                args.expected_sha256, expected_sha256
+            )
+            if stale_error is not None:
+                return ToolResult(success=False, output="", error=stale_error)
             atomic_write_scoped_bytes(
                 resolved_path,
                 payload,
@@ -1506,8 +1518,19 @@ def _sha256_bytes(content: bytes) -> str:
     return hashlib.sha256(content).hexdigest()
 
 
-def _validate_expected_sha256(expected: str | None, actual: str) -> str | None:
-    if expected is None or expected.casefold() == actual:
+def _validate_expected_sha256(
+    expected: str | None, actual: str | None
+) -> str | None:
+    if expected is None:
+        return None
+    if re.fullmatch(r"[a-fA-F0-9]{64}", expected) is None:
+        return (
+            "Error: expected_sha256 must be a 64-character hexadecimal digest. "
+            "Read the file again before editing."
+        )
+    if actual is None:
+        return "Error: Expected an existing file, but it is missing. Read it again."
+    if expected.lower() == actual:
         return None
     return (
         "Error: File changed since it was read. "

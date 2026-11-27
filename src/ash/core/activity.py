@@ -28,6 +28,12 @@ METRIC_EVENT_FIELDS = {
         "estimate_source",
         "current",
         "maximum",
+        "combined_limit",
+        "response_limit",
+        "input_limit",
+        "message_estimate_tokens",
+        "serialized_message_tokens",
+        "native_tool_schema_tokens",
         "estimator_route",
         "estimator_count_mode",
         "system_tokens",
@@ -38,6 +44,15 @@ METRIC_EVENT_FIELDS = {
         "history_message_count",
         "tool_message_count",
         "tool_message_chars",
+        "assistant_text_chars",
+        "assistant_tool_call_argument_chars",
+        "serialized_tool_result_chars",
+        "unattributed_tool_call_arguments",
+        "non_string_tool_result_messages",
+        "image_count",
+        "image_estimate_tokens",
+        "opaque_transport_estimate_enabled",
+        "opaque_transport_estimate_tokens",
         "provider_replay_state_preserved",
     ),
     "context.request.rejected": (
@@ -52,6 +67,22 @@ METRIC_EVENT_FIELDS = {
         "required_history_summary",
         "turn_tokens_used",
         "turn_token_limit",
+        "native_tool_schema_tokens",
+        "required_total_input_tokens",
+        "total_input_limit",
+        "combined_limit",
+        "response_limit",
+        "message_estimate_tokens",
+        "serialized_message_tokens",
+        "image_count",
+        "image_estimate_tokens",
+        "opaque_transport_estimate_tokens",
+        "opaque_transport_estimate_enabled",
+        "assistant_text_chars",
+        "assistant_tool_call_argument_chars",
+        "serialized_tool_result_chars",
+        "unattributed_tool_call_arguments",
+        "non_string_tool_result_messages",
     ),
     "model.request.started": (
         "context_id",
@@ -59,6 +90,7 @@ METRIC_EVENT_FIELDS = {
         "message_count",
         "tool_count",
         "native_tools",
+        "requested_completion_limit",
         "requested_route",
         "effective_route",
     ),
@@ -166,10 +198,47 @@ def summarize_context_diagnostics(
                 "context_id": context_id,
                 "current": _nonnegative_int(event.get("current")),
                 "maximum": _nonnegative_int(event.get("maximum")),
+                "combined_limit": _nonnegative_int(event.get("combined_limit")),
+                "response_limit": _nonnegative_int(event.get("response_limit")),
+                "input_limit": _nonnegative_int(event.get("input_limit")),
+                "message_estimate_tokens": _nonnegative_int(
+                    event.get("message_estimate_tokens")
+                ),
+                "serialized_message_tokens": _nonnegative_int(
+                    event.get("serialized_message_tokens")
+                ),
+                "native_tool_schema_tokens": _nonnegative_int(
+                    event.get("native_tool_schema_tokens")
+                ),
                 "estimator_route": _safe_route(event.get("estimator_route")),
                 "estimate_source": _safe_name(event.get("estimate_source")),
                 "estimator_count_mode": _safe_name(
                     event.get("estimator_count_mode")
+                ),
+                "assistant_text_chars": _nonnegative_int(
+                    event.get("assistant_text_chars")
+                ),
+                "assistant_tool_call_argument_chars": _nonnegative_int(
+                    event.get("assistant_tool_call_argument_chars")
+                ),
+                "serialized_tool_result_chars": _nonnegative_int(
+                    event.get("serialized_tool_result_chars")
+                ),
+                "unattributed_tool_call_arguments": _nonnegative_int(
+                    event.get("unattributed_tool_call_arguments")
+                ),
+                "non_string_tool_result_messages": _nonnegative_int(
+                    event.get("non_string_tool_result_messages")
+                ),
+                "image_count": _nonnegative_int(event.get("image_count")),
+                "image_estimate_tokens": _nonnegative_int(
+                    event.get("image_estimate_tokens")
+                ),
+                "opaque_transport_estimate_enabled": _optional_bool(
+                    event.get("opaque_transport_estimate_enabled")
+                ),
+                "opaque_transport_estimate_tokens": _nonnegative_int(
+                    event.get("opaque_transport_estimate_tokens")
                 ),
                 "provider_replay_state_preserved": (
                     event.get("provider_replay_state_preserved")
@@ -198,6 +267,29 @@ def summarize_context_diagnostics(
                 ),
                 "required_history_summary": _optional_bool(
                     event.get("required_history_summary")
+                ),
+                **{
+                    field: _nonnegative_int(event.get(field))
+                    for field in (
+                        "native_tool_schema_tokens",
+                        "required_total_input_tokens",
+                        "total_input_limit",
+                        "combined_limit",
+                        "response_limit",
+                        "message_estimate_tokens",
+                        "serialized_message_tokens",
+                        "image_count",
+                        "image_estimate_tokens",
+                        "opaque_transport_estimate_tokens",
+                        "assistant_text_chars",
+                        "assistant_tool_call_argument_chars",
+                        "serialized_tool_result_chars",
+                        "unattributed_tool_call_arguments",
+                        "non_string_tool_result_messages",
+                    )
+                },
+                "opaque_transport_estimate_enabled": _optional_bool(
+                    event.get("opaque_transport_estimate_enabled")
                 ),
                 "turn_tokens_used": _nonnegative_int(
                     event.get("turn_tokens_used")
@@ -314,6 +406,9 @@ def summarize_context_diagnostics(
             "context_id": start_context_id,
             "operation_id": operation_id,
             "attempt": _nonnegative_int(start.get("attempt")),
+            "requested_completion_limit": _nonnegative_int(
+                start.get("requested_completion_limit")
+            ),
             "requested_route": requested_route or "unknown",
             "effective_route": effective_route or "unknown",
             "route_parity": parity,

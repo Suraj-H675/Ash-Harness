@@ -190,6 +190,36 @@ class BoundedText:
 
 
 @dataclass(frozen=True)
+class HistoryTokenEstimate:
+    """Components from one local message-count pass, not provider occupancy."""
+
+    serialized_message_tokens: int
+    image_count: int
+    opaque_transport_estimate_tokens: int
+
+    @property
+    def image_estimate_tokens(self) -> int:
+        return self.image_count * IMAGE_TOKEN_ESTIMATE
+
+    @property
+    def total_tokens(self) -> int:
+        return (
+            self.serialized_message_tokens
+            + self.image_estimate_tokens
+            + self.opaque_transport_estimate_tokens
+        )
+
+    def metrics(self) -> dict[str, int]:
+        return {
+            "message_estimate_tokens": self.total_tokens,
+            "serialized_message_tokens": self.serialized_message_tokens,
+            "image_count": self.image_count,
+            "image_estimate_tokens": self.image_estimate_tokens,
+            "opaque_transport_estimate_tokens": self.opaque_transport_estimate_tokens,
+        }
+
+
+@dataclass(frozen=True)
 class CompactionResult:
     messages: list[dict[str, Any]]
     summary: str
@@ -198,6 +228,7 @@ class CompactionResult:
     removed_messages: int = 0
     pruned_tool_outputs: int = 0
     provider_replay_state_preserved: bool = False
+    token_estimate: HistoryTokenEstimate | None = None
 
 
 class ContextBudgetExceededError(RuntimeError):
@@ -211,7 +242,10 @@ class ContextBudgetExceededError(RuntimeError):
         protected_current_turn: bool,
         required_history_summary: bool = False,
         provider_replay_state_preserved: bool = False,
+        token_estimate: HistoryTokenEstimate | None = None,
     ) -> None:
+        self.token_estimate = token_estimate
+        self.rejection_accounting: dict[str, int | bool] = {}
         self.required_tokens = required_tokens
         self.limit = limit
         self.protected_current_turn = protected_current_turn
@@ -450,6 +484,21 @@ def _reasoning_transport_tokens(value: object) -> int | None:
     return (len(value) + 3) // 4
 
 
+def _reasoning_transport_item_tokens(item: object) -> int | None:
+    if (
+        not isinstance(item, dict)
+        or item.get("type") != "reasoning"
+        or not set(item)
+        <= {"type", "id", "summary", "status", "encrypted_content"}
+        or not isinstance(item.get("id"), str)
+        or not item["id"]
+        or not isinstance(item.get("summary"), list)
+        or item.get("status") not in (None, "completed", "in_progress", "incomplete")
+    ):
+        return None
+    return _reasoning_transport_tokens(item.get("encrypted_content"))
+
+
 class HistoryCompactor:
     """Fit canonical chat messages into a bounded model input budget.
 
@@ -529,10 +578,11 @@ class HistoryCompactor:
             item.get("role") == "assistant" and item.get("provider_state")
             for item in messages
         ):
-            unchanged_tokens = self._count(
+            estimate = self._estimate(
                 messages, count_tokens,
                 responses_reasoning_transport_estimate=self._responses_reasoning_transport_estimate,
             )
+            unchanged_tokens = estimate.total_tokens
             summary_required = include_previous_summary and bool(previous_summary)
             if force or summary_required or unchanged_tokens > self.input_limit:
                 raise ContextBudgetExceededError(
@@ -541,6 +591,7 @@ class HistoryCompactor:
                     protected_current_turn=protected_from_index is not None,
                     required_history_summary=summary_required,
                     provider_replay_state_preserved=True,
+                    token_estimate=estimate,
                 )
             return CompactionResult(
                 messages=list(messages),
@@ -548,13 +599,15 @@ class HistoryCompactor:
                 compacted=False,
                 estimated_tokens=unchanged_tokens,
                 provider_replay_state_preserved=True,
+                token_estimate=estimate,
             )
 
         prepared, pruned = self._prune_tool_outputs(
             messages,
             protected_from_index=protected_from_index,
         )
-        estimated = self._count(prepared, count_tokens)
+        estimate = self._estimate(prepared, count_tokens)
+        estimated = estimate.total_tokens
         if not prepared:
             return CompactionResult(
                 prepared,
@@ -562,6 +615,7 @@ class HistoryCompactor:
                 bool(pruned),
                 estimated,
                 pruned_tool_outputs=pruned,
+                token_estimate=estimate,
             )
 
         should_compact = force or estimated > self._compaction_trigger_limit
@@ -573,6 +627,7 @@ class HistoryCompactor:
                 bool(pruned),
                 estimated,
                 pruned_tool_outputs=pruned,
+                token_estimate=estimate,
             )
 
         system = prepared[0] if prepared[0].get("role") == "system" else None
@@ -634,7 +689,8 @@ class HistoryCompactor:
                 + ([summary_message] if summary_message is not None else [])
                 + recent
             )
-            final_estimate = self._count(compacted, count_tokens)
+            estimate = self._estimate(compacted, count_tokens)
+            final_estimate = estimate.total_tokens
             if final_estimate <= self.input_limit and summary_visible:
                 return CompactionResult(
                     messages=compacted,
@@ -643,6 +699,7 @@ class HistoryCompactor:
                     estimated_tokens=final_estimate,
                     removed_messages=len(removed),
                     pruned_tool_outputs=pruned,
+                    token_estimate=estimate,
                 )
 
             span = self._oldest_removable_span(
@@ -663,6 +720,7 @@ class HistoryCompactor:
                     self.input_limit,
                     protected_current_turn=protected_recent_index is not None,
                     required_history_summary=(summary_required and not summary_visible),
+                    token_estimate=(estimate if required_tokens == final_estimate else None),
                 )
             start, end = span
             removed.extend(recent[start:end])
@@ -936,6 +994,18 @@ class HistoryCompactor:
         *,
         responses_reasoning_transport_estimate: bool = False,
     ) -> int:
+        return HistoryCompactor._estimate(
+            messages, count_tokens,
+            responses_reasoning_transport_estimate=responses_reasoning_transport_estimate,
+        ).total_tokens
+
+    @staticmethod
+    def _estimate(
+        messages: list[dict[str, Any]],
+        count_tokens: Callable[[str], int],
+        *,
+        responses_reasoning_transport_estimate: bool = False,
+    ) -> HistoryTokenEstimate:
         sanitized, image_count = _without_image_data(messages)
         reasoning_tokens = 0
         if responses_reasoning_transport_estimate:
@@ -945,16 +1015,7 @@ class HistoryCompactor:
                     continue
                 estimated_states = []
                 for item in states:
-                    estimate = None
-                    if (
-                        isinstance(item, dict)
-                        and item.get("type") == "reasoning"
-                        and set(item) <= {"type", "id", "summary", "status", "encrypted_content"}
-                        and isinstance(item.get("id"), str) and item["id"]
-                        and isinstance(item.get("summary"), list)
-                        and item.get("status") in (None, "completed", "in_progress", "incomplete")
-                    ):
-                        estimate = _reasoning_transport_tokens(item.get("encrypted_content"))
+                    estimate = _reasoning_transport_item_tokens(item)
                     if estimate is None:
                         estimated_states.append(item)
                     else:
@@ -964,9 +1025,10 @@ class HistoryCompactor:
                 # by compact() or sent to the provider.
                 message["provider_state"] = estimated_states
         payload = json.dumps(sanitized, ensure_ascii=False, default=str)
-        return (
-            max(0, int(count_tokens(payload))) + image_count * IMAGE_TOKEN_ESTIMATE
-            + reasoning_tokens
+        return HistoryTokenEstimate(
+            serialized_message_tokens=max(0, int(count_tokens(payload))),
+            image_count=image_count,
+            opaque_transport_estimate_tokens=reasoning_tokens,
         )
 
 

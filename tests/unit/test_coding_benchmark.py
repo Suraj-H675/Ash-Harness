@@ -729,6 +729,12 @@ def test_coding_timeline_records_request_and_tool_timings_without_content() -> N
                 "context.usage",
                 current=8000,
                 maximum=16000,
+                combined_limit=20000,
+                response_limit=4000,
+                input_limit=16000,
+                message_estimate_tokens=7900,
+                serialized_message_tokens=6876,
+                native_tool_schema_tokens=100,
                 system_tokens=1000,
                 tool_schema_tokens=750,
                 history_tokens=6000,
@@ -737,10 +743,27 @@ def test_coding_timeline_records_request_and_tool_timings_without_content() -> N
                 history_message_count=5,
                 tool_message_count=2,
                 tool_message_chars=30000,
+                assistant_text_chars=900,
+                assistant_tool_call_argument_chars=1200,
+                serialized_tool_result_chars=30000,
+                unattributed_tool_call_arguments=0,
+                non_string_tool_result_messages=0,
+                image_count=1,
+                image_estimate_tokens=1024,
+                opaque_transport_estimate_enabled=True,
+                opaque_transport_estimate_tokens=0,
+                assistant_text_content="SECRET-ASSISTANT-TEXT",
                 tool_result="SECRET-SOURCE-TEXT",
                 file_path="/private/sensitive-file.py",
             ),
-            event(3, 1, "model.request.started", operation_id="r1", tool_count=10),
+            event(
+                3,
+                1,
+                "model.request.started",
+                operation_id="r1",
+                tool_count=10,
+                requested_completion_limit=1200,
+            ),
             event(
                 4,
                 4,
@@ -799,12 +822,21 @@ def test_coding_timeline_records_request_and_tool_timings_without_content() -> N
     )
     assert context_metrics["history_tokens"] == 6000
     assert context_metrics["tool_message_chars"] == 30000
+    assert context_metrics["message_estimate_tokens"] == 7900
+    assert context_metrics["assistant_text_chars"] == 900
+    request_start = next(
+        item
+        for item in evidence["timeline"]
+        if item["type"] == "model.request.started"
+    )
+    assert request_start["requested_completion_limit"] == 1200
     serialized = str(evidence)
     assert "SECRET-OUTPUT" not in serialized
     assert "PRIVATE-ERROR" not in serialized
     assert "private.txt" not in serialized
     assert "do not retain secret" not in serialized
     assert "SECRET-SOURCE-TEXT" not in serialized
+    assert "SECRET-ASSISTANT-TEXT" not in serialized
     assert "/private/sensitive-file.py" not in serialized
 
 

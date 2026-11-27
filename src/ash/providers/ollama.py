@@ -7,7 +7,7 @@ from typing import Any, AsyncGenerator
 
 import httpx
 
-from ash.context.tokens import AnthropicTokenCounter
+from ash.context.tokens import AnthropicTokenCounter, token_count_mode
 from ash.safe_io import strict_json_loads
 from ash.providers.capabilities import ProviderCapabilities
 from ash.providers.base import ProviderABC, StreamChunk, TokenCounterLike
@@ -182,6 +182,12 @@ class OllamaProvider(ProviderABC):
 
     def count_tokens(self, text: str) -> int:
         return self._token_counter.count(text)
+
+    @property
+    def context_count_mode(self) -> str:
+        if getattr(self.count_tokens, "__func__", None) is OllamaProvider.count_tokens:
+            return token_count_mode(self._token_counter)
+        return "unknown"
 
     def configure_max_tokens(self, max_tokens: int) -> None:
         if max_tokens < 1:

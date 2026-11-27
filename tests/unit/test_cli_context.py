@@ -56,8 +56,24 @@ def test_context_diagnostics_join_exact_request_and_keep_rejection_separate() ->
                     "estimate_source": "local",
                     "current": 74_000,
                     "maximum": 80_000,
+                    "combined_limit": 100_000,
+                    "response_limit": 20_000,
+                    "input_limit": 80_000,
+                    "message_estimate_tokens": 73_900,
+                    "serialized_message_tokens": 72_876,
+                    "native_tool_schema_tokens": 100,
                     "estimator_route": "unknown",
                     "estimator_count_mode": "unknown",
+                    "assistant_text_chars": 1_200,
+                    "assistant_tool_call_argument_chars": 400,
+                    "serialized_tool_result_chars": 6_000,
+                    "unattributed_tool_call_arguments": 0,
+                    "non_string_tool_result_messages": 0,
+                    "image_count": 1,
+                    "image_estimate_tokens": 1_024,
+                    "opaque_transport_estimate_enabled": True,
+                    "opaque_transport_estimate_tokens": 0,
+                    "provider_replay_state_preserved": True,
                 },
             ),
             record(
@@ -70,6 +86,7 @@ def test_context_diagnostics_join_exact_request_and_keep_rejection_separate() ->
                     "requested_route": "provider-a/model-a",
                     "effective_route": "unknown",
                     "turn_id": "turn-one",
+                    "requested_completion_limit": 1_200,
                 },
             ),
             record(
@@ -92,6 +109,7 @@ def test_context_diagnostics_join_exact_request_and_keep_rejection_separate() ->
                     "requested_route": "provider-a/model-a",
                     "effective_route": "unknown",
                     "turn_id": "turn-one",
+                    "requested_completion_limit": 1_200,
                 },
             ),
             record(
@@ -184,10 +202,13 @@ def test_context_diagnostics_join_exact_request_and_keep_rejection_separate() ->
     assert diagnostics["assembly"]["context_id"] == rejected_context_id
     assert diagnostics["assembly"]["current"] == 1500
     request = diagnostics["request"]
+    assert request["requested_completion_limit"] == 1200
     assert request["context_id"] == context_id
     assert request["assembly"]["context_id"] == context_id
     assert request["assembly"]["context_id"] != preview_context_id
     assert request["assembly"]["current"] == 74_000
+    assert request["assembly"]["message_estimate_tokens"] == 73_900
+    assert request["assembly"]["native_tool_schema_tokens"] == 100
     assert request["operation_id"] == second_operation_id
     assert request["attempt"] == 2
     assert request["state"] == "completed"
@@ -204,6 +225,19 @@ def test_context_diagnostics_join_exact_request_and_keep_rejection_separate() ->
     assert "route: provider-a/model-a -> provider-b/model-b (parity: mismatch)" in rendered
     assert "cumulative turn budget 7,900/9,000" in rendered
     assert "prompt cache subsets: 400 read, 90 written" in rendered
+    assert (
+        "configured limits: combined=100,000; response=20,000; input=80,000"
+        in rendered
+    )
+    assert (
+        "assistant=1,200 chars; tool-call arguments=400; serialized tool results=6,000"
+        in rendered
+    )
+    assert (
+        "unattributed tool arguments/non-string results: 0/0"
+        in rendered
+    )
+    assert "Ash requested completion limit for this call: 1,200 tokens" in rendered
     assert "secret/profile/token" not in rendered
 
 

@@ -584,12 +584,33 @@ def test_structured_redaction_only_preserves_numeric_usage_token_fields() -> Non
         "repo_map_tokens": 80,
         "memory_tokens": 40,
         "tool_schema_tokens": 700,
+        "message_estimate_tokens": 7900,
+        "image_estimate_tokens": 1024,
+        "serialized_message_tokens": 6_876,
+        "native_tool_schema_tokens": 100,
+        "opaque_transport_estimate_tokens": 6_000,
+        "required_input_tokens": 58_773,
+        "requested_completion_limit": 1200,
     }
     assert redact_value(context_counts) == context_counts
     for field in context_counts:
         assert redact_value({field: "PRIVATE-ACCESS-TOKEN"}) == {
             field: "[REDACTED]"
         }
+    assert redact_value(
+        {
+            "assistant_text_chars": "synthetic context content",
+            "opaque_transport_estimate_enabled": "true",
+            "api_key_tokens": 7,
+        }
+    ) == {
+        "assistant_text_chars": "[REDACTED]",
+        "opaque_transport_estimate_enabled": "[REDACTED]",
+        "api_key_tokens": "[REDACTED]",
+    }
+    assert redact_value(
+        {"input_limit": None, "opaque_transport_estimate_enabled": None}
+    ) == {"input_limit": None, "opaque_transport_estimate_enabled": None}
 
 
 def test_redaction_handles_nested_escaped_and_multiline_assignments() -> None:

@@ -132,9 +132,36 @@ local input estimate and `maximum` is the effective input ceiling. An
 unconfigured message build may report both as null with
 `estimate_source: "unavailable"`.
 The event also includes optional content-free accounting fields:
-`system_tokens`, `tool_schema_tokens`, `history_tokens`,
-`repo_map_tokens`, `memory_tokens`, `history_message_count`,
-`tool_message_count`, and `tool_message_chars`.
+`combined_limit`, `response_limit`, and `input_limit` record the configured
+request ceilings; `message_estimate_tokens` and `native_tool_schema_tokens`
+explain `current`. `serialized_message_tokens` is the local count of cleaned
+JSON messages, including their message envelope. `image_count` and
+`image_estimate_tokens` identify images whose bytes were omitted and charged
+with Ash's fixed image estimate. `opaque_transport_estimate_enabled` and
+`opaque_transport_estimate_tokens` identify the eligible opaque reasoning
+payload estimate when that route-specific heuristic is enabled. The message
+estimate is the sum of those three pieces; native schemas are added for
+`current`. The message estimate includes the serialized JSON message envelope,
+so no separate envelope-token count is implied. Section counts below are
+attribution views and must not be added again to the message estimate. These
+remain Ash estimates, not provider capacity measurements.
+
+The event retains the section fields `system_tokens`, `tool_schema_tokens`,
+`history_tokens`, `repo_map_tokens`, and `memory_tokens`, and adds character
+counts for assistant text, assistant tool-call arguments, and serialized tool
+results. Counts are numeric and content-free. Canonical object arguments are
+measured as local JSON, string arguments as supplied text; unsupported argument
+shapes and non-string result messages are counted separately. These character
+counts are not additive token charges.
+`estimate_source`, `estimator_route`, and `estimator_count_mode` identify the
+local counter provenance; `unknown` means the implementation could not be
+identified safely. Older events may omit these fields.
+
+`model.request.started.requested_completion_limit` records the completion
+limit Ash requested for that call when known. Provider enforcement varies;
+the ChatGPT-plan adapter does not enforce a per-call output cap. This is not
+an estimate of input headroom for a later request. Existing event consumers
+may continue to ignore these optional fields.
 
 `model.request.completed.usage_source` identifies whether its `prompt_tokens`
 are provider-reported or locally estimated. Failed and cancelled requests have
@@ -169,7 +196,14 @@ indicators for protected current-turn content and preserved opaque replay
 state. Cumulative-turn fields are present when relevant. The event says only
 that this attempt was not dispatched; earlier provider calls in the same turn
 may already have completed. It does not change turn stop reasons or admission
-guards.
+guards. For message-compactor rejection, the legacy `required_input_tokens`
+and `input_limit` are message-only. `native_tool_schema_tokens`,
+`required_total_input_tokens`, and `total_input_limit` identify the same
+rejection in total-input units, including native schemas. Optional numeric
+components come from that rejected estimate, not an earlier successful
+request. A required-summary rejection can provide only a conservative
+minimum requirement, without exact message-component attribution. Older
+records and other rejection paths may lack the normalized fields.
 
 The terminal `/context` command reads at most the latest 300 runtime events for
 the selected session. It shows the latest recorded successful request
