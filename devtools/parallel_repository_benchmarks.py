@@ -220,6 +220,7 @@ def run_pair(
                         "correct_source", "visible_test_command_executed",
                         "visible_test_command_passed",
                         "observed_edit_after_passing_test", "completion_verified",
+                        "verification_order_version", "verification_freshness",
                         "host_connector_isolation_verified",
                         "host_connector_invocation_observed", "score_eligible",
                         "shell_command_policy_enforced",
@@ -232,7 +233,12 @@ def run_pair(
             ash_cli_seconds=comparison["ash"]["cli_seconds"],
             codex_cli_seconds=comparison["codex"]["cli_seconds"],
             timing_available=evaluation["matching_cli_timing_available"],
+            same_verification_order_rubric=evaluation["same_verification_order_rubric"],
+            verification_order_evidence_consistent=evaluation["verification_order_evidence_consistent"],
         )
+        result["comparison_caveats"] = list(dict.fromkeys(
+            [*comparison_caveats, *comparison["comparison_caveats"]]
+        ))
     (directory / "summary.json").write_text(
         json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )

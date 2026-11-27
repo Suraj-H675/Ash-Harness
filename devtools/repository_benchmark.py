@@ -44,8 +44,10 @@ from coding_benchmark import (
 )
 from evaluation_files import (
     UNSAFE_ENTRIES,
+    VERIFICATION_ORDER_VERSION,
     content_identity,
     snapshot_workspace_files as snapshot_files,
+    verification_freshness,
 )
 
 
@@ -4582,7 +4584,8 @@ def observed_edit_after_passing_test(
                 and type(call.get("exit_code")) is int and call["exit_code"] == 0):
             after_test = False
         elif (after_test is not None and isinstance(call.get("tool"), str)
-              and call["tool"] in EDIT_TOOL_NAMES):
+              and call["tool"] in EDIT_TOOL_NAMES
+              and not (call["tool"] == "apply_patch" and call.get("dry_run") is True)):
             after_test = True
     return after_test
 
@@ -4623,6 +4626,10 @@ def collect_coding_session_receipts(
             if entry.tool_name == "run_command"
             else "",
             "size_metrics": tool_call_size_metrics(entry),
+            # The actual patch tool accepts a boolean dry-run option. Preserve
+            # just its content-free classification, not patch text or arguments.
+            **({"dry_run": entry.arguments.get("dry_run") is True}
+               if entry.tool_name == "apply_patch" else {}),
         } for entry in session.tool_calls)
         audit_ok = audit_ok and not store.verify_audit_log(session.session_id)
         used = store.get_session_usage(session.session_id)
@@ -4917,8 +4924,15 @@ def run_task(
                 and audit_ok
             ),
         }
+        result["verification_order_version"] = VERIFICATION_ORDER_VERSION
+        result["verification_freshness"] = verification_freshness(
+            result["observed_edit_after_passing_test"],
+        )
         result["completion_verified"] = ash_completion_verified(result)
-        result["passed"] = bool(result["passed"] and result["completion_verified"])
+        result["passed"] = bool(
+            result["passed"] and result["completion_verified"]
+            and result["verification_freshness"] != "observed_stale"
+        )
         (evidence / "result.json").write_text(json.dumps(result, indent=2) + "\n")
     result["scratch_removed"] = True
     result["credential_home_removed"] = True

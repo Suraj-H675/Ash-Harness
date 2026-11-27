@@ -10,6 +10,15 @@ from pathlib import Path
 
 UNSAFE_ENTRIES = frozenset({"SYMLINK", "SPECIAL", "UNREADABLE"})
 
+# Version 1 disqualifies observed stale verification, without claiming that
+# absence of an observed edit proves the final source was tested.
+VERIFICATION_ORDER_VERSION = 1
+
+
+def verification_freshness(observed_late_edit: bool | None) -> str:
+    """Classify only what the trace proves, never infer source-hash freshness."""
+    return "observed_stale" if observed_late_edit is True else "unknown"
+
 
 def content_identity(fingerprint: str | None) -> str | None:
     """Ignore permission bits when proving that required source bytes changed."""

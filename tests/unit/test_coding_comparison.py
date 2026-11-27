@@ -675,3 +675,76 @@ def test_comparison_requires_byte_identical_user_prompts_when_recorded(
     else:
         with pytest.raises(ValueError, match="user prompts do not match"):
             comparison.compare(ash, codex)
+
+
+@pytest.mark.parametrize("case,consistent", [
+    ("both_unknown", True),
+    ("ash_stale_failed", True),
+    ("codex_stale_failed", True),
+    ("ash_stale_pass", False),
+    ("codex_stale_pass", False),
+    ("ash_empty_trace_pass", False),
+    ("ash_forged_freshness", False),
+    ("codex_forged_order", False),
+    ("mixed_version", False),
+    ("boolean_version", False),
+    ("missing_observation", False),
+    ("legacy_stale_pass", True),
+])
+def test_versioned_verification_order_requires_consistent_evidence(tmp_path, case, consistent):
+    ash_dir, codex_dir = _evidence(tmp_path)
+    ash_path, codex_path = ash_dir / "result.json", codex_dir / "grade.json"
+    ash = json.loads(ash_path.read_text())
+    codex = json.loads(codex_path.read_text())
+    test = {"tool": "run_command", "success": True, "executed": True,
+            "exit_code": 0, "command": "python3 -B qa_visible.py"}
+    edit = {"tool": "replace_file_content", "success": True, "executed": True}
+    ash["tool_calls"] = [edit, test]
+    codex.update(visible_test_command_passed=True, passed=True, exit_code=0,
+                 timed_out=False, terminal_events=["turn.completed"])
+    events = [{"type": "item.completed", "item": {
+        "id": "test", "type": "command_execution", "command": test["command"],
+        "status": "completed", "exit_code": 0}}, {"type": "turn.completed"}]
+    for receipt in (ash, codex):
+        receipt.update(verification_order_version=1, verification_freshness="unknown",
+                       observed_edit_after_passing_test=False)
+    if case in ("ash_stale_failed", "ash_stale_pass", "ash_forged_freshness", "legacy_stale_pass"):
+        ash["tool_calls"].append(edit)
+        ash.update(observed_edit_after_passing_test=True, verification_freshness="observed_stale")
+        if case == "ash_stale_failed":
+            ash["passed"] = False
+        if case == "ash_forged_freshness":
+            ash["verification_freshness"] = "verified_fresh"
+    if case in ("codex_stale_failed", "codex_stale_pass", "codex_forged_order"):
+        events.insert(-1, {"type": "item.completed", "item": {"type": "file_change",
+            "status": "completed", "changes": [{"path": "module.py", "kind": "update"}]}})
+        codex.update(observed_edit_after_passing_test=True, verification_freshness="observed_stale")
+        if case == "codex_stale_failed":
+            codex["passed"] = False
+        if case == "codex_forged_order":
+            codex["observed_edit_after_passing_test"] = False
+    if case == "ash_empty_trace_pass":
+        ash.update(tool_calls=[], observed_edit_after_passing_test=None)
+    if case in ("mixed_version", "legacy_stale_pass"):
+        for key in ("verification_order_version", "verification_freshness"):
+            codex.pop(key)
+            if case == "legacy_stale_pass":
+                ash.pop(key)
+    if case == "boolean_version":
+        ash["verification_order_version"] = True
+    if case == "missing_observation":
+        ash.pop("observed_edit_after_passing_test")
+    ash_path.write_text(json.dumps(ash))
+    codex_path.write_text(json.dumps(codex))
+    (codex_dir / "codex.jsonl").write_text("\n".join(map(json.dumps, events)) + "\n")
+    report = comparison.compare(ash_dir, codex_dir)
+    assert report["evaluation"]["verification_order_evidence_consistent"] is consistent
+    assert report["evaluation"]["score_claims_consistent"] is consistent
+    assert report["ash"]["correct_source"] is True
+    assert report["codex"]["correct_source"] is True
+    if case == "legacy_stale_pass":
+        assert report["ash"]["scored_pass"] is True
+        assert report["ash"]["verification_freshness"] == "observed_stale"
+    if case == "both_unknown":
+        assert report["ash"]["verification_freshness"] == "unknown"
+        assert report["codex"]["verification_freshness"] == "unknown"

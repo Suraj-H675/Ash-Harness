@@ -41,6 +41,7 @@ from repository_benchmark import (
     verify_task_runtime,
 )
 from coding_benchmark import _chatgpt_tmpfs_root
+from evaluation_files import VERIFICATION_ORDER_VERSION, verification_freshness
 
 
 MAX_EVENT_BYTES = 32 * 1024 * 1024
@@ -927,8 +928,10 @@ def run_task(
             and events.get("host_connector_invocation_observed") is False
         )
         score_eligible = event_log_valid and host_connector_isolation_verified
+        freshness = verification_freshness(events["observed_edit_after_passing_test"])
         passed = bool(
-            invocation["exit_code"] == 0
+            freshness != "observed_stale"
+            and invocation["exit_code"] == 0
             and not invocation["timed_out"]
             and score_eligible
             and events["terminal_events"] == ["turn.completed"]
@@ -984,6 +987,8 @@ def run_task(
                 invocation.get("no_model_sandbox_probe_verified", False)
             ),
             "passed": passed,
+            "verification_order_version": VERIFICATION_ORDER_VERSION,
+            "verification_freshness": freshness,
             "protected_files_unchanged": protected,
             "required_source_changed": changed,
             "oracles": {

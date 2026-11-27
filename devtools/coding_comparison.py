@@ -15,6 +15,7 @@ from typing import Any
 from codex_repository_benchmark import (
     HOST_APP_FEATURES, HOST_CONNECTOR_CHECK_METHOD, summarize_codex_events,
 )
+from evaluation_files import VERIFICATION_ORDER_VERSION, verification_freshness
 from repository_benchmark import (
     TASKS,
     ash_completion_verified,
@@ -440,8 +441,53 @@ def compare(ash_dir: Path, codex_dir: Path) -> dict[str, Any]:
         and isinstance(ash_calls, list) and all(isinstance(c, dict) for c in ash_calls)
         else None
     )
+    observed_codex_edit = (
+        event_trace.get("observed_edit_after_passing_test")
+        if event_trace_valid and event_trace is not None else None
+    )
+    # Preserve historical grades, but never pool different grading rubrics.
+    # Recompute the order classification rather than trusting a claimed pass.
+    def order_version(receipt: dict[str, Any]) -> int | None:
+        if ("verification_order_version" not in receipt
+                and "verification_freshness" not in receipt):
+            return 0  # legacy rubric
+        version = receipt.get("verification_order_version")
+        return version if type(version) is int and version == VERIFICATION_ORDER_VERSION else None
+
+    ash_order_version = order_version(ash)
+    codex_order_version = order_version(codex)
+    same_order_rubric = ash_order_version is not None and ash_order_version == codex_order_version
+
+    def order_consistent(receipt: dict[str, Any], version: int | None,
+                         observed: bool | None, trace_valid: bool) -> bool:
+        if version == 0:
+            return True
+        return (
+            version == VERIFICATION_ORDER_VERSION and trace_valid
+            and "observed_edit_after_passing_test" in receipt
+            and receipt["observed_edit_after_passing_test"] is observed
+            and receipt.get("verification_freshness") == verification_freshness(observed)
+            and (receipt.get("passed") is not True or observed is False)
+        )
+
+    order_evidence_consistent = (
+        same_order_rubric
+        and order_consistent(ash, ash_order_version, observed_ash_edit,
+                             isinstance(exact_test, str) and bool(exact_test)
+                             and isinstance(ash_calls, list)
+                             and all(isinstance(c, dict) for c in ash_calls))
+        and order_consistent(codex, codex_order_version, observed_codex_edit,
+                             event_trace_valid)
+    )
+    if not same_order_rubric:
+        comparison_caveats.append("Verification-order scoring rubrics differ or are unsupported.")
+    if ash_order_version == codex_order_version == VERIFICATION_ORDER_VERSION:
+        comparison_caveats.append(
+            "Observed stale verification disqualifies a full pass; no observed late edit does not attest tested source hashes."
+        )
     score_claims_consistent = bool(
         completion_consistent
+        and order_evidence_consistent
         and codex_claimed_pass is not None and ash_claimed_pass is not None
         and (
             not codex_claimed_pass
@@ -538,6 +584,8 @@ def compare(ash_dir: Path, codex_dir: Path) -> dict[str, Any]:
             ),
             "completion_verified": completion_verified,
             "observed_edit_after_passing_test": observed_ash_edit,
+            "verification_order_version": ash_order_version,
+            "verification_freshness": verification_freshness(observed_ash_edit),
             "cli_complete": ash.get("exit_code") == 0 and ash.get("timed_out") is False
             and (legacy_completion or completion_verified is True),
             "timed_out": _recorded_bool(ash, "timed_out"),
@@ -558,10 +606,9 @@ def compare(ash_dir: Path, codex_dir: Path) -> dict[str, Any]:
                 if event_trace_valid and event_trace is not None
                 else _recorded_bool(codex, "visible_test_command_passed")
             ),
-            "observed_edit_after_passing_test": (
-                event_trace.get("observed_edit_after_passing_test")
-                if event_trace_valid and event_trace is not None else None
-            ),
+            "observed_edit_after_passing_test": observed_codex_edit,
+            "verification_order_version": codex_order_version,
+            "verification_freshness": verification_freshness(observed_codex_edit),
             "recorded_visible_test_command_executed": _recorded_bool(
                 codex, "visible_test_command_executed"
             ),
@@ -665,6 +712,8 @@ def compare(ash_dir: Path, codex_dir: Path) -> dict[str, Any]:
             ),
             "codex_ephemeral_auth_cleanup": auth_cleanup_verified,
             "score_claims_consistent": score_claims_consistent,
+            "same_verification_order_rubric": same_order_rubric,
+            "verification_order_evidence_consistent": order_evidence_consistent,
             "host_connector_isolation_verified": host_connector_isolation_verified,
             "host_connector_feature_check_verified": feature_check_verified,
         },

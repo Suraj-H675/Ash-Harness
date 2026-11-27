@@ -1410,9 +1410,10 @@ def test_r17_preflight_records_exact_reference_paths_and_provenance(
     (["turn.completed"], "iteration_limit", False),
     (["turn.completed", "turn.completed"], "completed", False),
 ])
+@pytest.mark.parametrize("late_edit", [False, True])
 def test_r17_ash_fake_grade_accepts_one_semantic_source_repair(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-    terminals: list[str], stop_reason: str | None, expected: bool,
+    terminals: list[str], stop_reason: str | None, expected: bool, late_edit: bool,
 ) -> None:
     task_name = "pytest-mixed-indirect-fixture-precedence"
     task = bench.TASKS[task_name]
@@ -1463,6 +1464,8 @@ def test_r17_ash_fake_grade_accepts_one_semantic_source_repair(
         cwd = _kwargs["cwd"]
         assert isinstance(cwd, Path)
         (cwd / "src/_pytest/fixtures.py").write_text("repaired", encoding="utf-8")
+        if late_edit:
+            (cwd / "src/_pytest/fixtures.py").write_text("repaired again", encoding="utf-8")
         return FakeChild()
 
     tool_calls = [
@@ -1479,6 +1482,9 @@ def test_r17_ash_fake_grade_accepts_one_semantic_source_repair(
             "exit_code": 0,
         },
     ]
+
+    if late_edit:
+        tool_calls.append(dict(tool_calls[0]))
 
     setup_commands: list[list[str]] = []
     monkeypatch.setattr(bench, "preflight", preflight)
@@ -1532,7 +1538,10 @@ def test_r17_ash_fake_grade_accepts_one_semantic_source_repair(
         context_tokens=32768,
         turn_token_budget=0,
     )
-    assert result["passed"] is expected, result
+    assert result["passed"] is (expected and not late_edit), result
+    assert result["observed_edit_after_passing_test"] is late_edit
+    assert result["verification_order_version"] == 1
+    assert result["verification_freshness"] == ("observed_stale" if late_edit else "unknown")
     assert result["protected_files_unchanged"] is True
     assert result["required_sources_changed"] is True
     assert result["required_tools_succeeded"] is True
@@ -2146,6 +2155,12 @@ def test_observed_edit_after_passing_test_uses_last_successful_exact_command() -
     assert bench.observed_edit_after_passing_test([edit, passing, edit], command) is True
     assert bench.observed_edit_after_passing_test([edit, passing, edit, passing], command) is False
     assert bench.observed_edit_after_passing_test([
+        passing, {**edit, "tool": "apply_patch", "dry_run": True},
+    ], command) is False
+    assert bench.observed_edit_after_passing_test([
+        passing, {**edit, "tool": "apply_patch", "dry_run": False},
+    ], command) is True
+    assert bench.observed_edit_after_passing_test([
         passing, edit, {**passing, "exit_code": 1, "success": False},
         {**passing, "command": "other command"}, {**passing, "exit_code": False},
     ], command) is True
@@ -2185,3 +2200,27 @@ def test_completion_receipt_reads_durable_terminal_evidence(tmp_path, event, rea
         "requested_context_continuations": int(tool_free),
         "context_continuations": data["context_continuations"], "session_count": data["session_count"],
     }) is expected
+
+
+def test_patch_dry_run_receipt_preserves_nonmutation_without_patch_text(tmp_path):
+    from ash.core.session import SessionStore
+
+    store = SessionStore(tmp_path / "session.db")
+    session = store.create_session(str(tmp_path))
+    store.start_turn(session.session_id, "original", "repair")
+    command = "python3 -B qa_visible.py"
+    for i, (tool, arguments, exit_code) in enumerate([
+        ("run_command", {"command_line": command}, 0),
+        ("apply_patch", {"patch": "PRIVATE_PATCH_BYTES", "dry_run": True}, None),
+        ("apply_patch", {"patch": "PRIVATE_PATCH_BYTES", "dry_run": False}, None),
+    ]):
+        store.save_tool_call(session.session_id, ToolCallRecord(
+            call_id=str(i), tool_name=tool, arguments=arguments, approved=True,
+            dispatched=True, executed=True, success=True, exit_code=exit_code,
+            result="ok", timestamp=datetime.now(timezone.utc),
+        ), turn_id="original")
+    calls = bench.collect_coding_session_receipts(store, tmp_path)["calls"]
+    assert calls[1]["dry_run"] is True and calls[2]["dry_run"] is False
+    assert "PRIVATE_PATCH_BYTES" not in repr(calls)
+    assert bench.observed_edit_after_passing_test(calls[:2], command) is False
+    assert bench.observed_edit_after_passing_test(calls, command) is True

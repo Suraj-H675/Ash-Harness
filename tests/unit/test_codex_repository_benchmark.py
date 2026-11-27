@@ -956,8 +956,9 @@ def test_codex_scoring_accepts_new_editable_source_modules(
     assert result["visible_test_command_executed"] is True
 
 
+@pytest.mark.parametrize("late_edit", [False, True])
 def test_r17_codex_fake_grade_accepts_one_semantic_source_repair(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, late_edit: bool
 ) -> None:
     task_name = "pytest-mixed-indirect-fixture-precedence"
     task = runner.TASKS[task_name]
@@ -1012,6 +1013,12 @@ def test_r17_codex_fake_grade_accepts_one_semantic_source_repair(
             },
             {"type": "turn.completed", "usage": {"input_tokens": 40}},
         ]
+        if late_edit:
+            (workspace / "src/_pytest/fixtures.py").write_text("repaired again", encoding="utf-8")
+            events.insert(-1, {"type": "item.completed", "item": {
+                "type": "file_change", "status": "completed",
+                "changes": [{"path": "src/_pytest/fixtures.py", "kind": "update"}],
+            }})
         (evidence / "codex.jsonl").write_text(
             "".join(json.dumps(item) + "\n" for item in events),
             encoding="utf-8",
@@ -1054,7 +1061,11 @@ def test_r17_codex_fake_grade_accepts_one_semantic_source_repair(
         timeout=30,
         authorize_model_trial=True,  # mock executor only; no model call
     )
-    assert result["passed"] is True
+    assert result["passed"] is (not late_edit)
+    assert result["observed_edit_after_passing_test"] is late_edit
+    assert result["verification_order_version"] == 1
+    assert result["verification_freshness"] == ("observed_stale" if late_edit else "unknown")
+    assert result["oracles"]["correct"] is True
     assert result["required_source_changed"] is True
     assert result["visible_test_command_executed"] is True
     assert result["shell_command_policy_enforced"] is False
