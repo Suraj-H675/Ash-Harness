@@ -3686,6 +3686,131 @@ print("HIDDEN PASS")
         require_each_editable_ablation_red=True,
         offline_only=True,
     ),
+    "platformdirs-root-site-iteration": RepositoryTask(
+        source="tox-dev/platformdirs",
+        upstream="https://github.com/tox-dev/platformdirs.git",
+        base_sha="e3cf124b8d399e76a4392573ef1d8d08041be900",
+        reference_fix_sha="3ce0f50532b5c1be1e0fa1c57f39c4e8c404852d",
+        editable=frozenset({"src/platformdirs/unix.py"}),
+        visible_script="qa_visible.py",
+        visible_source=r"""import os
+import sys
+from unittest.mock import patch
+sys.path.insert(0, "src")
+from platformdirs.unix import Unix
+
+env = {
+    "XDG_CONFIG_HOME": "/home/example/config",
+    "XDG_DATA_HOME": "/home/example/data",
+    "XDG_CONFIG_DIRS": "/site/config1:/site/config2",
+    "XDG_DATA_DIRS": "/site/data1:/site/data2",
+}
+with patch.dict(os.environ, env, clear=True):
+    with patch("platformdirs.unix.getuid", return_value=0):
+        dirs = Unix("demo", version="v1", use_site_for_root=True)
+        assert list(dirs.iter_config_dirs()) == [
+            "/site/config1/demo/v1", "/site/config2/demo/v1",
+        ]
+        assert list(dirs.iter_data_dirs()) == [
+            "/site/data1/demo/v1", "/site/data2/demo/v1",
+        ]
+    with patch("platformdirs.unix.getuid", return_value=1000):
+        dirs = Unix("demo", version="v1", use_site_for_root=True)
+        assert list(dirs.iter_config_dirs()) == [
+            "/home/example/config/demo/v1", "/site/config1/demo/v1",
+            "/site/config2/demo/v1",
+        ]
+        assert list(dirs.iter_data_dirs()) == [
+            "/home/example/data/demo/v1", "/site/data1/demo/v1",
+            "/site/data2/demo/v1",
+        ]
+""",
+        hidden_source=r"""import os
+import sys
+from pathlib import Path
+from unittest.mock import patch
+sys.path.insert(0, "src")
+from platformdirs.unix import Unix
+
+# Keep existing explicit duplicates and ordering. Only remove the synthetic
+# user alias when the root redirect is active.
+env = {
+    "XDG_CONFIG_HOME": "/etc/a",
+    "XDG_DATA_HOME": "/data/a",
+    "XDG_CONFIG_DIRS": "/etc/a:/etc/b:/etc/a",
+    "XDG_DATA_DIRS": "/data/a:/data/b:/data/a",
+}
+for uid, enabled in ((0, False), (1000, True), (1000, False), (0, True)):
+    for multi in (False, True):
+        with patch.dict(os.environ, env, clear=True), patch(
+            "platformdirs.unix.getuid", return_value=uid,
+        ):
+            dirs = Unix("widget", version="2", multipath=multi, use_site_for_root=enabled)
+            for kind, home, site in (
+                ("config", "/etc/a", ["/etc/a", "/etc/b", "/etc/a"]),
+                ("data", "/data/a", ["/data/a", "/data/b", "/data/a"]),
+            ):
+                suffix = "/widget/2"
+                expected_site = [path + suffix for path in site]
+                redirected = uid == 0 and enabled
+                expected = expected_site if redirected else [home + suffix] + expected_site
+                assert list(getattr(dirs, f"iter_{kind}_dirs")()) == expected
+                assert list(getattr(dirs, f"iter_{kind}_paths")()) == list(map(Path, expected))
+                site_value = os.pathsep.join(expected_site) if multi else expected_site[0]
+                assert getattr(dirs, f"site_{kind}_dir") == site_value
+                assert getattr(dirs, f"user_{kind}_dir") == (
+                    site_value if redirected else home + suffix
+                )
+
+# Default XDG values and unnamed applications remain supported.
+for uid, enabled in ((0, True), (0, False), (42, True)):
+    with patch.dict(os.environ, {"HOME": "/home/fixture"}, clear=True), patch(
+        "platformdirs.unix.getuid", return_value=uid,
+    ):
+        dirs = Unix(use_site_for_root=enabled, multipath=True)
+        redirected = uid == 0 and enabled
+        assert list(dirs.iter_config_dirs()) == (
+            [] if redirected else ["/home/fixture/.config"]
+        ) + ["/etc/xdg"]
+        assert list(dirs.iter_data_dirs()) == (
+            [] if redirected else ["/home/fixture/.local/share"]
+        ) + ["/usr/local/share", "/usr/share"]
+""",
+        command_grant="python3 -B qa_visible.py",
+        prompt=(
+            "Fix a historical Unix directory-iteration bug in platformdirs. "
+            "When use_site_for_root is enabled and the process is root, "
+            "the configuration and data iterators include an extra entry "
+            "representing the redirected user directory. Yield the site "
+            "directories in their original order without that synthetic "
+            "entry, including with multipath enabled. Preserve existing "
+            "non-root and disabled-option behavior, explicit repeated XDG "
+            "entries, path iterators, public properties, app/version "
+            "suffixes, and default directories. Inspect qa_visible.py and "
+            "the relevant source; edit only src/platformdirs/unix.py. "
+            "Run exactly python3 -B qa_visible.py after your final edit. "
+            "Do not modify tests, generated metadata or other files. "
+            "Read-only source inspection commands are allowed. Do not run "
+            "other tests or shell commands that modify files."
+        ),
+        runtime=PythonSourceRuntime(
+            packages=(),
+            generated_files=((
+                "src/platformdirs/version.py",
+                b'"""Disposable offline fixture metadata; not a release version."""\n'
+                b'__version__ = "0.0.0.dev0"\n'
+                b'__version_tuple__ = (0, 0, 0, "dev0")\n',
+            ),),
+            trusted_overlay_sha256="e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        ),
+        upstream_pr="https://github.com/tox-dev/platformdirs/pull/469",
+        license="MIT",
+        expected_reference_paths=frozenset({
+            "src/platformdirs/unix.py", "tests/test_unix.py",
+        }),
+        require_both_oracles_red_green=True,
+        require_each_editable_ablation_red=True,
+    ),
 }
 
 
@@ -4127,6 +4252,8 @@ def _collect_source_runtime(
         "source": (
             "active Ash virtualenv; uv.lock and installed RECORD checked; "
             "source bytes matched chief-observed fingerprints, not PyPI wheel hashes"
+            if runtime.packages
+            else "deterministic generated metadata only; no third-party packages copied"
         ),
         "oracle_interpreter": (
             "Linux /usr/bin/python3, Python 3.10 or newer, shared by task and grader"
@@ -4192,7 +4319,7 @@ def _assert_generated_file_ignored(root: Path, relative_name: str) -> None:
         timeout=5,
     )
     if result.returncode != 0:
-        raise RuntimeError("generated pytest version metadata is not Git-ignored")
+        raise RuntimeError("generated runtime metadata is not Git-ignored")
 
 
 def materialize_task_runtime(
@@ -4210,6 +4337,9 @@ def materialize_task_runtime(
         destination = root / name
         if destination.exists() or destination.is_symlink():
             raise RuntimeError("generated runtime metadata path already exists")
+    # Metadata-only source checkouts have no third-party dependency files.
+    # Still create the same verified, empty overlay directory.
+    _ensure_directory(root, Path(".benchmark_runtime/site"))
     for name, content in sorted(files.items()):
         _write_new_file(root, f".benchmark_runtime/site/{name}", content)
     for name, content in sorted(generated.items()):

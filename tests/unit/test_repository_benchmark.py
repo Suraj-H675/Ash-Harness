@@ -1233,6 +1233,54 @@ def test_pytest_mro_runtime_reuses_locked_overlay_with_pinned_generated_version(
         bench.verify_task_runtime(tree, task.runtime, baseline_receipt)
 
 
+def test_platformdirs_generated_only_runtime_is_deterministic_and_protected(
+    tmp_path: Path,
+) -> None:
+    task = bench.TASKS["platformdirs-root-site-iteration"]
+    assert task.base_sha == "e3cf124b8d399e76a4392573ef1d8d08041be900"
+    assert task.reference_fix_sha == "3ce0f50532b5c1be1e0fa1c57f39c4e8c404852d"
+    assert task.editable == frozenset({"src/platformdirs/unix.py"})
+    assert task.require_both_oracles_red_green
+    assert task.require_each_editable_ablation_red
+    assert task.runtime is not None and not task.runtime.packages
+    assert hashlib.sha256(task.visible_source.encode()).hexdigest() == (
+        "3d353cb1153bba00d605dd469737a512e0fafc8ebb23d683fbf3c26751803030"
+    )
+    assert bench.hidden_oracle_sha256(task) == (
+        "159cf5289648f2acc336a733ca52cf8891bd43b94283f267ce9d1876abc24d78"
+    )
+    path = "src/platformdirs/version.py"
+    receipts = []
+    for name in ("baseline", "reference"):
+        root = tmp_path / name
+        root.mkdir()
+        subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+        (root / ".gitignore").write_text("/" + path + "\n")
+        receipt = bench.materialize_task_runtime(root, task.runtime)
+        receipts.append(receipt)
+        assert receipt["overlay_file_count"] == 0
+        assert receipt["dependencies"] == {}
+        assert receipt["source"] == (
+            "deterministic generated metadata only; no third-party packages copied"
+        )
+        assert list((root / ".benchmark_runtime/site").iterdir()) == []
+        assert receipt["generated_files"] == {
+            path: "a80724d97d660cce35f412ca168e11d5b38199d41e0f9f96fc26725def869c40"
+        }
+        bench.verify_task_runtime(root, task.runtime, receipt)
+        with pytest.raises(RuntimeError, match="already exists"):
+            bench.materialize_task_runtime(root, task.runtime)
+    assert receipts[0] == receipts[1]
+    root = tmp_path / "baseline"
+    (root / ".benchmark_runtime/site/unexpected.py").write_text("unexpected")
+    with pytest.raises(RuntimeError, match="unexpected file set"):
+        bench.verify_task_runtime(root, task.runtime, receipts[0])
+    (root / ".benchmark_runtime/site/unexpected.py").unlink()
+    (root / path).write_text("tampered")
+    with pytest.raises(RuntimeError, match="bytes differ"):
+        bench.verify_task_runtime(root, task.runtime, receipts[0])
+
+
 def test_r17_runtime_refuses_package_symlinks_and_special_files(
     tmp_path: Path,
 ) -> None:
