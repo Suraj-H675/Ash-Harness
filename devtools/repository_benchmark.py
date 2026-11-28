@@ -1848,6 +1848,16 @@ class RuntimePackage:
     package: str
     version: str
     trusted_source_sha256: str
+    additional_roots: tuple[str, ...] = ()
+
+    def source_roots(self) -> tuple[str, ...]:
+        roots = (self.package, *self.additional_roots)
+        if len(set(roots)) != len(roots) or any(
+            re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*(?:\.py)?", root) is None
+            for root in roots
+        ):
+            raise RuntimeError("runtime import roots must be distinct top-level names")
+        return roots
 
 
 @dataclass(frozen=True)
@@ -3811,6 +3821,153 @@ for uid, enabled in ((0, True), (0, False), (42, True)):
         require_both_oracles_red_green=True,
         require_each_editable_ablation_red=True,
     ),
+    "cattrs-annotated-field-overrides": RepositoryTask(
+        source="python-attrs/cattrs",
+        upstream="https://github.com/python-attrs/cattrs.git",
+        base_sha="309e9d1413cfb0947b8ba4e704dd5dcd2652ae27",
+        reference_fix_sha="6bc4708fb9b2ac52d9a18997e923da6a58916102",
+        editable=frozenset({
+            "src/cattrs/cols.py", "src/cattrs/gen/__init__.py",
+            "src/cattrs/gen/_shared.py", "src/cattrs/gen/typeddicts.py",
+        }),
+        visible_script="qa_visible.py",
+        visible_source=r"""import sys
+sys.path[:0] = ["src", ".benchmark_runtime/site"]
+from typing import Annotated, TypedDict
+from dataclasses import dataclass
+from attrs import define
+from cattrs import Converter, override
+@define
+class Item:
+    code: Annotated[int, override(rename="itemCode")]
+@dataclass
+class Packet:
+    item: Item
+    count: Annotated[int, override(rename="qty")]
+class Record(TypedDict):
+    packet: Annotated[Packet, override(rename="payload")]
+c = Converter()
+value = {"packet": Packet(Item(17), 3)}
+wire = {"payload": {"item": {"itemCode": 17}, "qty": 3}}
+assert c.unstructure(value, unstructure_as=Record) == wire
+assert c.structure(wire, Record) == value
+print("PASS nested annotated roundtrip")
+""",
+        hidden_source=r"""import sys
+sys.path[:0] = ["src", ".benchmark_runtime/site"]
+from typing import Annotated, TypedDict, NamedTuple, NotRequired
+from dataclasses import dataclass
+from attrs import define
+from cattrs import Converter, override
+from cattrs.cols import namedtuple_dict_structure_factory, namedtuple_dict_unstructure_factory
+from cattrs.gen import make_dict_structure_fn, make_dict_unstructure_fn
+from cattrs.errors import ClassValidationError
+import traceback
+def check_attrs():
+    @define
+    class A:
+        x: Annotated[int, "unrelated", override(rename="X")]
+        y: Annotated[int, override(omit_if_default=True)] = 5
+    c=Converter()
+    assert c.unstructure(A(2)) == {"X":2}
+    assert c.structure({"X":"2"}, A) == A(2)
+    assert c.unstructure(A(2,6)) == {"X":2,"y":6}
+    c.register_unstructure_hook(A,make_dict_unstructure_fn(A,c,x=override(rename="explicit")))
+    c.register_structure_hook(A,make_dict_structure_fn(A,c,x=override(rename="explicit")))
+    assert c.unstructure(A(4)) == {"explicit":4}
+    assert c.structure({"explicit":4}, A) == A(4)
+def check_dataclass():
+    @dataclass
+    class A:
+        x: Annotated[int, override(struct_hook=lambda v,_: int(v)+1, unstruct_hook=lambda v:v-1)]
+        keep: Annotated[str, "metadata"]="a"
+    c=Converter()
+    assert c.structure({"x":"3"},A)==A(4)
+    assert c.unstructure(A(4))=={"x":3,"keep":"a"}
+def check_typed():
+    class T(TypedDict):
+        x: Annotated[int, override(rename="X")]
+        y: NotRequired[Annotated[int, override(rename="Y")]]
+    c=Converter()
+    assert c.structure({"X":"3"},T)=={"x":3}
+    assert c.unstructure({"x":3,"y":4},unstructure_as=T)=={"X":3,"Y":4}
+    assert c.structure({"X":3,"Y":"4"},T)=={"x":3,"y":4}
+def check_named():
+    class N(NamedTuple):
+        code: Annotated[int, override(rename="key")]
+        n: int=3
+    c=Converter()
+    c.register_structure_hook(N,namedtuple_dict_structure_factory(N,c))
+    c.register_unstructure_hook(N,namedtuple_dict_unstructure_factory(N,c))
+    assert c.structure({"key":"7"},N)==N(7)
+    assert c.unstructure(N(7))=={"key":7,"n":3}
+    assert Converter().unstructure(N(7))==(7,3)
+def check_legacy():
+    @define
+    class A:
+        x: Annotated[int, "irrelevant"]
+        y: int=9
+    c=Converter(forbid_extra_keys=True)
+    assert c.structure({"x":"3"},A)==A(3)
+    assert c.unstructure(A(3))=={"x":3,"y":9}
+    try: c.structure({"x":3,"bad":4},A)
+    except ClassValidationError: pass
+    else: raise AssertionError("unknown keys accepted")
+fail=0
+for f in (check_attrs,check_dataclass,check_typed,check_named,check_legacy):
+    try: f();print(f.__name__,"PASS")
+    except Exception as e: fail+=1; print(f.__name__,"FAIL",type(e).__name__,str(e))
+raise SystemExit(bool(fail))
+""",
+        command_grant="python3 -B qa_visible.py",
+        prompt=(
+            "Implement field-level serialization customization using "
+            "typing.Annotated[T, cattrs.override(...)]. The default Converter "
+            "must honor field overrides for attrs classes, dataclasses and "
+            "TypedDicts, and dictionary NamedTuple hook factories must honor "
+            "them when used. Support structuring and unstructuring, renamed "
+            "keys, default omission and custom hooks; explicit hook-factory "
+            "overrides take precedence over annotation overrides. Ordinary "
+            "annotations, unrelated metadata, defaults, validation and standard "
+            "NamedTuple tuple behavior must remain compatible. Nested models "
+            "must compose correctly. Inspect qa_visible.py and relevant source. "
+            "You may edit only src/cattrs/cols.py, src/cattrs/gen/__init__.py, "
+            "src/cattrs/gen/_shared.py and src/cattrs/gen/typeddicts.py. "
+            "Do not modify tests or runtime files. Run exactly "
+            "python3 -B qa_visible.py after your final edit. Read-only source "
+            "inspection commands are allowed. Do not run other tests or shell "
+            "commands that modify files."
+        ),
+        runtime=PythonSourceRuntime(
+            packages=(
+                RuntimePackage(
+                    "attrs", "attr", "26.1.0",
+                    "9b0022b8a356040f04f8bc6617395cd797cbacf487387f92a19bafc17f0ce2df",
+                    additional_roots=("attrs",),
+                ),
+                RuntimePackage(
+                    "typing-extensions", "typing_extensions.py", "4.16.0",
+                    "39d26a2d6362d136969eae61763486141ae47fab0034ccf1d4cf0bf55975cf76",
+                ),
+            ),
+            generated_files=(),
+            trusted_overlay_sha256=(
+                "109f5e81322359955a6f0052f5b350482efc17ec289f922e865fcc58151e91fc"
+            ),
+        ),
+        upstream_pr="https://github.com/python-attrs/cattrs/pull/717",
+        license="MIT",
+        expected_reference_paths=frozenset({
+            "HISTORY.md", "docs/customizing.md", "docs/defaulthooks.md",
+            "src/cattrs/cols.py", "src/cattrs/gen/__init__.py",
+            "src/cattrs/gen/_shared.py", "src/cattrs/gen/typeddicts.py",
+            "tests/test_annotated_overrides.py",
+        }),
+        require_both_oracles_red_green=True,
+        require_each_editable_ablation_red=True,
+        require_all_editable_changed=False,
+        offline_only=True,
+    ),
 }
 
 
@@ -3963,6 +4120,11 @@ def _real_directory(path: Path) -> None:
         raise RuntimeError(f"runtime path is not a plain directory: {path.name}")
 
 
+def _distribution_key(name: str) -> str:
+    # Python distribution names normalize hyphens, underscores and dots.
+    return re.sub(r"[-_.]+", "-", name).lower()
+
+
 def _locked_runtime_versions(
     runtime: PythonSourceRuntime,
 ) -> tuple[
@@ -4007,11 +4169,14 @@ def _locked_runtime_versions(
 
     package_metadata: dict[str, tuple[RuntimePackage, dict[str, tuple[str, str]]]] = {}
     for package in runtime.packages:
+        roots = package.source_roots()
+        if _distribution_key(package.distribution) in package_metadata:
+            raise RuntimeError("duplicate runtime distribution")
         matching = [
             item
             for item in lock_packages
             if isinstance(item, dict)
-            and str(item.get("name", "")).casefold() == package.distribution.casefold()
+            and _distribution_key(str(item.get("name", ""))) == _distribution_key(package.distribution)
         ]
         if len(matching) != 1 or matching[0].get("version") != package.version:
             raise RuntimeError(
@@ -4052,7 +4217,7 @@ def _locked_runtime_versions(
             if separator:
                 headers.setdefault(key.strip().casefold(), value.strip())
         if (
-            headers.get("name", "").casefold() != package.distribution.casefold()
+            _distribution_key(headers.get("name", "")) != _distribution_key(package.distribution)
             or headers.get("version") != package.version
         ):
             raise RuntimeError(
@@ -4068,11 +4233,13 @@ def _locked_runtime_versions(
                 if len(row) != 3:
                     raise ValueError("invalid RECORD row")
                 relative = Path(row[0])
-                if relative.parts and relative.parts[0] == package.package:
+                if relative.parts and relative.parts[0] in roots:
                     if relative.is_absolute() or ".." in relative.parts:
                         raise ValueError("unsafe package RECORD path")
-                    if relative.suffix not in {".py", ".typed"}:
+                    if relative.suffix not in {".py", ".pyi", ".typed"}:
                         raise ValueError("non-source package entry")
+                    if relative.as_posix() in recorded:
+                        raise ValueError("duplicate package RECORD path")
                     recorded[relative.as_posix()] = (row[1], row[2])
         except (csv.Error, ValueError) as error:
             raise RuntimeError(
@@ -4082,7 +4249,7 @@ def _locked_runtime_versions(
             raise RuntimeError(
                 f"runtime package has no source RECORD: {package.distribution}"
             )
-        package_metadata[package.distribution.casefold()] = (package, recorded)
+        package_metadata[_distribution_key(package.distribution)] = (package, recorded)
     return lock_bytes, purelib, package_metadata
 
 
@@ -4119,27 +4286,32 @@ def _package_source_files(
     package: RuntimePackage,
     recorded: dict[str, tuple[str, str]],
 ) -> dict[str, bytes]:
-    source_root = purelib / package.package
-    try:
-        root_mode = source_root.lstat().st_mode
-    except OSError as error:
-        raise RuntimeError(
-            f"runtime source package is missing: {package.distribution}"
-        ) from error
-    if stat.S_ISLNK(root_mode) or not stat.S_ISDIR(root_mode):
-        raise RuntimeError(
-            f"runtime source package path is unsafe: {package.distribution}"
-        )
-    if source_root.resolve(strict=True) != source_root:
-        raise RuntimeError(
-            f"runtime source package resolves unexpectedly: {package.distribution}"
-        )
-
     found: dict[str, bytes] = {}
     total_bytes = 0
 
-    def visit(directory: Path, relative: Path, *, copy_source: bool = True) -> None:
+    def add_file(path: Path, relative: Path) -> None:
         nonlocal total_bytes
+        if path.suffix not in {".py", ".pyi", ".typed"}:
+            raise RuntimeError("runtime package contains a non-source file")
+        relative_name = relative.as_posix()
+        if relative_name not in recorded:
+            raise RuntimeError("runtime source entry is not covered by package RECORD")
+        hash_record, size_record = recorded[relative_name]
+        if not hash_record.startswith("sha256=") or not size_record.isdecimal():
+            raise RuntimeError("runtime package source lacks a bounded SHA-256 RECORD")
+        # A RECORD match alone is insufficient, including for uv cache hardlinks.
+        data = _read_regular_source(path, relative_name)
+        digest = base64.urlsafe_b64encode(hashlib.sha256(data).digest())
+        if digest.rstrip(b"=").decode("ascii") != hash_record.partition("=")[2] or len(
+            data
+        ) != int(size_record):
+            raise RuntimeError("runtime package source does not match package RECORD")
+        found[relative_name] = data
+        total_bytes += len(data)
+        if len(found) > _RUNTIME_MAX_FILES or total_bytes > _RUNTIME_MAX_BYTES:
+            raise RuntimeError("runtime package source exceeds bounded overlay limits")
+
+    def visit(directory: Path, relative: Path, *, copy_source: bool = True) -> None:
         for entry in sorted(os.scandir(directory), key=lambda item: item.name):
             path = Path(entry.path)
             child_relative = relative / entry.name
@@ -4160,42 +4332,33 @@ def _package_source_files(
                 continue
             if not stat.S_ISREG(mode):
                 raise RuntimeError("runtime package contains a special file")
-            if entry.name.endswith(".pyc") or "__pycache__" in child_relative.parts:
+            if entry.name.endswith(".pyc") or not copy_source:
                 continue
-            if not copy_source:
-                continue
-            if path.suffix not in {".py", ".typed"}:
-                raise RuntimeError("runtime package contains a non-source file")
-            relative_name = (Path(package.package) / child_relative).as_posix()
-            if relative_name not in recorded:
-                raise RuntimeError(
-                    "runtime source entry is not covered by package RECORD"
-                )
-            hash_record, size_record = recorded[relative_name]
-            if not hash_record.startswith("sha256=") or not size_record.isdecimal():
-                raise RuntimeError(
-                    "runtime package source lacks a bounded SHA-256 RECORD"
-                )
-            # uv can legitimately hardlink wheel files to its cache. Never
-            # publish bytes from the active venv unless the complete package
-            # matches its separately frozen source fingerprint below.
-            data = _read_regular_source(path, relative_name)
-            digest = base64.urlsafe_b64encode(hashlib.sha256(data).digest())
-            digest_text = digest.rstrip(b"=").decode("ascii")
-            if digest_text != hash_record.partition("=")[2] or len(data) != int(
-                size_record
-            ):
-                raise RuntimeError(
-                    "runtime package source does not match package RECORD"
-                )
-            found[relative_name] = data
-            total_bytes += len(data)
-            if len(found) > _RUNTIME_MAX_FILES or total_bytes > _RUNTIME_MAX_BYTES:
-                raise RuntimeError(
-                    "runtime package source exceeds bounded overlay limits"
-                )
+            add_file(path, child_relative)
 
-    visit(source_root, Path())
+    for root in package.source_roots():
+        source_root = purelib / root
+        try:
+            root_mode = source_root.lstat().st_mode
+        except OSError as error:
+            raise RuntimeError(
+                f"runtime source package is missing: {package.distribution}"
+            ) from error
+        standalone = root.endswith(".py")
+        if stat.S_ISLNK(root_mode) or not (
+            stat.S_ISREG(root_mode) if standalone else stat.S_ISDIR(root_mode)
+        ):
+            raise RuntimeError(
+                f"runtime source package path is unsafe: {package.distribution}"
+            )
+        if source_root.resolve(strict=True) != source_root:
+            raise RuntimeError(
+                f"runtime source package resolves unexpectedly: {package.distribution}"
+            )
+        if standalone:
+            add_file(source_root, Path(root))
+        else:
+            visit(source_root, Path(root))
     if set(found) != set(recorded):
         raise RuntimeError(
             f"runtime package source inventory mismatch: {package.distribution}"
@@ -4223,7 +4386,7 @@ def _collect_source_runtime(
     files: dict[str, bytes] = {}
     package_receipt: dict[str, dict[str, object]] = {}
     for package in runtime.packages:
-        metadata = package_metadata.get(package.distribution.casefold())
+        metadata = package_metadata.get(_distribution_key(package.distribution))
         if metadata is None or metadata[0] != package:
             raise RuntimeError("trusted runtime package metadata was not resolved")
         source_files = _package_source_files(purelib, package, metadata[1])

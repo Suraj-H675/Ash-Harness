@@ -1281,6 +1281,66 @@ def test_platformdirs_generated_only_runtime_is_deterministic_and_protected(
         bench.verify_task_runtime(root, task.runtime, receipts[0])
 
 
+def test_cattrs_runtime_preserves_frozen_distribution_source_and_scope(tmp_path: Path) -> None:
+    task = bench.TASKS["cattrs-annotated-field-overrides"]
+    assert task.offline_only
+    assert task.require_both_oracles_red_green and task.require_each_editable_ablation_red
+    assert not task.require_all_editable_changed
+    assert task.runtime is not None
+    assert task.command_grant == "python3 -B qa_visible.py"
+    assert len(task.editable) == 4
+    assert bench.task_evidence_classification(task) == "offline-qualified-only-not-score-eligible"
+    root = tmp_path / "source"
+    root.mkdir()
+    receipt = bench.materialize_task_runtime(root, task.runtime)
+    assert receipt["overlay_file_count"] == 32
+    assert receipt["overlay_sha256"] == task.runtime.trusted_overlay_sha256
+    assert receipt["dependencies"]["attrs"]["source_files"] == 31
+    assert receipt["dependencies"]["typing-extensions"]["source_files"] == 1
+    site = root / ".benchmark_runtime/site"
+    assert (site / "attr/__init__.py").is_file()
+    assert (site / "attrs/__init__.py").is_file()
+    assert (site / "typing_extensions.py").is_file()
+    assert any(site.rglob("*.pyi"))
+    bench.verify_task_runtime(root, task.runtime, receipt)
+    (site / "typing_extensions.py").write_bytes(b"# tampered")
+    with pytest.raises(RuntimeError, match="bytes differ"):
+        bench.verify_task_runtime(root, task.runtime, receipt)
+
+
+@pytest.mark.parametrize("root", ["../outside", "/absolute", "a/b", "a.so", ""])
+def test_runtime_import_roots_reject_non_source_names(root: str) -> None:
+    package = bench.RuntimePackage("fixture", "valid", "1", "0" * 64, (root,))
+    with pytest.raises(RuntimeError, match="top-level names"):
+        package.source_roots()
+
+
+def test_runtime_multiple_roots_and_standalone_source_fail_closed(tmp_path: Path) -> None:
+    files = {"a/__init__.py": b"pass\n", "b/__init__.pyi": b"pass\n", "c.py": b"pass\n"}
+    for name, data in files.items():
+        path = tmp_path / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+    recorded = {
+        name: (
+            "sha256=" + base64.urlsafe_b64encode(hashlib.sha256(data).digest()).rstrip(b"=").decode("ascii"),
+            str(len(data)),
+        )
+        for name, data in files.items()
+    }
+    package = bench.RuntimePackage("fixture", "a", "1", bench._hash_file_map(files), ("b", "c.py"))
+    assert bench._package_source_files(tmp_path, package, recorded) == files
+    with pytest.raises(RuntimeError, match="distinct top-level"):
+        replace(package, additional_roots=("a",)).source_roots()
+    with pytest.raises(RuntimeError, match="RECORD"):
+        bench._package_source_files(tmp_path, package, {k: v for k, v in recorded.items() if k != "c.py"})
+    module = tmp_path / "c.py"
+    module.unlink()
+    module.symlink_to(tmp_path / "a/__init__.py")
+    with pytest.raises(RuntimeError, match="path is unsafe"):
+        bench._package_source_files(tmp_path, package, recorded)
+
+
 def test_r17_runtime_refuses_package_symlinks_and_special_files(
     tmp_path: Path,
 ) -> None:
