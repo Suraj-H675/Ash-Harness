@@ -467,6 +467,8 @@ _OBSERVER_EVENT_FIELDS: dict[str, frozenset[str]] = {
             "message_estimate_tokens",
             "serialized_message_tokens",
             "native_tool_schema_tokens",
+            "deferred_catalog_omitted_count",
+            "original_tool_schema_tokens",
             "estimator_route",
             "estimator_count_mode",
             "system_tokens",
@@ -4615,16 +4617,49 @@ class AshLoop:
             repo_map_refresh_error = await self._refresh_repo_map_before_prompt()
             context_id = str(uuid4())
             try:
-                messages = self._build_messages(
-                    session,
-                    tool_result_images=tool_result_images,
-                    request_budget=request_budget,
-                    provider_tools=iteration_tools,
-                    tool_schema_payload=iteration_tool_schema,
-                    repo_map_refresh_error=repo_map_refresh_error,
-                    context_id=context_id,
-                    assembly_purpose="request",
-                )
+                try:
+                    messages = self._build_messages(
+                        session,
+                        tool_result_images=tool_result_images,
+                        request_budget=request_budget,
+                        provider_tools=iteration_tools,
+                        tool_schema_payload=iteration_tool_schema,
+                        repo_map_refresh_error=repo_map_refresh_error,
+                        context_id=context_id,
+                        assembly_purpose="request",
+                    )
+                except ContextBudgetExceededError as initial_error:
+                    reduced = self._deferred_catalog_fallback(
+                        session, initial_error, iteration_tools, iteration_tool_schema,
+                    )
+                    if reduced is None:
+                        raise
+                    reduced_tools, reduced_schema = reduced
+                    # This is local assembly, not a provider/tool retry. The
+                    # failed attempt committed no compaction or history changes.
+                    messages = self._build_messages(
+                        session,
+                        tool_result_images=tool_result_images,
+                        request_budget=request_budget,
+                        provider_tools=reduced_tools,
+                        tool_schema_payload=reduced_schema,
+                        repo_map_refresh_error=repo_map_refresh_error,
+                        context_id=context_id,
+                        assembly_purpose="request",
+                        refresh_instructions=False,
+                        deferred_catalog_omitted_count=len(iteration_tools) - len(reduced_tools),
+                        original_tool_schema_tokens=int(
+                            initial_error.rejection_accounting["native_tool_schema_tokens"]
+                        ),
+                    )
+                    iteration_tools, iteration_tool_schema = reduced_tools, reduced_schema
+                    # Only after successful admission: evict discovered
+                    # declarations, not registered tools or permission grants.
+                    search_tool = self.tools.get("search_tools")
+                    from ash.tools.tool_search import SearchToolsTool
+
+                    if type(search_tool) is SearchToolsTool:
+                        search_tool.prune_activations(set(iteration_tools))
             except ContextBudgetExceededError as exc:
                 used_before_request = total_prompt_tokens + total_completion_tokens
                 remaining = turn_token_budget - used_before_request
@@ -5753,6 +5788,83 @@ class AshLoop:
                         visible[review_name] = self.tools[review_name]
             return visible
         return self.tools
+
+    def _deferred_catalog_fallback(
+        self,
+        session: Session,
+        error: ContextBudgetExceededError,
+        tools: dict[str, BaseTool],
+        schema: list[dict[str, Any]],
+    ) -> tuple[dict[str, BaseTool], list[dict[str, Any]]] | None:
+        """Try a smaller native declaration set only for a real opaque input overflow.
+
+        The exact essential/eager catalog remains available; prior messages
+        and approvals are not changed. Reuse the same schema snapshot so
+        dynamic declarations are not evaluated a second time.
+        """
+        from ash.tools.tool_search import ESSENTIAL_TOOL_NAMES, SearchToolsTool
+
+        search = self.tools.get("search_tools")
+        if (
+            type(search) is not SearchToolsTool
+            or search.threshold == 0
+            or len(self.tools) <= search.threshold
+            or not _provider_capabilities(self.provider).native_tools
+            or not error.provider_replay_state_preserved
+            or error.required_history_summary
+            or error.token_estimate is None
+            or error.required_tokens <= error.limit
+        ):
+            return None
+        original_schema_tokens = error.rejection_accounting.get("native_tool_schema_tokens")
+        total_limit = error.rejection_accounting.get("total_input_limit")
+        if (
+            type(original_schema_tokens) is not int
+            or type(total_limit) is not int
+            or total_limit != error.limit + original_schema_tokens
+        ):
+            return None
+        # A just-completed discovery promises schemas on the next request.
+        # Never immediately withdraw that promise to fit the window.
+        last_assistant = next(
+            (message for message in reversed(session.messages) if message.role == "assistant"),
+            None,
+        )
+        recent_calls = (
+            last_assistant.metadata.get("tool_calls", []) if last_assistant is not None else []
+        )
+        if not isinstance(recent_calls, list):
+            return None
+        recent_names = {
+            call["name"] for call in recent_calls
+            if isinstance(call, dict) and isinstance(call.get("name"), str)
+        }
+        if "search_tools" in recent_names:
+            return None
+        # A just-used optional tool may be needed to repair its failed action.
+        # Keep it, along with the essential and eagerly promoted review tools.
+        preserve = (
+            ESSENTIAL_TOOL_NAMES | {"search_tools", "git_diff", "workspace_diff"} | recent_names
+        )
+        omitted = (set(tools) & search.activated_names) - preserve
+        if not omitted:
+            return None
+        reduced = {name: tool for name, tool in tools.items() if name not in omitted}
+        # Native declaration names must correspond exactly to the registry
+        # snapshot. Unknown or malformed schemas are not recovery candidates.
+        names = [item.get("function", {}).get("name") for item in schema]
+        if len(names) != len(tools) or set(names) != set(tools):
+            return None
+        reduced_schema = [
+            item for item, name in zip(schema, names) if name not in omitted
+        ]
+        reduced_tokens = self._estimate_tool_schema_tokens(reduced_schema)
+        if (
+            reduced_tokens >= original_schema_tokens
+            or error.required_tokens + reduced_tokens > total_limit
+        ):
+            return None
+        return reduced, reduced_schema
 
     def _search_activation_fits(
         self, activated_names: set[str], search_output: str
@@ -9759,6 +9871,8 @@ class AshLoop:
         pending_memory_context_override: str | None = None,
         additional_instructions_override: str | None = None,
         commit_compaction: bool = True,
+        deferred_catalog_omitted_count: int | None = None,
+        original_tool_schema_tokens: int | None = None,
     ) -> list[dict[str, Any]]:
         """Build the messages payload for the provider."""
 
@@ -9958,7 +10072,17 @@ class AshLoop:
                 self._last_context_maximum = assembly.maximum_input
                 self._emit_event(
                     self._context_usage_event_payload(
-                        assembly.usage_event,
+                        {
+                            **assembly.usage_event,
+                            **(
+                                {
+                                    "deferred_catalog_omitted_count": deferred_catalog_omitted_count,
+                                    "original_tool_schema_tokens": original_tool_schema_tokens,
+                                }
+                                if deferred_catalog_omitted_count is not None
+                                else {}
+                            ),
+                        },
                         context_id=context_id,
                         assembly_purpose=assembly_purpose,
                         estimate_source="local",

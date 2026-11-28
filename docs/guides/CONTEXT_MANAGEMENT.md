@@ -169,6 +169,21 @@ Only visible schemas count against the tools budget. Deferred tools remain in
 the runtime registry and continue through normal validation, permissions,
 hooks, audit, event, and result-persistence paths after activation.
 
+If an otherwise valid native-tool request with opaque replay state exceeds
+its input budget, Ash can try one smaller declaration set before dispatch.
+Only previously discovered optional tools that were not used in the most
+recent assistant call batch can be deferred again. Essential tools, review
+tools, and the immediately preceding batch's tools remain available; a
+just-completed discovery is not withdrawn on its next request. Ash reuses
+the exact declaration snapshot and rechecks the unchanged protected
+conversation against the normal budget. It does not lower the response
+reserve, retry a model call, rewrite provider reasoning or repeat a tool
+action. Only a successful local admission evicts the old activations.
+Deferred tools remain discoverable, and ordinary validation and approval
+still apply. If even the smaller catalog cannot fit, the original protected
+context refusal remains. This does not guarantee enough space for later
+requests, or change the explicit opt-in requirements for context restarts.
+
 When the **effective** provider input limit is at least 24,576 tokens and
 deferred discovery is active, Ash also exposes the existing read-only
 `git_diff` schema directly. The generated system prompt includes concise

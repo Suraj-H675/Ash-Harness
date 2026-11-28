@@ -783,6 +783,8 @@ _NUMERIC_ONLY_CONTEXT_FIELDS = frozenset(
         "message_estimate_tokens",
         "serialized_message_tokens",
         "native_tool_schema_tokens",
+        "deferred_catalog_omitted_count",
+        "original_tool_schema_tokens",
         "assistant_text_chars",
         "assistant_tool_call_argument_chars",
         "serialized_tool_result_chars",

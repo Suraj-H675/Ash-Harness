@@ -540,6 +540,14 @@ def _render_context_assembly_details(assembly: dict[str, Any]) -> list[str]:
         )
     else:
         lines.append("  local input attribution: unavailable in this stored event")
+    omitted = assembly.get("deferred_catalog_omitted_count")
+    prior_schema = assembly.get("original_tool_schema_tokens")
+    native_schema = assembly.get("native_tool_schema_tokens")
+    if all(type(value) is int for value in (omitted, prior_schema, native_schema)):
+        lines.append(
+            f"  deferred {omitted:,} previously discovered optional tools at admission; "
+            f"native schema estimate {prior_schema:,} -> {native_schema:,} tokens"
+        )
     return lines
 
 

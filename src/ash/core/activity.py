@@ -34,6 +34,8 @@ METRIC_EVENT_FIELDS = {
         "message_estimate_tokens",
         "serialized_message_tokens",
         "native_tool_schema_tokens",
+        "deferred_catalog_omitted_count",
+        "original_tool_schema_tokens",
         "estimator_route",
         "estimator_count_mode",
         "system_tokens",
@@ -209,6 +211,12 @@ def summarize_context_diagnostics(
                 ),
                 "native_tool_schema_tokens": _nonnegative_int(
                     event.get("native_tool_schema_tokens")
+                ),
+                "deferred_catalog_omitted_count": _nonnegative_int(
+                    event.get("deferred_catalog_omitted_count")
+                ),
+                "original_tool_schema_tokens": _nonnegative_int(
+                    event.get("original_tool_schema_tokens")
                 ),
                 "estimator_route": _safe_route(event.get("estimator_route")),
                 "estimate_source": _safe_name(event.get("estimate_source")),

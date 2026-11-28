@@ -157,6 +157,15 @@ counts are not additive token charges.
 local counter provenance; `unknown` means the implementation could not be
 identified safely. Older events may omit these fields.
 
+When local admission succeeds only after deferring old optional native
+tool declarations, the admitted `context.usage` event also records
+`deferred_catalog_omitted_count` and `original_tool_schema_tokens`.
+The actual `native_tool_schema_tokens` remains the reduced declaration
+estimate. The failed larger assembly is not a dispatched model request;
+no prior tool calls, results, or opaque replay items were removed. These
+optional numeric fields identify a local catalog reduction, not provider
+capacity or a guaranteed ability to finish the turn.
+
 `model.request.started.requested_completion_limit` records the completion
 limit Ash requested for that call when known. Provider enforcement varies;
 the ChatGPT-plan adapter does not enforce a per-call output cap. This is not
