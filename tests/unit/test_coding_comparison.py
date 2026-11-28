@@ -217,6 +217,16 @@ def test_final_source_evidence_is_verified_without_echoing_text(tmp_path, fault)
         assert "FINAL PRIVATE SOURCE CONTENT" not in repr(report)
 
 
+def test_offline_fixture_cannot_be_scored_as_live_comparison(tmp_path):
+    ash, codex = _evidence(tmp_path)
+    for path in (ash / "result.json", codex / "grade.json", codex / "manifest.json"):
+        receipt = json.loads(path.read_text())
+        receipt["task"] = "pathspec-scandir-iteration-errors"
+        path.write_text(json.dumps(receipt))
+    with pytest.raises(ValueError, match="offline-only"):
+        comparison.compare(ash, codex)
+
+
 def test_legacy_receipts_keep_host_isolation_unknown_and_are_not_pair_eligible(
     tmp_path: Path,
 ) -> None:

@@ -122,6 +122,8 @@ def run_pair(
     order_offset: int = 0,
     authorize_model_trial: bool = False,
 ) -> dict[str, Any]:
+    if TASKS[task].offline_only:
+        raise ValueError("repository scenario is qualified for offline preflight only")
     if not authorize_model_trial:
         raise ValueError("paired model trials require explicit operator authorization")
     if invoke is invoke_runner:
@@ -312,6 +314,8 @@ def run_batch(
         raise ValueError("too many model comparisons in one batch")
     if not tasks or len(tasks) != len(set(tasks)) or any(t not in TASKS for t in tasks):
         raise ValueError("tasks must be distinct known repository scenarios")
+    if any(TASKS[t].offline_only for t in tasks):
+        raise ValueError("repository scenario is qualified for offline preflight only")
     if not 30 <= timeout <= 300 or not 8192 <= context <= 65536:
         raise ValueError("out-of-range model limits")
     if root.resolve().is_relative_to(ROOT.resolve()):
@@ -387,6 +391,8 @@ def main() -> int:
     )
     args = parser.parse_args()
     os.umask(0o077)
+    if any(TASKS[t].offline_only for t in args.task):
+        parser.error("repository scenario is qualified for offline preflight only")
     if (
         len(args.task) != len(set(args.task))
         or not 1 <= args.repetitions <= 3

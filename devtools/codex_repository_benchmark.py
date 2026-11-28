@@ -842,6 +842,8 @@ def run_task(
         if (model, effort) != ("gpt-6-luna", "xhigh"):
             raise RuntimeError("Plain Codex model trials require GPT-6 Luna xhigh")
     task = TASKS[name]
+    if task.offline_only and not preflight_only:
+        raise ValueError("repository scenario is qualified for offline preflight only")
     with tempfile.TemporaryDirectory(prefix="ash-codex-repo-") as temp:
         scratch = Path(temp)
         (scratch / "tmp").mkdir()
@@ -1056,6 +1058,8 @@ def main() -> int:
     parser.add_argument("--prepared-source", nargs=2, metavar=("ROOT", "SHA256"),
                         help=argparse.SUPPRESS)
     args = parser.parse_args()
+    if TASKS[args.task].offline_only and not args.preflight_only:
+        parser.error("repository scenario is qualified for offline preflight only")
     if not re.fullmatch(r"[a-z0-9][a-z0-9._-]*", args.model):
         parser.error("model must be an explicit simple model ID")
     if not 30 <= args.timeout <= 300:

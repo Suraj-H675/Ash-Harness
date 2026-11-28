@@ -151,6 +151,8 @@ def compare(ash_dir: Path, codex_dir: Path) -> dict[str, Any]:
     if _required_str(codex, "task") != task or _required_str(manifest, "task") != task:
         raise ValueError("comparator receipts are for different tasks")
     registered_task = TASKS.get(task)
+    if registered_task is not None and registered_task.offline_only:
+        raise ValueError("offline-only repository scenario cannot be scored as a live pair")
     base = _required_str(ash, "base_sha")
     reference = _required_str(ash, "reference_fix_sha")
     if (

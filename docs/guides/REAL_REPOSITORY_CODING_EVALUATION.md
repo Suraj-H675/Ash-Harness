@@ -230,6 +230,15 @@ PYTHONPATH=src .venv/bin/python devtools/parallel_repository_benchmarks.py \
   --evidence-root /var/tmp/ash-approved-paired-new-evidence
 ~~~
 
+The registry also distinguishes offline-qualified fixtures from live
+comparison scenarios. The JSON Pointer exception-provenance and PathSpec
+directory-scan error fixtures retain the independently prepared visible and
+hidden probes, with explicit editable paths in the user prompts. Their
+`offline_only` flag allows trusted preflight (including the native runner's
+`--preflight-only` mode) but blocks live dispatch and live scoring, even
+with a general model-trial authorization. An offline pass does not resolve
+prior execution-interface restrictions or authorize a new live route.
+
 Before either model is dispatched, the paired coordinator acquires both exact
 upstream pins and runs the existing red/green preflight once. It removes
 the reference checkout, then fingerprints the pristine baseline (including

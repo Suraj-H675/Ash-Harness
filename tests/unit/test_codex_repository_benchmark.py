@@ -1117,6 +1117,29 @@ def test_no_paid_trial_without_explicit_approval_before_preflight(
         )
 
 
+def test_offline_fixture_refuses_native_model_even_with_general_authorization(
+    tmp_path, monkeypatch,
+):
+    def unexpected(*args, **kwargs):
+        pytest.fail("offline fixture must not access native provider setup")
+
+    monkeypatch.setattr(runner, "preflight", unexpected)
+    monkeypatch.setattr(runner, "_require_sealed_comparator_profile", unexpected)
+    evidence = tmp_path / "evidence"
+    name = "pathspec-scandir-iteration-errors"
+    with pytest.raises(ValueError, match="offline preflight only"):
+        runner.run_task(name, evidence=evidence, model="gpt-6-luna", effort="xhigh",
+                        timeout=300, authorize_model_trial=True)
+    monkeypatch.setattr(sys, "argv", [
+        "codex_repository_benchmark.py", "--task", name, "--evidence-dir",
+        str(evidence), "--authorize-model-trial",
+    ])
+    with pytest.raises(SystemExit) as error:
+        runner.main()
+    assert error.value.code == 2
+    assert not evidence.exists()
+
+
 def test_sealed_metadata_rejects_symlinks_and_mode_changes(tmp_path: Path) -> None:
     metadata = tmp_path / "attestation.json"
     metadata.write_text('"synthetic"')

@@ -440,6 +440,51 @@ def test_upstream_tasks_are_pinned_and_oracles_sealed(
     compile(task.hidden_source, "<sealed-oracle>", "exec")
 
 
+@pytest.mark.parametrize(("name", "path", "visible_sha", "hidden_sha"), [
+    (
+        "jsonpointer-join-exception-provenance", "jsonpointer.py",
+        "f9ee91283d9c1ce93b3d895226a3c171c30e5921166f0b83a01c604000c037cb",
+        "dc4722db0ebe745d8c1359681d8ad37a88789c53bbcd94aefb850714d8e0a8ef",
+    ),
+    (
+        "pathspec-scandir-iteration-errors", "pathspec/util.py",
+        "1ae1e64760eaba7ecc9ee54e757d86e29b5018eec128b3b372ea924e508606f6",
+        "1b36390f2410d22f66e618d3544e43146856f91b6335c46f0539d934e3365a3b",
+    ),
+])
+def test_fresh_offline_fixture_preserves_frozen_oracles_and_refuses_live_ash(
+    name, path, visible_sha, hidden_sha, tmp_path, monkeypatch,
+):
+    task = bench.TASKS[name]
+    assert task.offline_only
+    assert task.editable == frozenset({path})
+    assert task.require_both_oracles_red_green
+    assert task.require_each_editable_ablation_red
+    assert hashlib.sha256(task.visible_source.encode()).hexdigest() == visible_sha
+    assert bench.hidden_oracle_sha256(task) == hidden_sha
+    assert path in bench.shared_user_prompt(task)
+    assert "Read-only inspection" in bench.shared_user_prompt(task)
+    assert bench.task_evidence_classification(task) == "offline-qualified-only-not-score-eligible"
+    evidence = tmp_path / "evidence"
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("offline-only fixture must not access credentials or prepare a live runner")
+
+    monkeypatch.setattr(bench, "ChatGPTCredentialStore", unexpected)
+    monkeypatch.setattr(bench, "preflight", unexpected)
+    with pytest.raises(ValueError, match="offline preflight only"):
+        bench.run_task(name, model="gpt-6-luna", account=None, evidence=evidence,
+                       timeout=300, context_tokens=65536, turn_token_budget=0)
+    monkeypatch.setattr(sys, "argv", [
+        "repository_benchmark.py", "--task", name, "--chatgpt-model", "gpt-6-luna",
+        "--evidence-dir", str(evidence),
+    ])
+    with pytest.raises(SystemExit) as error:
+        bench.main()
+    assert error.value.code == 2
+    assert not evidence.exists()
+
+
 def test_pyflakes_r16_pins_and_model_inputs() -> None:
     task_id = "pyflakes-functional-typing-fields"
     assert [name for name in bench.TASKS if name.startswith("pyflakes-")] == [task_id]

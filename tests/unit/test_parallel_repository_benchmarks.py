@@ -199,6 +199,28 @@ def test_batch_and_pair_refuse_unapproved_model_dispatch_before_any_effect(
     assert not called
 
 
+def test_offline_fixture_blocks_pair_batch_and_cli_before_readiness(tmp_path, monkeypatch):
+    def unexpected(*args, **kwargs):
+        pytest.fail("offline fixture must not access readiness or dispatch")
+
+    monkeypatch.setattr(batch_runner, "preflight_plain_codex_readiness", unexpected)
+    monkeypatch.setattr(batch_runner, "refresh_existing_chatgpt_access", unexpected)
+    name = "pathspec-scandir-iteration-errors"
+    with pytest.raises(ValueError, match="offline preflight only"):
+        run_pair(name, 1, tmp_path, 300, 65536, authorize_model_trial=True)
+    with pytest.raises(ValueError, match="offline preflight only"):
+        run_batch([name], 1, 1, tmp_path / "batch", 300, 65536,
+                  authorize_model_trial=True)
+    monkeypatch.setattr(sys, "argv", [
+        "parallel_repository_benchmarks.py", "--task", name,
+        "--evidence-root", str(tmp_path / "batch"), "--authorize-model-trial",
+    ])
+    with pytest.raises(SystemExit) as error:
+        batch_runner.main()
+    assert error.value.code == 2
+    assert not list(tmp_path.iterdir())
+
+
 def test_explicit_batch_consent_reaches_only_plain_codex_runner(
     tmp_path: Path,
 ) -> None:
