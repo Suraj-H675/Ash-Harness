@@ -1283,13 +1283,13 @@ def test_platformdirs_generated_only_runtime_is_deterministic_and_protected(
 
 def test_cattrs_runtime_preserves_frozen_distribution_source_and_scope(tmp_path: Path) -> None:
     task = bench.TASKS["cattrs-annotated-field-overrides"]
-    assert task.offline_only
+    assert not task.offline_only
     assert task.require_both_oracles_red_green and task.require_each_editable_ablation_red
     assert not task.require_all_editable_changed
     assert task.runtime is not None
     assert task.command_grant == "python3 -B qa_visible.py"
     assert len(task.editable) == 4
-    assert bench.task_evidence_classification(task) == "offline-qualified-only-not-score-eligible"
+    assert bench.task_evidence_classification(task) == "source-backed-task"
     root = tmp_path / "source"
     root.mkdir()
     receipt = bench.materialize_task_runtime(root, task.runtime)

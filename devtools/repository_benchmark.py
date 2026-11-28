@@ -3917,6 +3917,81 @@ fail=0
 for f in (check_attrs,check_dataclass,check_typed,check_named,check_legacy):
     try: f();print(f.__name__,"PASS")
     except Exception as e: fail+=1; print(f.__name__,"FAIL",type(e).__name__,str(e))
+
+# Chief qualification checks, frozen before the first model trial.
+import sys
+sys.path[:0] = ["src", ".benchmark_runtime/site"]
+from typing import Annotated, NamedTuple, TypedDict, NotRequired
+from dataclasses import dataclass
+from attrs import define
+from cattrs import Converter, override
+from cattrs.cols import namedtuple_dict_structure_factory, namedtuple_dict_unstructure_factory
+from cattrs.gen.typeddicts import make_dict_structure_fn, make_dict_unstructure_fn
+from cattrs.errors import ClassValidationError
+
+def legacy():
+    @dataclass
+    class Plain:
+        n: Annotated[int, "not an override"] = 3
+    class Pair(NamedTuple):
+        left: int
+        right: str = "ok"
+    class Map(TypedDict):
+        n: int
+        label: NotRequired[str]
+    for detailed in (True, False):
+        c = Converter(detailed_validation=detailed)
+        assert c.structure({"n": "9"}, Plain) == Plain(9)
+        assert c.unstructure(Plain()) == {"n": 3}
+        assert c.structure(["7", "x"], Pair) == Pair(7, "x")
+        assert c.unstructure(Pair(7)) == (7, "ok")
+        assert c.structure({"n": "11"}, Map) == {"n": 11}
+        assert c.unstructure({"n": 11}, unstructure_as=Map) == {"n": 11}
+
+def named_precedence():
+    class Entry(NamedTuple):
+        value: Annotated[int, override(rename="v", unstruct_hook=lambda x: x + 5)]
+        count: Annotated[int, override(omit_if_default=True)] = 8
+    c = Converter()
+    u = namedtuple_dict_unstructure_factory(Entry,c)
+    s = namedtuple_dict_structure_factory(Entry,c)
+    assert u(Entry(3)) == {"v": 8}
+    assert u(Entry(3,2)) == {"v": 8, "count": 2}
+    assert s({"v": "3"},Entry) == Entry(3)
+    u2 = namedtuple_dict_unstructure_factory(Entry,c,value=override(rename="explicit"))
+    s2 = namedtuple_dict_structure_factory(Entry,c,value=override(rename="explicit"))
+    assert u2(Entry(3)) == {"explicit": 3}
+    assert s2({"explicit": "3"},Entry) == Entry(3)
+
+def typed_precedence():
+    class Record(TypedDict):
+        n: Annotated[int, override(rename="number")]
+        extra: NotRequired[Annotated[int, override(rename="aux")]]
+    c = Converter()
+    u = make_dict_unstructure_fn(Record,c,n=override(rename="explicit"))
+    s = make_dict_structure_fn(Record,c,n=override(rename="explicit"))
+    assert u({"n": 2, "extra": 4}) == {"explicit": 2, "aux": 4}
+    assert s({"explicit": "2", "aux": "4"},Record) == {"n": 2, "extra": 4}
+    assert s({"explicit": "2"},Record) == {"n": 2}
+
+def renamed_validation():
+    @define
+    class Model:
+        x: Annotated[int, override(rename="X")]
+    c = Converter(forbid_extra_keys=True)
+    assert c.structure({"X":"5"},Model) == Model(5)
+    for value in ({"X":"bad"}, {"X":"5","other":0}, {}):
+        try:
+            c.structure(value,Model)
+        except ClassValidationError:
+            pass
+        else:
+            raise AssertionError("invalid structure accepted")
+for check in (legacy,named_precedence,typed_precedence,renamed_validation):
+    try:
+        check(); print(check.__name__, "PASS")
+    except Exception as exc:
+        fail+=1; print(check.__name__, "FAIL", type(exc).__name__,str(exc))
 raise SystemExit(bool(fail))
 """,
         command_grant="python3 -B qa_visible.py",
@@ -3966,7 +4041,6 @@ raise SystemExit(bool(fail))
         require_both_oracles_red_green=True,
         require_each_editable_ablation_red=True,
         require_all_editable_changed=False,
-        offline_only=True,
     ),
 }
 
