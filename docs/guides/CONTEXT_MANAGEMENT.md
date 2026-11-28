@@ -528,7 +528,10 @@ Ash records a separate completed reporting turn with explicit provenance and
 sets `tool_free_finalized=true` in one-shot JSON output. The report must
 distinguish a successful recorded command from proof that every user
 requirement was met. Admission requires a recorded zero exit status and a
-valid command identity after the last successful local edit. The reporting
+valid command identity after the last successful local edit. A successful
+`apply_patch` dry run is a validation-only action, not an edit; it cannot
+authorize this reporting path or replace a recorded real edit as the
+verification-order anchor. The reporting
 evidence identifies the command, its working directory, its exit status and
 bounded redacted output. Redaction precedes truncation, and truncated command,
 directory or output fields are marked. A later edit without a subsequent

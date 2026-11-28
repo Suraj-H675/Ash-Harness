@@ -6737,16 +6737,26 @@ class SessionStore:
                     return None
                 if not isinstance(arguments, dict):
                     return None
-                if name in {
-                    "write_file", "replace_file_content", "replace_file_edits",
-                    "whole_edit", "apply_patch",
-                }:
+                patch_dry_run = False
+                if name == "apply_patch":
+                    # Match the built-in tool's argument semantics, including
+                    # accepted boolean coercions. A successful validation-only
+                    # patch is not evidence of a workspace edit.
+                    from ash.tools.patch import ApplyPatchArgs
+
+                    try:
+                        patch_dry_run = ApplyPatchArgs.model_validate(arguments).dry_run
+                    except ValueError:
+                        return None
+                if name in AUTOMATIC_CONTEXT_FILE_EDIT_TOOLS and not patch_dry_run:
                     last_edit_index = index
                 action: dict[str, Any] = {
                     "tool": name,
                     "arguments": arguments,
                     "result": str(row["result"] or ""),
                 }
+                if name == "apply_patch":
+                    action["dry_run"] = patch_dry_run
                 if name == "run_command":
                     command = arguments.get("command_line")
                     cwd = arguments.get("cwd")

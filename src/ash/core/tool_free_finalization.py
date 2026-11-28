@@ -56,7 +56,9 @@ def _compact_actions(actions: list[dict[str, Any]]) -> str:
         frozenset({"run_command"}),
     ):
         for i in range(len(actions) - 1, -1, -1):
-            if actions[i]["tool"] in wanted:
+            if actions[i]["tool"] in wanted and not (
+                actions[i]["tool"] == "apply_patch" and actions[i].get("dry_run") is True
+            ):
                 selected.add(i)
                 break
     for i in sorted(selected):
@@ -64,6 +66,10 @@ def _compact_actions(actions: list[dict[str, Any]]) -> str:
         name = str(action["tool"])
         arguments = action["arguments"]
         record: dict[str, Any] = {"tool": name, "status": "recorded successful"}
+        if name == "apply_patch":
+            record["dry_run"] = action.get("dry_run") is True
+            if record["dry_run"]:
+                record["status"] = "recorded successful validation only; no edit"
         if name == "run_command":
             command = redact_text(arguments["command_line"])
             cwd = redact_text(arguments.get("cwd") or ".")

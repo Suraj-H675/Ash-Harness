@@ -94,12 +94,15 @@ def record_completed_coding_turn(
     command_first: bool = False,
     command_exit_code: int | None = 0,
     command_arguments: dict | None = None,
+    edit_tool: str = "replace_file_content",
+    edit_arguments: dict | None = None,
+    extra_arguments: dict | None = None,
 ) -> str:
     turn_id = "prior-coding-turn"
     store.start_turn(session_id, turn_id, "Original source repair")
     calls: list[tuple[str, str, str]] = []
     if include_edit:
-        calls.append(("edit", "replace_file_content", "src/a.py"))
+        calls.append(("edit", edit_tool, "src/a.py"))
     calls.append(("test", "run_command", "python3 -B qa_visible.py"))
     if command_first:
         calls.reverse()
@@ -115,7 +118,11 @@ def record_completed_coding_turn(
                 tool_name=name,
                 arguments=(
                     (command_arguments if command_arguments is not None else {"command_line": target})
-                    if name == "run_command" else {"file_path": target}
+                    if name == "run_command" else (
+                        edit_arguments if call_id == "edit" and edit_arguments is not None
+                        else extra_arguments if call_id == "other" and extra_arguments is not None
+                        else {"file_path": target}
+                    )
                 ),
                 approved=True,
                 dispatched=dispatched,
@@ -506,6 +513,79 @@ async def test_finalizer_refuses_failed_unknown_or_unscoped_effects(
         assert evidence is None
     finally:
         await loop.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("patch_args", "admitted"), [
+    ({"patch": "diff", "dry_run": True}, False),
+    ({"patch": "diff", "dry_run": "true"}, False),
+    ({"patch": "diff", "dry_run": False}, True),
+    ({"patch": "diff", "dry_run": "false"}, True),
+    ({"patch": "diff"}, True),
+    ({"patch": "diff", "dry_run": "invalid"}, False),
+    ({"dry_run": False}, False),
+])
+async def test_patch_validation_is_not_an_edit_for_tool_free_finalization(
+    tmp_path: Path, patch_args: dict, admitted: bool,
+) -> None:
+    loop = build_loop(tmp_path, FinalReportProvider())
+    try:
+        session = await loop.start_session()
+        record_completed_coding_turn(
+            loop.session_store, session.session_id, edit_tool="apply_patch",
+            edit_arguments=patch_args,
+        )
+        reconcile(loop, session.session_id)
+        evidence = loop.session_store.tool_free_finalization_evidence(
+            session.session_id, expected_project_path=tmp_path
+        )
+        assert (evidence is not None) is admitted
+        if evidence is not None:
+            assert evidence[1][0]["dry_run"] is False
+            assert json.loads(_compact_actions(evidence[1]))["actions"][0]["dry_run"] is False
+    finally:
+        await loop.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("dry_run", [True, False])
+async def test_post_check_patch_preview_preserves_verification_order(
+    tmp_path: Path, dry_run: bool,
+) -> None:
+    loop = build_loop(tmp_path, FinalReportProvider())
+    try:
+        session = await loop.start_session()
+        record_completed_coding_turn(
+            loop.session_store, session.session_id, extra_tool="apply_patch",
+            extra_arguments={"patch": "diff", "dry_run": dry_run},
+        )
+        reconcile(loop, session.session_id)
+        evidence = loop.session_store.tool_free_finalization_evidence(
+            session.session_id, expected_project_path=tmp_path
+        )
+        assert (evidence is not None) is dry_run
+        if evidence is not None:
+            last = json.loads(_compact_actions(evidence[1]))["actions"][-1]
+            assert last["dry_run"] is True
+            assert last["status"] == "recorded successful validation only; no edit"
+    finally:
+        await loop.aclose()
+
+
+def test_report_dry_run_does_not_displace_last_real_edit() -> None:
+    actions = [
+        {"tool": "apply_patch", "arguments": {"patch": "real"}, "dry_run": False, "result": "done"},
+        {"tool": "run_command", "arguments": {"command_line": "check"}, "exit_code": 0, "result": "ok"},
+    ] + [
+        {"tool": "apply_patch", "arguments": {"patch": "preview"}, "dry_run": True, "result": "valid"}
+        for _ in range(40)
+    ]
+    report = json.loads(_compact_actions(actions))
+    assert report["shown_calls"] == 32
+    assert report["actions"][0]["dry_run"] is False
+    assert report["actions"][1]["tool"] == "run_command"
+    assert all(row["dry_run"] is True for row in report["actions"][2:])
+    assert "patch" not in report["actions"][0]
 
 
 @pytest.mark.asyncio
